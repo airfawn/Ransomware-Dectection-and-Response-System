@@ -1,0 +1,4 @@
+([('basic_gui',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/dist/basic_gui',
+   'EXECUTABLE')],)

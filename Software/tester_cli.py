@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-import os
 import sys
+from pathlib import Path
 
-BASE_DIR = os.path.join(os.path.dirname(__file__), 'tester')
+from utils.paths import get_base_dir
+
+# Tester directory location (relative to base application directory)
+BASE_DIR = get_base_dir() / 'tester'
 
 
 def ensure_tester_dir():
-    if not os.path.exists(BASE_DIR):
-        os.makedirs(BASE_DIR, exist_ok=True)
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def create_file():
@@ -16,8 +18,8 @@ def create_file():
         print('Filename cannot be empty.')
         return
 
-    filepath = os.path.join(BASE_DIR, filename)
-    if os.path.exists(filepath):
+    filepath = BASE_DIR / filename
+    if filepath.exists():
         print(f'File already exists: {filepath}')
         return
 
@@ -34,12 +36,12 @@ def delete_file():
         print('Filename cannot be empty.')
         return
 
-    filepath = os.path.join(BASE_DIR, filename)
-    if not os.path.exists(filepath):
+    filepath = BASE_DIR / filename
+    if not filepath.exists():
         print(f'File does not exist: {filepath}')
         return
 
-    os.remove(filepath)
+    filepath.unlink()
     print(f'Deleted file: {filepath}')
 
 
@@ -49,8 +51,8 @@ def modify_file():
         print('Filename cannot be empty.')
         return
 
-    filepath = os.path.join(BASE_DIR, filename)
-    if not os.path.exists(filepath):
+    filepath = BASE_DIR / filename
+    if not filepath.exists():
         print(f'File does not exist: {filepath}')
         return
 

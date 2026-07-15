@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
+"""RDRS GUI Application.
+
+This module provides the main graphical user interface for the Ransomware
+Detection and Response System. It features:
+- Real-time file monitoring display
+- Process behavior tracking with detailed inspection
+- Suspicious activity detection
+- Process details panel with file activity timeline
+- Thread-safe GUI updates from background monitoring
+
+Thread Safety:
+    All GUI updates are performed on the main Qt thread using signals.
+"""
+
 import re
 import sys
-import subprocess
-import threading
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple, Set
 
 try:
     import psutil
-except Exception:
+except ImportError:
     psutil = None
 
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
@@ -29,10 +42,20 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QCheckBox,
     QMessageBox,
-    QScrollArea,
     QDialog,
     QStackedWidget,
+    QSplitter,
+    QComboBox,
+    QFrame,
 )
+
+from monitor.session import MonitorSession
+
+try:
+    from config import get_config
+    _CONFIG_AVAILABLE = True
+except ImportError:
+    _CONFIG_AVAILABLE = False
 
 
 class OutputBridge(QObject):
@@ -64,7 +87,15 @@ class RawOutputWindow(QMainWindow):
 
 
 class EventDetailsDialog(QDialog):
-    def __init__(self, parent, entry: dict):
+    """Dialog for viewing detailed event information."""
+    
+    def __init__(self, parent: QWidget, entry: dict):
+        """Initialize event details dialog.
+        
+        Args:
+            parent: Parent widget.
+            entry: Event dictionary.
+        """
         super().__init__(parent)
         self.setWindowTitle("Event Details")
         self.setGeometry(200, 200, 700, 500)
@@ -93,16 +124,405 @@ class EventDetailsDialog(QDialog):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
-
         self.setLayout(layout)
+
+
+class ProcessDetailsDialog(QDialog):
+    """Detailed process investigation panel.
+    
+    Displays comprehensive information about a process including:
+    - General process information
+    - Activity summary counters
+    - File activity timeline
+    - Search and filtering capabilities
+    """
+    
+    def __init__(self, parent: QWidget, process_data: dict, process_key: Tuple):
+        """Initialize process details dialog.
+        
+        Args:
+            parent: Parent widget.
+            process_data: Process state dictionary.
+            process_key: Tuple identifying the process (pid, executable).
+        """
+        super().__init__(parent)
+        self.process_data = process_data
+        self.process_key = process_key
+        self.parent_gui = parent
+        self.file_events: List[Tuple[float, str, str, str]] = []
+        
+        self.setWindowTitle(f"Process Details - {process_data.get('process', 'Unknown')}")
+        self.setGeometry(150, 150, 1200, 800)
+        self.setModal(False)
+        
+        # Load config for styling
+        if _CONFIG_AVAILABLE:
+            config = get_config().gui
+            self.classification_colors = config.classification_colors
+            self.max_events = config.process_details_max_events
+        else:
+            self.classification_colors = {
+                "Normal": "#4CAF50",
+                "Suspicious": "#ff9800",
+                "Alert": "#f44336",
+                "Inactive": "#808080",
+            }
+            self.max_events = 1000
+        
+        self._build_ui()
+        self._populate_data()
+        
+        # Auto-refresh timer for live updates
+        self.refresh_timer = QTimer()
+        self.refresh_timer.setInterval(1000)  # Update every second
+        self.refresh_timer.timeout.connect(self._refresh_data)
+        self.refresh_timer.start()
+    
+    def _build_ui(self) -> None:
+        """Build the dialog UI."""
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Header with process name and classification badge
+        header_layout = QHBoxLayout()
+        
+        process_name = self.process_data.get("process", "Unknown")
+        self.title_label = QLabel(f"Process: {process_name}")
+        self.title_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        header_layout.addWidget(self.title_label)
+        
+        header_layout.addStretch()
+        
+        self.classification_badge = QLabel(self.process_data.get("classification", "Normal"))
+        self._update_classification_badge()
+        header_layout.addWidget(self.classification_badge)
+        
+        main_layout.addLayout(header_layout)
+        
+        # Splitter for sections
+        splitter = QSplitter(Qt.Vertical)
+        
+        # === General Information Section ===
+        info_frame = QFrame()
+        info_frame.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; padding: 12px; }")
+        info_layout = QVBoxLayout()
+        
+        info_title = QLabel("General Information")
+        info_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
+        info_layout.addWidget(info_title)
+        
+        # Grid layout for info fields
+        info_grid = QVBoxLayout()
+        info_grid.setSpacing(4)
+        
+        self.info_labels = {}
+        info_fields = [
+            ("PID", "pid"),
+            ("Executable Path", "executable"),
+            ("Parent Process", "parent_process"),
+            ("Process Creation Time", "process_start_time"),
+            ("Process Age", "process_age"),
+            ("First Activity", "first_activity"),
+            ("Last Activity", "last_activity"),
+            ("Current Score", "score"),
+        ]
+        
+        for label_text, data_key in info_fields:
+            row_layout = QHBoxLayout()
+            label = QLabel(f"{label_text}:")
+            label.setStyleSheet("color: #d9d9d9; font-weight: bold; min-width: 180px;")
+            value_label = QLabel(self.process_data.get(data_key, "Unknown"))
+            value_label.setStyleSheet("color: #f0f0f0;")
+            value_label.setWordWrap(True)
+            self.info_labels[data_key] = value_label
+            row_layout.addWidget(label)
+            row_layout.addWidget(value_label, 1)
+            info_grid.addLayout(row_layout)
+        
+        info_layout.addLayout(info_grid)
+        info_frame.setLayout(info_layout)
+        splitter.addWidget(info_frame)
+        
+        # === Activity Summary Section ===
+        activity_frame = QFrame()
+        activity_frame.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; padding: 12px; }")
+        activity_layout = QVBoxLayout()
+        
+        activity_title = QLabel("Activity Summary")
+        activity_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
+        activity_layout.addWidget(activity_title)
+        
+        # Counter grid
+        counter_grid = QHBoxLayout()
+        counter_grid.setSpacing(20)
+        
+        self.counter_labels = {}
+        counters = [
+            ("Files Created", "files_created", "#007a00"),
+            ("Files Modified", "files_modified", "#003a9e"),
+            ("Files Deleted", "files_deleted", "#a00000"),
+            ("Total Events", "total_events", "#ffffff"),
+            ("Unique Files", "unique_files", "#ffffff"),
+            ("Events/sec", "events_sec", "#ff9800"),
+            ("Events/min", "events_min", "#ff9800"),
+        ]
+        
+        for label_text, data_key, color in counters:
+            counter_widget = QWidget()
+            counter_layout = QVBoxLayout()
+            counter_layout.setContentsMargins(8, 8, 8, 8)
+            counter_layout.setSpacing(4)
+            
+            value_label = QLabel(self.process_data.get(data_key, "0"))
+            value_label.setAlignment(Qt.AlignCenter)
+            value_label.setStyleSheet(f"font-size: 24px; font-weight: bold; color: {color};")
+            self.counter_labels[data_key] = value_label
+            
+            desc_label = QLabel(label_text)
+            desc_label.setAlignment(Qt.AlignCenter)
+            desc_label.setStyleSheet("font-size: 10px; color: #d9d9d9;")
+            
+            counter_layout.addWidget(value_label)
+            counter_layout.addWidget(desc_label)
+            counter_widget.setLayout(counter_layout)
+            counter_grid.addWidget(counter_widget)
+        
+        counter_grid.addStretch()
+        activity_layout.addLayout(counter_grid)
+        activity_frame.setLayout(activity_layout)
+        splitter.addWidget(activity_frame)
+        
+        # === File Activity Timeline Section ===
+        timeline_frame = QFrame()
+        timeline_frame.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; padding: 12px; }")
+        timeline_layout = QVBoxLayout()
+        
+        timeline_header_layout = QHBoxLayout()
+        timeline_title = QLabel("File Activity Timeline")
+        timeline_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
+        timeline_header_layout.addWidget(timeline_title)
+        timeline_header_layout.addStretch()
+        
+        # Search and filter controls
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search file name, path, or extension...")
+        self.search_input.setStyleSheet("background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;")
+        self.search_input.textChanged.connect(self._apply_filters)
+        timeline_header_layout.addWidget(self.search_input)
+        
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All Events", "Created Only", "Modified Only", "Deleted Only"])
+        self.filter_combo.setStyleSheet("background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;")
+        self.filter_combo.currentIndexChanged.connect(self._apply_filters)
+        timeline_header_layout.addWidget(self.filter_combo)
+        
+        timeline_layout.addLayout(timeline_header_layout)
+        
+        # Timeline table
+        self.timeline_table = QTableWidget(0, 7)
+        self.timeline_table.setHorizontalHeaderLabels([
+            "Timestamp",
+            "Event Type",
+            "File Name",
+            "Full Path",
+            "Directory",
+            "Extension",
+            "Action",
+        ])
+        self.timeline_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.timeline_table.horizontalHeader().setStretchLastSection(False)
+        self.timeline_table.setColumnWidth(0, 150)
+        self.timeline_table.setColumnWidth(1, 120)
+        self.timeline_table.setColumnWidth(2, 200)
+        self.timeline_table.setColumnWidth(3, 300)
+        self.timeline_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.timeline_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.timeline_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.timeline_table.setSortingEnabled(True)
+        self.timeline_table.setStyleSheet("QTableWidget { background: #171b25; font-size: 11px; }")
+        
+        timeline_layout.addWidget(self.timeline_table)
+        timeline_frame.setLayout(timeline_layout)
+        splitter.addWidget(timeline_frame)
+        
+        # Set splitter proportions
+        splitter.setSizes([200, 150, 450])
+        main_layout.addWidget(splitter)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        close_btn.setStyleSheet("background: #2f3a59; color: white; font-weight: bold; padding: 10px; border-radius: 6px;")
+        main_layout.addWidget(close_btn)
+        
+        self.setLayout(main_layout)
+    
+    def _update_classification_badge(self) -> None:
+        """Update the classification badge color and text."""
+        classification = self.process_data.get("classification", "Normal")
+        color = self.classification_colors.get(classification, "#808080")
+        self.classification_badge.setText(classification)
+        self.classification_badge.setStyleSheet(
+            f"background: {color}; color: white; font-weight: bold; "
+            f"padding: 6px 16px; border-radius: 12px; font-size: 12px;"
+        )
+    
+    def _populate_data(self) -> None:
+        """Populate dialog with initial data."""
+        self._refresh_data()
+    
+    def _refresh_data(self) -> None:
+        """Refresh data from parent GUI."""
+        # Get updated process data from parent
+        if hasattr(self.parent_gui, 'process_state_cache'):
+            updated_data = self.parent_gui.process_state_cache.get(self.process_key)
+            if updated_data:
+                self.process_data = updated_data
+                self._update_info_fields()
+                self._update_counters()
+                self._update_classification_badge()
+                self._update_timeline()
+    
+    def _update_info_fields(self) -> None:
+        """Update general information fields."""
+        for data_key, label in self.info_labels.items():
+            value = self.process_data.get(data_key, "Unknown")
+            label.setText(str(value))
+    
+    def _update_counters(self) -> None:
+        """Update activity summary counters."""
+        for data_key, label in self.counter_labels.items():
+            value = self.process_data.get(data_key, "0")
+            label.setText(str(value))
+    
+    def _update_timeline(self) -> None:
+        """Update file activity timeline table."""
+        # Extract file events from raw_event if available
+        # This is a simplified version - in production, the monitor should expose events directly
+        self._extract_file_events()
+        
+        # Apply current filters
+        self._apply_filters()
+    
+    def _extract_file_events(self) -> None:
+        """Extract file events from process data.
+        
+        Note: This is a workaround. In production, ProcessState should expose
+        recent_events directly via a proper API.
+        """
+        # For now, we'll create mock events based on counters
+        # In production, this should access ProcessState.recent_events directly
+        self.file_events = []
+        
+        # Try to extract from parent's event logs
+        if hasattr(self.parent_gui, 'event_rows'):
+            pid = self.process_data.get('pid')
+            executable = self.process_data.get('executable')
+            
+            for event in self.parent_gui.event_rows:
+                if event.get('pid') == pid or event.get('executable') == executable:
+                    timestamp_str = event.get('timestamp', '')
+                    event_type = event.get('event_type', '')
+                    file_path = event.get('file', '')
+                    
+                    if timestamp_str and file_path:
+                        try:
+                            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").timestamp()
+                            self.file_events.append((timestamp, event_type, '', file_path))
+                        except Exception:
+                            pass
+        
+        # Sort by timestamp (newest first) and limit
+        self.file_events.sort(reverse=True, key=lambda x: x[0])
+        self.file_events = self.file_events[:self.max_events]
+    
+    def _apply_filters(self) -> None:
+        """Apply search and filter criteria to timeline table."""
+        search_text = self.search_input.text().lower()
+        filter_index = self.filter_combo.currentIndex()
+        
+        # Clear table
+        self.timeline_table.setRowCount(0)
+        self.timeline_table.setSortingEnabled(False)
+        
+        for timestamp, event_type, _, file_path in self.file_events:
+            # Apply event type filter
+            if filter_index == 1 and "CREATED" not in event_type.upper():
+                continue
+            elif filter_index == 2 and "MODIFIED" not in event_type.upper():
+                continue
+            elif filter_index == 3 and "DELETED" not in event_type.upper():
+                continue
+            
+            # Apply search filter
+            path_obj = Path(file_path)
+            file_name = path_obj.name
+            extension = path_obj.suffix
+            directory = str(path_obj.parent)
+            
+            if search_text:
+                if (search_text not in file_name.lower() and
+                    search_text not in file_path.lower() and
+                    search_text not in extension.lower()):
+                    continue
+            
+            # Add row
+            row = self.timeline_table.rowCount()
+            self.timeline_table.insertRow(row)
+            
+            timestamp_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Determine action badge
+            if "CREATED" in event_type.upper():
+                action = "Created"
+                action_color = QColor("#007a00")
+            elif "MODIFIED" in event_type.upper():
+                action = "Modified"
+                action_color = QColor("#003a9e")
+            elif "DELETED" in event_type.upper():
+                action = "Deleted"
+                action_color = QColor("#a00000")
+            else:
+                action = "Unknown"
+                action_color = QColor("#808080")
+            
+            items = [
+                timestamp_str,
+                event_type,
+                file_name,
+                file_path,
+                directory,
+                extension,
+                action,
+            ]
+            
+            for col, value in enumerate(items):
+                item = QTableWidgetItem(value)
+                if col == 6:  # Action column
+                    item.setForeground(QBrush(action_color))
+                    item.setFont(QFont("Arial", 10, QFont.Bold))
+                self.timeline_table.setItem(row, col, item)
+        
+        self.timeline_table.setSortingEnabled(True)
+    
+    def closeEvent(self, event) -> None:
+        """Handle dialog close event."""
+        self.refresh_timer.stop()
+        event.accept()
 
 
 class RdrsGui(QWidget):
     def __init__(self):
         super().__init__()
-        self.process = None
-        self.reader_thread = None
+        self.monitor_session: Optional[MonitorSession] = None
+        self._pending_log_lines: List[str] = []
         self.event_rows: List[dict] = []
+        self.suspicious_process_rows: Dict[Tuple[Optional[str], str], int] = {}
+        self.active_process_rows: Dict[Tuple[Optional[str], str], int] = {}
+        self.inactive_process_rows: Dict[Tuple[Optional[str], str], int] = {}
+        self.process_state_cache: Dict[Tuple[Optional[str], str], dict] = {}
+        self.process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.raw_output_window = None
         self.event_count = 0
         self.start_time = None
@@ -110,7 +530,7 @@ class RdrsGui(QWidget):
         self.runtime_timer.setInterval(1000)
         self.runtime_timer.timeout.connect(self._update_runtime_display)
         self.output_bridge = OutputBridge()
-        self.output_bridge.new_raw_line.connect(self.append_raw_line)
+        self.output_bridge.new_raw_line.connect(self._handle_monitor_line)
         self.output_bridge.new_log_entry.connect(self.add_log_row)
         self.output_bridge.process_started.connect(self.on_process_started)
         self.output_bridge.process_stopped.connect(self.on_process_stopped)
@@ -154,6 +574,11 @@ class RdrsGui(QWidget):
         self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.monitoring_button)
 
+        self.processes_button = QPushButton("▶ Processes")
+        self.processes_button.clicked.connect(lambda: self.select_page(2))
+        self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        sidebar_layout.addWidget(self.processes_button)
+
         sidebar_layout.addSpacing(12)
 
         controls_label = QLabel("Monitor Settings")
@@ -194,8 +619,18 @@ class RdrsGui(QWidget):
         home_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
         home_layout.addWidget(home_title)
 
-        self.home_table = QTableWidget(0, 3)
-        self.home_table.setHorizontalHeaderLabels(["Process Name", "PID", "Reason"])
+        self.home_table = QTableWidget(0, 9)
+        self.home_table.setHorizontalHeaderLabels([
+            "Process Name",
+            "PID",
+            "Executable",
+            "Score",
+            "Modified",
+            "Created",
+            "Deleted",
+            "Unique Directories",
+            "Last Activity",
+        ])
         self.home_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.home_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.home_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -242,6 +677,103 @@ class RdrsGui(QWidget):
         file_layout.addWidget(raw_output_btn)
 
         self.page_stack.addWidget(self.file_monitoring_page)
+
+        self.processes_page = QWidget()
+        processes_layout = QVBoxLayout()
+        processes_layout.setContentsMargins(24, 24, 24, 24)
+        processes_layout.setSpacing(14)
+        self.processes_page.setLayout(processes_layout)
+
+        processes_title = QLabel("Processes")
+        processes_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #ffffff;")
+        processes_layout.addWidget(processes_title)
+
+        process_description = QLabel("Active and inactive process summaries are shown here. Each row reflects the current process state from the monitor.")
+        process_description.setWordWrap(True)
+        process_description.setStyleSheet("color: #d1d1d1; font-size: 12px; margin-bottom: 10px;")
+        processes_layout.addWidget(process_description)
+
+        processes_split_layout = QHBoxLayout()
+        processes_split_layout.setSpacing(16)
+
+        active_container = QWidget()
+        active_layout = QVBoxLayout()
+        active_layout.setContentsMargins(0, 0, 0, 0)
+        active_layout.setSpacing(8)
+        active_container.setLayout(active_layout)
+
+        active_label = QLabel("Active Processes")
+        active_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        active_layout.addWidget(active_label)
+
+        self.active_process_table = QTableWidget(0, 13)
+        self.active_process_table.setHorizontalHeaderLabels([
+            "Process Name",
+            "PID",
+            "Process Age",
+            "Executable Path",
+            "Files Created",
+            "Files Modified",
+            "Files Deleted",
+            "Unique Files",
+            "Events/sec",
+            "Events/min",
+            "Current Score",
+            "Classification",
+            "Last Activity",
+        ])
+        self.active_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.active_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.active_process_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.active_process_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.active_process_table.setStyleSheet(
+            "QTableWidget { background: #1f2430; font-size: 12px; }"
+            "QHeaderView::section { padding: 10px; }"
+        )
+        self.active_process_table.doubleClicked.connect(self.on_process_double_click)
+        active_layout.addWidget(self.active_process_table)
+
+        inactive_container = QWidget()
+        inactive_layout = QVBoxLayout()
+        inactive_layout.setContentsMargins(0, 0, 0, 0)
+        inactive_layout.setSpacing(8)
+        inactive_container.setLayout(inactive_layout)
+
+        inactive_label = QLabel("Inactive Processes")
+        inactive_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        inactive_layout.addWidget(inactive_label)
+
+        self.inactive_process_table = QTableWidget(0, 13)
+        self.inactive_process_table.setHorizontalHeaderLabels([
+            "Process Name",
+            "PID",
+            "Process Age",
+            "Executable Path",
+            "Files Created",
+            "Files Modified",
+            "Files Deleted",
+            "Unique Files",
+            "Events/sec",
+            "Events/min",
+            "Current Score",
+            "Classification",
+            "Last Activity",
+        ])
+        self.inactive_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.inactive_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.inactive_process_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.inactive_process_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.inactive_process_table.setStyleSheet(
+            "QTableWidget { background: #1f2430; font-size: 12px; }"
+            "QHeaderView::section { padding: 10px; }"
+        )
+        self.inactive_process_table.doubleClicked.connect(self.on_process_double_click)
+        inactive_layout.addWidget(self.inactive_process_table)
+
+        processes_split_layout.addWidget(active_container, 1)
+        processes_split_layout.addWidget(inactive_container, 1)
+        processes_layout.addLayout(processes_split_layout)
+        self.page_stack.addWidget(self.processes_page)
 
         bottom_bar = QWidget()
         bottom_layout = QHBoxLayout()
@@ -298,45 +830,49 @@ class RdrsGui(QWidget):
         if index == 0:
             self.home_button.setText("▼ Home")
             self.monitoring_button.setText("▶ File Monitoring")
+            self.processes_button.setText("▶ Processes")
             self.home_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
             self.monitoring_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
-        else:
+            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        elif index == 1:
             self.home_button.setText("▶ Home")
             self.monitoring_button.setText("▼ File Monitoring")
+            self.processes_button.setText("▶ Processes")
             self.home_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
             self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
+            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        else:
+            self.home_button.setText("▶ Home")
+            self.monitoring_button.setText("▶ File Monitoring")
+            self.processes_button.setText("▼ Processes")
+            self.home_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
+            self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
 
     def start_monitor(self):
-        if self.process is not None:
-            return
-        script_path = self._resolve_main_script()
-        if not script_path.exists():
-            self.handle_error(f"Could not find main.py at {script_path}")
+        if self.monitor_session is not None and self.monitor_session.is_running:
             return
 
-        monitor_path = self.path_input.text().strip() or str(Path.home())
+        monitor_path_text = self.path_input.text().strip() or str(Path.home())
+        monitor_path = Path(monitor_path_text).expanduser()
+        if not monitor_path.exists():
+            self.handle_error(f"Monitor path does not exist: {monitor_path}")
+            return
+
+        self._pending_log_lines.clear()
         self.append_raw_line(f"Starting monitor for: {monitor_path}")
 
-        cmd = [sys.executable, str(script_path), "--path", monitor_path]
-        if self.recursive_checkbox.isChecked():
-            cmd.append("--recursive")
+        self.monitor_session = MonitorSession(
+            target_path=monitor_path,
+            recursive=self.recursive_checkbox.isChecked(),
+            emit_line=self.output_bridge.new_raw_line.emit,
+            emit_error=self.output_bridge.error_occurred.emit,
+            emit_started=self.output_bridge.process_started.emit,
+            emit_stopped=self._on_monitor_stopped,
+        )
 
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-        except Exception as exc:
-            try:
-                self.runtime_timer.stop()
-            except Exception:
-                pass
-            self.handle_error(f"Failed to start monitor: {exc}")
-            self.process = None
+        if not self.monitor_session.start():
+            self.monitor_session = None
             return
 
         self.start_time = time.time()
@@ -345,20 +881,14 @@ class RdrsGui(QWidget):
         self._update_runtime_display()
         self.runtime_timer.start()
 
-        self.reader_thread = threading.Thread(target=self.read_process_output, daemon=True)
-        self.reader_thread.start()
-        self.output_bridge.process_started.emit()
-
     def stop_monitor(self):
-        if self.process is None:
+        if self.monitor_session is None:
             return
-        if self.process.poll() is None:
-            try:
-                self.process.terminate()
-            except Exception as exc:
-                self.handle_error(f"Failed to stop monitor: {exc}")
-        self.process = None
-        self.output_bridge.process_stopped.emit()
+        try:
+            self.monitor_session.stop()
+        except Exception as exc:
+            self.handle_error(f"Failed to stop monitor: {exc}")
+        self.monitor_session = None
         self.append_raw_line("Monitor stopped.")
         try:
             self.runtime_timer.stop()
@@ -392,6 +922,10 @@ class RdrsGui(QWidget):
             self.raw_output_window.append_line(line)
 
     def add_log_row(self, entry: dict) -> None:
+        if entry.get("event_type") == "PROCESS_STATE":
+            self._update_process_state_table(entry)
+            return
+
         row = self.log_table.rowCount()
         self.log_table.insertRow(row)
         self.event_rows.append(entry)
@@ -422,8 +956,11 @@ class RdrsGui(QWidget):
             if text_color is not None:
                 item.setForeground(QBrush(text_color))
             self.log_table.setItem(row, col_index, item)
+        self._update_suspicious_process_table(entry)
+        self._update_process_state_table(entry)
 
     def on_table_selection_changed(self):
+        """Handle log table selection changes."""
         selected_items = self.log_table.selectedItems()
         if not selected_items:
             return
@@ -432,35 +969,63 @@ class RdrsGui(QWidget):
             entry = self.event_rows[row]
             dialog = EventDetailsDialog(self, entry)
             dialog.exec_()
+    
+    def on_process_double_click(self) -> None:
+        """Handle double-click on process table to show details."""
+        # Determine which table was clicked
+        sender = self.sender()
+        if sender == self.active_process_table:
+            table = self.active_process_table
+            row_map = self.active_process_rows
+        elif sender == self.inactive_process_table:
+            table = self.inactive_process_table
+            row_map = self.inactive_process_rows
+        else:
+            return
+        
+        selected_items = table.selectedItems()
+        if not selected_items:
+            return
+        
+        row = selected_items[0].row()
+        
+        # Find process key for this row
+        process_key = None
+        for key, mapped_row in row_map.items():
+            if mapped_row == row:
+                process_key = key
+                break
+        
+        if process_key is None:
+            return
+        
+        # Get process data
+        process_data = self.process_state_cache.get(process_key)
+        if process_data is None:
+            return
+        
+        # Open details dialog
+        details_dialog = ProcessDetailsDialog(self, process_data, process_key)
+        details_dialog.show()
 
-    def read_process_output(self):
-        if self.process is None or self.process.stdout is None:
+    def _handle_monitor_line(self, line: str) -> None:
+        """Receive one formatted log line from the background monitor."""
+        self.append_raw_line(line)
+
+        if self._is_timestamped_header(line):
+            if self._pending_log_lines:
+                self._emit_log_entry(self._pending_log_lines)
+            self._pending_log_lines = [line]
             return
 
-        entry_lines: List[str] = []
-        try:
-            while self.process.poll() is None:
-                raw_line = self.process.stdout.readline()
-                if raw_line == "":
-                    break
-                line = raw_line.rstrip("\n")
-                self.output_bridge.new_raw_line.emit(line)
+        self._pending_log_lines.append(line)
 
-                if self._is_timestamped_header(line):
-                    if entry_lines:
-                        self._emit_log_entry(entry_lines)
-                    entry_lines = [line]
-                else:
-                    entry_lines.append(line)
-
-            if entry_lines:
-                self._emit_log_entry(entry_lines)
-        except Exception as exc:
-            self.handle_error(f"Error reading monitor output: {exc}")
-        finally:
-            self.process = None
-            self.output_bridge.process_stopped.emit()
-            self.output_bridge.new_raw_line.emit("main.py process exited.")
+    def _on_monitor_stopped(self) -> None:
+        """Flush any buffered log entry and update UI state."""
+        if self._pending_log_lines:
+            self._emit_log_entry(self._pending_log_lines)
+            self._pending_log_lines = []
+        self.output_bridge.process_stopped.emit()
 
     @staticmethod
     def _is_timestamped_header(line: str) -> bool:
@@ -469,7 +1034,7 @@ class RdrsGui(QWidget):
     def _emit_log_entry(self, lines: List[str]) -> None:
         entry = self._parse_logger_entry(lines)
         entry["raw_event"] = "\n".join(lines)
-        # try to enrich record (best-effort; will not alter main.py behavior)
+        # Try to enrich the record (best-effort; never blocks the monitor).
         try:
             self._enrich_record(entry)
         except Exception:
@@ -541,6 +1106,16 @@ class RdrsGui(QWidget):
             "pid": "",
             "executable": "",
             "parent_process": "",
+            "score": "",
+            "reason": "",
+            "files_modified": "",
+            "files_created": "",
+            "files_deleted": "",
+            "unique_directories": "",
+            "unique_files": "",
+            "last_activity": "",
+            "process_age": "",
+            "classification": "",
             "message": "",
             "raw_event": "",
         }
@@ -556,12 +1131,33 @@ class RdrsGui(QWidget):
 
         body = "\n".join(lines[1:]).strip()
         if body:
-            if body.startswith("EVENT:") or "EVENT:" in body:
-                self._parse_event_block(body, log_record)
-            elif not log_record["message"]:
-                log_record["message"] = body
+            is_detection_body = body.startswith("[Detection]") or "[Detection]" in body
+            is_process_state = body.startswith("[ProcessState]") or "[ProcessState]" in body
+            if is_process_state:
+                self._parse_process_state_block(body, log_record)
+            elif is_detection_body:
+                self._parse_detection_block(body, log_record)
             else:
-                log_record["message"] = f"{log_record['message']}\n{body}" if log_record["message"] else body
+                is_event_body = body.startswith("EVENT:") or "EVENT:" in body
+                if is_event_body:
+                    self._parse_event_block(body, log_record)
+                elif not log_record["message"]:
+                    log_record["message"] = body
+                else:
+                    log_record["message"] = f"{log_record['message']}\n{body}" if log_record["message"] else body
+
+            if not log_record["event_type"]:
+                normalized_body = body.upper()
+                if "FILE MODIFIED" in normalized_body:
+                    log_record["event_type"] = "FILE MODIFIED"
+                elif "FILE CREATED" in normalized_body:
+                    log_record["event_type"] = "FILE CREATED"
+                elif "FILE DELETED" in normalized_body:
+                    log_record["event_type"] = "FILE DELETED"
+                elif is_detection_body:
+                    log_record["event_type"] = "DETECTION"
+                elif is_process_state:
+                    log_record["event_type"] = "PROCESS_STATE"
 
         return log_record
 
@@ -594,6 +1190,189 @@ class RdrsGui(QWidget):
                     record["message"] += f"\n{line}"
                 current_key = None
 
+    def _parse_detection_block(self, body: str, record: dict) -> None:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        current_key = None
+        for line in lines:
+            if line.startswith("[Detection]"):
+                record["event_type"] = "DETECTION"
+                continue
+            if line.endswith(":"):
+                current_key = line[:-1].lower().replace(" ", "_")
+                continue
+            if current_key and line:
+                if current_key == "process":
+                    record["process"] = line
+                elif current_key == "pid":
+                    record["pid"] = line
+                elif current_key == "executable":
+                    record["executable"] = line
+                elif current_key == "reason":
+                    record["reason"] = line
+                elif current_key == "score":
+                    record["score"] = line
+                elif current_key == "files_modified":
+                    record["files_modified"] = line
+                elif current_key == "files_created":
+                    record["files_created"] = line
+                elif current_key == "files_deleted":
+                    record["files_deleted"] = line
+                elif current_key == "unique_directories":
+                    record["unique_directories"] = line
+                elif current_key == "last_activity":
+                    record["last_activity"] = line
+                elif current_key == "start_time":
+                    # Keep start time for future analysis, but no table column uses it yet.
+                    record["start_time"] = line
+                else:
+                    record["message"] += f"\n{line}"
+                current_key = None
+
+    def _parse_process_state_block(self, body: str, record: dict) -> None:
+        lines = [line.rstrip() for line in body.splitlines()]
+        current_key = None
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("[ProcessState]"):
+                record["event_type"] = "PROCESS_STATE"
+                continue
+            if line.endswith(":"):
+                current_key = line[:-1].strip().lower().replace(" ", "_")
+                continue
+            if current_key is None and ":" in line:
+                key, value = line.split(":", 1)
+                current_key = key.strip().lower().replace(" ", "_")
+                line = value.strip()
+            if current_key:
+                value = line
+                if current_key == "process_name":
+                    record["process"] = value
+                elif current_key == "pid":
+                    record["pid"] = value
+                elif current_key == "executable":
+                    record["executable"] = value
+                elif current_key == "process_age":
+                    record["process_age"] = value
+                elif current_key == "files_created":
+                    record["files_created"] = value
+                elif current_key == "files_modified":
+                    record["files_modified"] = value
+                elif current_key == "files_deleted":
+                    record["files_deleted"] = value
+                elif current_key == "unique_files":
+                    record["unique_files"] = value
+                elif current_key == "events_last_second":
+                    record["events_sec"] = value
+                elif current_key == "events_last_minute":
+                    record["events_min"] = value
+                elif current_key == "current_score":
+                    record["score"] = value
+                elif current_key == "classification":
+                    record["classification"] = value
+                elif current_key == "last_activity":
+                    record["last_activity"] = value
+                elif current_key == "process_start_time":
+                    record["process_start_time"] = value
+                elif current_key == "first_activity":
+                    record["first_activity"] = value
+                elif current_key == "total_events":
+                    record["total_events"] = value
+                else:
+                    record["message"] += f"\n{value}"
+                current_key = None
+
+    def _update_suspicious_process_table(self, entry: dict) -> None:
+        if entry.get("event_type") != "DETECTION":
+            return
+        try:
+            score = int(entry.get("score", "0"))
+        except ValueError:
+            score = 0
+        if score < 50:
+            return
+
+        key = (entry.get("pid"), entry.get("executable", ""))
+        row = self.suspicious_process_rows.get(key)
+        values = [
+            entry.get("process", ""),
+            entry.get("pid", ""),
+            entry.get("executable", ""),
+            str(score),
+            entry.get("files_modified", ""),
+            entry.get("files_created", ""),
+            entry.get("files_deleted", ""),
+            entry.get("unique_directories", ""),
+            entry.get("last_activity", ""),
+        ]
+        if row is None:
+            row = self.home_table.rowCount()
+            self.home_table.insertRow(row)
+            self.suspicious_process_rows[key] = row
+        for col_index, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            self.home_table.setItem(row, col_index, item)
+
+    def _update_process_state_table(self, entry: dict) -> None:
+        if entry.get("event_type") != "PROCESS_STATE":
+            return
+        key = (entry.get("pid"), entry.get("executable", ""))
+        self.process_state_cache[key] = entry.copy()
+        self._refresh_process_state_tables()
+
+    def _refresh_process_state_tables(self) -> None:
+        self.active_process_table.setRowCount(0)
+        self.inactive_process_table.setRowCount(0)
+        self.active_process_rows.clear()
+        self.inactive_process_rows.clear()
+
+        def _score_for_sort(item: tuple) -> int:
+            value = item[1].get("score", "0")
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        for key, entry in sorted(self.process_state_cache.items(), key=_score_for_sort, reverse=True):
+            last_activity = entry.get("last_activity", "")
+            is_active = self._process_is_active(last_activity)
+            target_table = self.active_process_table if is_active else self.inactive_process_table
+            row = target_table.rowCount()
+            target_table.insertRow(row)
+            if is_active:
+                self.active_process_rows[key] = row
+            else:
+                self.inactive_process_rows[key] = row
+
+            values = [
+                entry.get("process", ""),
+                entry.get("pid", ""),
+                entry.get("process_age", ""),
+                entry.get("executable", ""),
+                entry.get("files_created", ""),
+                entry.get("files_modified", ""),
+                entry.get("files_deleted", ""),
+                entry.get("unique_files", ""),
+                entry.get("events_sec", ""),
+                entry.get("events_min", ""),
+                entry.get("score", ""),
+                entry.get("classification", ""),
+                entry.get("last_activity", ""),
+            ]
+            for col_index, value in enumerate(values):
+                target_table.setItem(row, col_index, QTableWidgetItem(value))
+
+    def _process_is_active(self, last_activity: str) -> bool:
+        if not last_activity:
+            return False
+        try:
+            timestamp = time.strptime(last_activity, "%Y-%m-%d %H:%M:%S")
+            last_ts = time.mktime(timestamp)
+            return (time.time() - last_ts) <= 60.0
+        except Exception:
+            return False
+
     def _text_color_for_event(self, event_type: str):
         event_type = (event_type or "").upper()
         if "CREAT" in event_type:
@@ -603,13 +1382,6 @@ class RdrsGui(QWidget):
         if "MODIF" in event_type or "MODIFIED" in event_type or "MODIFY" in event_type:
             return QColor("#003a9e")
         return None
-
-    def _resolve_main_script(self) -> Path:
-        if getattr(sys, "frozen", False):
-            base_path = Path(sys._MEIPASS)
-        else:
-            base_path = Path(__file__).resolve().parent
-        return base_path / "main.py"
 
     def _update_runtime_display(self):
         if not self.start_time:

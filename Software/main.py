@@ -11,7 +11,7 @@ from utils.logger import setup_logger
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the monitoring application."""
     parser = argparse.ArgumentParser(
-        description="RDRS File System Monitor: watch file create/delete events in real time."
+        description="RDRS File System Monitor: watch file create/delete/modify events in real time."
     )
     parser.add_argument(
         "--path",
@@ -27,20 +27,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    """Create and start the filesystem monitor."""
-    args = parse_args()
-    logger = setup_logger()
-    monitor = FileSystemMonitor(target_path=args.path, recursive=args.recursive, logger=logger)
+def run_monitor(target_path: Path, recursive: bool, logger=None) -> None:
+    """Create and start the filesystem monitor.
 
-    logger.info("Starting RDRS filesystem monitor for %s", args.path)
+    Args:
+        target_path: Directory to monitor.
+        recursive: Whether to watch subdirectories.
+        logger: Optional logger instance. A configured default logger is created
+            when one is not supplied.
+    """
+    monitor_logger = logger or setup_logger()
+    monitor = FileSystemMonitor(target_path=target_path, recursive=recursive, logger=monitor_logger)
+
+    monitor_logger.info("Starting RDRS filesystem monitor for %s", target_path)
     try:
         monitor.start()
         monitor.join()
     except KeyboardInterrupt:
-        logger.info("Stopping monitor due to user interrupt.")
+        monitor_logger.info("Stopping monitor due to user interrupt.")
     finally:
         monitor.stop()
+
+
+def main() -> None:
+    """Parse CLI arguments and start the monitor."""
+    args = parse_args()
+    run_monitor(args.path, args.recursive)
 
 
 if __name__ == "__main__":

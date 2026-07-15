@@ -18,7 +18,7 @@ echo ""
 
 # Start monitor in background
 echo "Starting monitor in background..."
-"$PYTHON" main.py --path "$MONITOR_DIR" &
+"$PYTHON" -m main --path "$MONITOR_DIR" &
 MONITOR_PID=$!
 echo "✓ Monitor started (PID: $MONITOR_PID)"
 echo ""

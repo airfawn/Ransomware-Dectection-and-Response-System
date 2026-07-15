@@ -1,48 +1,43 @@
-# -*- mode: python -*-
-block_cipher = None
-
-import os
-from PyInstaller.utils.hooks import collect_submodules
-
-# Ensure main.py is bundled alongside the GUI
-datas = [
-    ('main.py', '.'),
-]
-hiddenimports = collect_submodules('PyQt5')
+# -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
     ['basic_gui.py'],
-    pathex=[os.path.dirname(__file__)],
+    pathex=[],
     binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
+    datas=[],
+    hiddenimports=['monitor', 'monitor.filesystem_monitor', 'monitor.session', 'utils', 'utils.logger', 'utils.paths'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
+    noarchive=False,
+    optimize=0,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
+
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
-    name='rdrs_gui',
+    name='basic_gui',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
 )
-coll = COLLECT(
+app = BUNDLE(
     exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    name='rdrs_gui',
+    name='basic_gui.app',
+    icon=None,
+    bundle_identifier=None,
 )
