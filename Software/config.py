@@ -1,16 +1,23 @@
 """Centralized configuration for RDRS.
 
 This module provides a single source of truth for all configuration parameters,
-thresholds, and limits used throughout the application. It supports both
+thresholds, and limits used throughout the application.  It supports both
 development and production environments and is designed for easy tuning.
+
+Runtime values are loaded from config.yaml (searched next to the executable or
+in the source tree).  If the file is absent or malformed the application falls
+back to the dataclass defaults — ensuring the application always starts.
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 import sys
+import logging
 
 from utils.paths import get_base_dir, get_log_dir, get_config_dir
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -172,15 +179,68 @@ class PathConfig:
 
 
 @dataclass
+class EntropyConfig:
+    """Configuration for the Shannon Entropy detection module."""
+
+    # File extensions to check for entropy (lowercase, no leading dot).
+    # Populated from config.yaml; sensible defaults are provided here.
+    file_extensions: List[str] = field(default_factory=lambda: [
+        "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf",
+        "txt", "csv", "jpg", "jpeg", "png", "zip",
+        "py", "js", "ts", "html", "xml", "json",
+        "db", "sqlite", "sqlite3",
+    ])
+
+    # Directories to watch — resolved at runtime so "~" is expanded.
+    directories: List[str] = field(default_factory=lambda: ["~"])
+
+    # Bytes to read per file (5 MB default).
+    sample_size_bytes: int = 5 * 1024 * 1024
+
+    # Entropy increase (bits) above which an event is emitted to the Engine.
+    # See config.yaml for rationale.
+    threshold: float = 1.4
+
+    # Score delta the Engine adds on EntropyIncreaseDetected.
+    score: int = 30
+
+
+@dataclass
+class DatabaseConfig:
+    """Configuration for SQLite database file names and retention policies."""
+
+    metadata_db: str = "metadata.db"
+    logs_db: str = "logs.db"
+    alerts_db: str = "alerts.db"
+
+    # Days to retain deleted-file records in metadata.db before purging.
+    metadata_retention_days: int = 30
+
+    # Maximum rows in the logs table; oldest rows purged when exceeded.
+    max_log_rows: int = 500_000
+
+
+@dataclass
+class AlertsConfig:
+    """Configuration for alert thresholds and notifications."""
+
+    # Process score at or above which the Home page shows a red alert banner.
+    process_alert_threshold: int = 70
+
+
+@dataclass
 class AppConfig:
     """Master configuration container for the entire application."""
-    
+
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     paths: PathConfig = field(default_factory=PathConfig)
-    
+    entropy: EntropyConfig = field(default_factory=EntropyConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary for serialization."""
         return {
@@ -194,8 +254,123 @@ class AppConfig:
                 "classification_colors": self.gui.classification_colors.copy(),
             },
             "logging": self.logging.__dict__,
+            "entropy": self.entropy.__dict__,
+            "database": self.database.__dict__,
+            "alerts": self.alerts.__dict__,
         }
 
+
+# ---------------------------------------------------------------------------
+# YAML loading helpers
+# ---------------------------------------------------------------------------
+
+def _find_config_yaml() -> Optional[Path]:
+    """Search for config.yaml in order of priority.
+
+    Priority:
+    1. Next to the executable / sys._MEIPASS (frozen builds).
+    2. Next to this source file's parent (Software/ directory).
+    3. Current working directory.
+
+    Returns:
+        Path to config.yaml or None if not found.
+    """
+    candidates: List[Path] = []
+
+    if getattr(sys, "frozen", False):
+        # PyInstaller: bundled assets are in sys._MEIPASS
+        candidates.append(Path(sys._MEIPASS) / "config.yaml")
+        # Also check next to the actual executable
+        candidates.append(Path(sys.executable).parent / "config.yaml")
+    else:
+        # Source mode: config.yaml sits in Software/
+        candidates.append(Path(__file__).resolve().parent / "config.yaml")
+
+    candidates.append(Path.cwd() / "config.yaml")
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    return None
+
+
+def _load_yaml_config(path: Path) -> Dict[str, Any]:
+    """Load and parse a YAML config file.
+
+    Args:
+        path: Path to config.yaml.
+
+    Returns:
+        Parsed dictionary, or empty dict on error.
+    """
+    try:
+        import yaml  # PyYAML — optional but strongly recommended
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return data
+    except ImportError:
+        logger.warning(
+            "PyYAML is not installed.  Install it with: pip install pyyaml\n"
+            "Falling back to built-in defaults."
+        )
+        return {}
+    except Exception as exc:
+        logger.warning("Failed to parse config.yaml (%s): %s — using defaults.", path, exc)
+        return {}
+
+
+def _apply_yaml_to_config(cfg: AppConfig, data: Dict[str, Any]) -> None:
+    """Overwrite cfg fields with values from the parsed YAML dict.
+
+    Only keys that exist in the YAML are applied; missing keys retain defaults.
+
+    Args:
+        cfg: AppConfig instance to modify in-place.
+        data: Parsed YAML dictionary.
+    """
+    # -- monitoring section --------------------------------------------------
+    mon = data.get("monitoring") or {}
+
+    # -- entropy section -----------------------------------------------------
+    ent = data.get("entropy") or {}
+    if "sample_size_mb" in ent:
+        cfg.entropy.sample_size_bytes = int(ent["sample_size_mb"]) * 1024 * 1024
+    if "threshold" in ent:
+        cfg.entropy.threshold = float(ent["threshold"])
+    if "score" in ent:
+        cfg.entropy.score = int(ent["score"])
+    if "file_extensions" in mon:
+        exts = mon["file_extensions"]
+        if isinstance(exts, list):
+            cfg.entropy.file_extensions = [str(e).lower().lstrip(".") for e in exts]
+    if "directories" in mon:
+        dirs = mon["directories"]
+        if isinstance(dirs, list):
+            cfg.entropy.directories = [str(d) for d in dirs]
+
+    # -- database section ----------------------------------------------------
+    db = data.get("database") or {}
+    if "metadata_db" in db:
+        cfg.database.metadata_db = str(db["metadata_db"])
+    if "logs_db" in db:
+        cfg.database.logs_db = str(db["logs_db"])
+    if "alerts_db" in db:
+        cfg.database.alerts_db = str(db["alerts_db"])
+    if "metadata_retention_days" in db:
+        cfg.database.metadata_retention_days = int(db["metadata_retention_days"])
+    if "max_log_rows" in db:
+        cfg.database.max_log_rows = int(db["max_log_rows"])
+
+    # -- alerts section ------------------------------------------------------
+    al = data.get("alerts") or {}
+    if "process_alert_threshold" in al:
+        cfg.alerts.process_alert_threshold = int(al["process_alert_threshold"])
+
+
+# ---------------------------------------------------------------------------
+# Global config instance
+# ---------------------------------------------------------------------------
 
 # Global configuration instance
 _config: AppConfig = AppConfig()
@@ -203,7 +378,7 @@ _config: AppConfig = AppConfig()
 
 def get_config() -> AppConfig:
     """Return the global configuration instance.
-    
+
     Returns:
         The application configuration object.
     """
@@ -211,6 +386,18 @@ def get_config() -> AppConfig:
 
 
 def reload_config() -> None:
-    """Reload configuration from defaults (future: from file)."""
+    """Reload configuration: first resets to defaults, then applies config.yaml."""
     global _config
     _config = AppConfig()
+    yaml_path = _find_config_yaml()
+    if yaml_path is not None:
+        data = _load_yaml_config(yaml_path)
+        _apply_yaml_to_config(_config, data)
+        logger.debug("Loaded config.yaml from %s", yaml_path)
+    else:
+        logger.debug("config.yaml not found — using built-in defaults.")
+
+
+# Apply YAML config at import time so the first call to get_config() is
+# already populated with the user's settings.
+reload_config()

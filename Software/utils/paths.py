@@ -2,9 +2,15 @@
 
 This module provides helpers to resolve asset and log directories correctly
 whether the application is running from source or as a PyInstaller bundle.
+
+Key distinction:
+  - get_base_dir()  → bundled read-only assets (inside sys._MEIPASS or source tree)
+  - get_data_dir()  → writable user data (databases, logs) that MUST survive
+                      across PyInstaller runs.  Never placed inside the bundle.
 """
 
 import sys
+import platform
 from pathlib import Path
 
 
@@ -52,6 +58,42 @@ def get_config_dir() -> Path:
     config_dir = get_base_dir() / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
+
+
+def get_data_dir() -> Path:
+    """Return the platform-appropriate writable user data directory for RDRS.
+
+    This directory stores persistent, writable data (SQLite databases, user logs)
+    that must survive between PyInstaller runs.  It is NEVER located inside the
+    bundle itself, because PyInstaller's onefile mode extracts to a temp directory
+    that is deleted on exit.
+
+    Platform locations:
+      - macOS  : ~/Library/Application Support/RDRS/
+      - Windows: %APPDATA%/RDRS/          (C:/Users/<user>/AppData/Roaming/RDRS/)
+      - Linux  : ~/.local/share/RDRS/
+
+    The directory is created automatically if it does not exist.
+
+    Returns:
+        Path to the writable RDRS data directory.
+    """
+    system = platform.system()
+    if system == "Darwin":
+        base = Path.home() / "Library" / "Application Support" / "RDRS"
+    elif system == "Windows":
+        import os
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            base = Path(appdata) / "RDRS"
+        else:
+            base = Path.home() / "AppData" / "Roaming" / "RDRS"
+    else:
+        # Linux / other UNIX
+        base = Path.home() / ".local" / "share" / "RDRS"
+
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def is_frozen() -> bool:

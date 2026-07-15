@@ -266,22 +266,63 @@ class FileActivityEngine(DetectionEngine):
 
 
 class EntropyAnalysisEngine(DetectionEngine):
-    """Placeholder for future entropy analysis detection.
-    
-    This engine will analyze file entropy to detect encryption patterns.
+    """Detection engine that scores processes on entropy-increase alerts.
+
+    This engine is activated by the EntropyMonitor (entropy/monitor.py).
+    When the EntropyMonitor detects a suspicious entropy increase it calls
+    notify_entropy_event(), which this engine records.  The next call to
+    evaluate() (triggered by any file event on the same process) converts
+    the pending alert into a DetectionResult with the configured score delta.
+
+    The Entropy Module itself NEVER modifies scores — it only calls this
+    engine via notify_entropy_event().  The Engine (this class) decides
+    the score delta.
+
+    Score rationale:
+        A default of +30 is assigned per entropy alert.  This matches the
+        multi-directory rule weight and reflects that a single file's entropy
+        spike is strong evidence but not conclusive on its own.  The score is
+        configurable via config.yaml (entropy.score).
     """
-    
-    def __init__(self):
-        self._enabled = False  # Not yet implemented
-    
+
+    def __init__(self, score_delta: int = 30) -> None:
+        """Initialise the engine.
+
+        Args:
+            score_delta: Score to add per confirmed entropy increase event.
+                         Should be sourced from config.entropy.score.
+        """
+        import threading as _threading
+        self._enabled = True
+        self._score_delta = score_delta
+        # Queue of pending entropy events waiting to be scored.
+        self._pending_alerts: List[dict] = []
+        self._lock = _threading.Lock()
+
     @property
     def name(self) -> str:
         return "EntropyAnalysisEngine"
-    
+
     @property
     def enabled(self) -> bool:
         return self._enabled
-    
+
+    def notify_entropy_event(self, file_path: str, entropy_delta: float) -> None:
+        """Record a pending entropy-increase alert for the next evaluate() call.
+
+        Called by the GUI bridge on the Qt main thread after receiving an
+        EntropyIncreaseDetected signal from the EntropyMonitor.
+
+        Args:
+            file_path:     The affected file path.
+            entropy_delta: The entropy increase in bits.
+        """
+        with self._lock:
+            self._pending_alerts.append({
+                "file_path": file_path,
+                "delta": entropy_delta,
+            })
+
     def evaluate(
         self,
         process_context: ProcessContext,
@@ -289,10 +330,29 @@ class EntropyAnalysisEngine(DetectionEngine):
         timestamp: float,
         file_path: str,
     ) -> List[DetectionResult]:
-        """Future: Analyze file entropy patterns."""
-        return []
-    
+        """Return DetectionResults for any queued entropy alerts."""
+        with self._lock:
+            pending = self._pending_alerts.copy()
+            self._pending_alerts.clear()
+
+        results: List[DetectionResult] = []
+        for alert in pending:
+            results.append(DetectionResult(
+                rule_name="EntropyIncrease",
+                reason=(
+                    f"File entropy increased by {alert['delta']:.2f} bits/byte "
+                    f"in {alert['file_path']} — possible encryption in progress"
+                ),
+                score_delta=self._score_delta,
+                severity="high",
+                metadata={"file_path": alert["file_path"], "entropy_delta": alert["delta"]},
+            ))
+        return results
+
     def is_rule_active(self, rule_name: str, process_context: ProcessContext) -> bool:
+        if rule_name == "EntropyIncrease":
+            with self._lock:
+                return len(self._pending_alerts) > 0
         return False
 
 

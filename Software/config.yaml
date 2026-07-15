@@ -1,0 +1,84 @@
+# RDRS Configuration
+# All runtime-tunable values live here. Never hardcode these in source files.
+# Restart the application for changes to take effect.
+
+monitoring:
+  # Directories to watch for entropy analysis.
+  # These are also passed to the file monitor as the canonical monitored paths.
+  # At minimum, include the user's home directory or any sensitive data folders.
+  directories:
+    - "~"
+
+  # File extensions that the entropy module will scan.
+  # Extensions must be lowercase, without a leading dot.
+  file_extensions:
+    - doc
+    - docx
+    - xls
+    - xlsx
+    - ppt
+    - pptx
+    - pdf
+    - txt
+    - csv
+    - jpg
+    - jpeg
+    - png
+    - zip
+    - py
+    - js
+    - ts
+    - html
+    - xml
+    - json
+    - db
+    - sqlite
+    - sqlite3
+
+entropy:
+  # How many bytes of each file are read for entropy calculation.
+  # Ransomware typically encrypts the full file, so the first 5 MB
+  # is a sufficient and performant sample.  Reducing this value speeds
+  # up scanning but may miss partial-encryption patterns.
+  sample_size_mb: 5
+
+  # Minimum entropy increase (bits) between two scans that is treated as
+  # suspicious.
+  #
+  # Rationale:
+  #   - Plaintext English/source files typically have entropy 3.5–5.0 bits/byte.
+  #   - Encrypted or compressed data approaches 7.5–8.0 bits/byte.
+  #   - A legitimate "save" of a Word document rarely changes entropy by > 0.5.
+  #   - Modern ransomware (LockBit, BlackCat, Conti) typically jumps entropy
+  #     from ~4.5 to ~7.8 after encryption — a delta of ~3.3.
+  #   - Setting the threshold at 1.4 bits provides a comfortable margin above
+  #     normal compression/format changes while catching early-stage encryption.
+  #   Reference: "Entropy-Based Detection of Ransomware" (NDSS 2019);
+  #              Continella et al., "ShieldFS" (ACSAC 2016).
+  threshold: 1.4
+
+  # Score delta the Engine awards when EntropyIncreaseDetected fires.
+  # This value is READ by the Engine / detection_engine.py — the entropy module
+  # itself never modifies scores.
+  score: 30
+
+database:
+  # File names only — the application resolves the full path to a platform-
+  # appropriate writable directory (e.g. ~/Library/Application Support/RDRS/).
+  # Do NOT put absolute paths here.
+  metadata_db: metadata.db
+  logs_db:     logs.db
+  alerts_db:   alerts.db
+
+  # Deleted file records are kept for this many days before being purged.
+  metadata_retention_days: 30
+
+  # Maximum rows in the logs table.  When exceeded, the oldest rows are
+  # deleted in bulk.  500 000 rows is roughly 200–400 MB depending on
+  # event verbosity.
+  max_log_rows: 500000
+
+alerts:
+  # A process score at or above this value triggers the red alert banner
+  # on the Home page and plays a notification sound.
+  process_alert_threshold: 70

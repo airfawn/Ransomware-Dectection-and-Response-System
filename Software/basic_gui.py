@@ -16,6 +16,7 @@ Thread Safety:
 import re
 import sys
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
@@ -47,6 +48,10 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QComboBox,
     QFrame,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QAbstractItemView,
+    QSizePolicy,
 )
 
 from monitor.session import MonitorSession
@@ -57,6 +62,25 @@ try:
 except ImportError:
     _CONFIG_AVAILABLE = False
 
+try:
+    from database import get_logs_db, get_metadata_db, get_alerts_db
+    _DATABASE_AVAILABLE = True
+except ImportError:
+    _DATABASE_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Entropy / database integration (gracefully optional so the GUI still starts
+# even if new packages are not yet installed)
+# ---------------------------------------------------------------------------
+try:
+    from entropy import EntropyMonitor, EntropyIncreaseDetected
+    _ENTROPY_AVAILABLE = True
+except ImportError:
+    _ENTROPY_AVAILABLE = False
+    EntropyMonitor = None  # type: ignore[assignment,misc]
+
+logger = logging.getLogger(__name__)
+
 
 class OutputBridge(QObject):
     new_raw_line = pyqtSignal(str)
@@ -64,6 +88,11 @@ class OutputBridge(QObject):
     process_started = pyqtSignal()
     process_stopped = pyqtSignal()
     error_occurred = pyqtSignal(str)
+    # Emitted when EntropyMonitor detects a suspicious entropy increase.
+    # Payload: (file_path, process_name, previous_entropy, current_entropy, delta)
+    entropy_alert = pyqtSignal(str, str, float, float, float)
+    # Emitted periodically to refresh the Entropy Monitor page.
+    entropy_data_updated = pyqtSignal()
 
 
 class RawOutputWindow(QMainWindow):
@@ -535,6 +564,26 @@ class RdrsGui(QWidget):
         self.output_bridge.process_started.connect(self.on_process_started)
         self.output_bridge.process_stopped.connect(self.on_process_stopped)
         self.output_bridge.error_occurred.connect(self.show_error)
+        self.output_bridge.entropy_alert.connect(self._on_entropy_alert_signal)
+        self.output_bridge.entropy_data_updated.connect(self._refresh_entropy_table)
+
+        # --- Entropy monitor (created lazily when monitor starts) ----------
+        self._entropy_monitor: Optional[object] = None  # EntropyMonitor | None
+
+        # --- Alert banner state -------------------------------------------
+        self._alert_banner_visible: bool = False
+        # Timer to periodically refresh the entropy page data.
+        self._entropy_refresh_timer = QTimer()
+        self._entropy_refresh_timer.setInterval(5000)  # 5-second refresh
+        self._entropy_refresh_timer.timeout.connect(self.output_bridge.entropy_data_updated.emit)
+
+        # Persistent logs DB handle (available even when entropy module is not).
+        self._logs_db = None
+        if _DATABASE_AVAILABLE:
+            try:
+                self._logs_db = get_logs_db()
+            except Exception:
+                self._logs_db = None
 
         self.setWindowTitle("RDRS GUI Monitor")
         self.setStyleSheet(
@@ -545,6 +594,7 @@ class RdrsGui(QWidget):
             "QTableWidget { background: #1f2430; gridline-color: #2d3547; }"
         )
         self.build_ui()
+        self._load_persisted_logs(limit=300)
 
     def build_ui(self):
         main_layout = QHBoxLayout()
@@ -578,6 +628,11 @@ class RdrsGui(QWidget):
         self.processes_button.clicked.connect(lambda: self.select_page(2))
         self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.processes_button)
+
+        self.entropy_button = QPushButton("▶ Entropy Monitor")
+        self.entropy_button.clicked.connect(lambda: self.select_page(3))
+        self.entropy_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        sidebar_layout.addWidget(self.entropy_button)
 
         sidebar_layout.addSpacing(12)
 
@@ -618,6 +673,58 @@ class RdrsGui(QWidget):
         home_title = QLabel("Suspicious Behaviour")
         home_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
         home_layout.addWidget(home_title)
+
+        # ---- Alert banner (hidden by default; shown when score >= threshold) ----
+        self.alert_banner = QFrame()
+        self.alert_banner.setStyleSheet(
+            "QFrame { background: #8b0000; border: 2px solid #ff3333; border-radius: 8px; padding: 10px; }"
+        )
+        alert_banner_layout = QHBoxLayout()
+        alert_banner_layout.setContentsMargins(12, 8, 12, 8)
+
+        self._alert_icon = QLabel("🚨")
+        self._alert_icon.setStyleSheet("font-size: 22px;")
+        alert_banner_layout.addWidget(self._alert_icon)
+
+        self._alert_text = QLabel("Suspicious process detected — score threshold exceeded!")
+        self._alert_text.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: bold;")
+        self._alert_text.setWordWrap(True)
+        alert_banner_layout.addWidget(self._alert_text, 1)
+
+        # V1: Only Ignore is functional; others are visual stubs.
+        _btn_style = (
+            "QPushButton { background: #cc0000; color: white; font-weight: bold; "
+            "padding: 6px 14px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background: #e00000; }"
+        )
+        _stub_style = (
+            "QPushButton { background: #5a1a1a; color: #aaaaaa; font-weight: bold; "
+            "padding: 6px 14px; border-radius: 5px; border: 1px solid #7a2020; }"
+        )
+
+        btn_ignore = QPushButton("Ignore")
+        btn_ignore.setStyleSheet(_btn_style)
+        btn_ignore.clicked.connect(self._dismiss_alert_banner)
+        alert_banner_layout.addWidget(btn_ignore)
+
+        btn_quarantine = QPushButton("Quarantine")
+        btn_quarantine.setStyleSheet(_stub_style)
+        btn_quarantine.setToolTip("Not yet implemented in v1.0")
+        alert_banner_layout.addWidget(btn_quarantine)
+
+        btn_delete = QPushButton("Delete")
+        btn_delete.setStyleSheet(_stub_style)
+        btn_delete.setToolTip("Not yet implemented in v1.0")
+        alert_banner_layout.addWidget(btn_delete)
+
+        btn_more = QPushButton("More Information")
+        btn_more.setStyleSheet(_stub_style)
+        btn_more.setToolTip("Not yet implemented in v1.0")
+        alert_banner_layout.addWidget(btn_more)
+
+        self.alert_banner.setLayout(alert_banner_layout)
+        self.alert_banner.setVisible(False)
+        home_layout.addWidget(self.alert_banner)
 
         self.home_table = QTableWidget(0, 9)
         self.home_table.setHorizontalHeaderLabels([
@@ -775,6 +882,89 @@ class RdrsGui(QWidget):
         processes_layout.addLayout(processes_split_layout)
         self.page_stack.addWidget(self.processes_page)
 
+        # ---- Entropy Monitor page ----------------------------------------
+        self.entropy_page = QWidget()
+        entropy_layout = QVBoxLayout()
+        entropy_layout.setContentsMargins(24, 24, 24, 24)
+        entropy_layout.setSpacing(14)
+        self.entropy_page.setLayout(entropy_layout)
+
+        entropy_title = QLabel("Entropy Monitor")
+        entropy_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        entropy_layout.addWidget(entropy_title)
+
+        entropy_desc = QLabel(
+            "Displays entropy values for monitored files. "
+            "High entropy increases may indicate encryption by ransomware."
+        )
+        entropy_desc.setWordWrap(True)
+        entropy_desc.setStyleSheet("color: #d1d1d1; font-size: 12px; margin-bottom: 6px;")
+        entropy_layout.addWidget(entropy_desc)
+
+        # Toolbar row (directory selector + refresh button)
+        entropy_toolbar = QHBoxLayout()
+
+        entropy_dir_label = QLabel("Directory:")
+        entropy_dir_label.setStyleSheet("color: #d9d9d9;")
+        entropy_toolbar.addWidget(entropy_dir_label)
+
+        self.entropy_dir_input = QLineEdit(str(Path.home()))
+        self.entropy_dir_input.setStyleSheet(
+            "background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;"
+        )
+        self.entropy_dir_input.setPlaceholderText("Filter by directory prefix…")
+        entropy_toolbar.addWidget(self.entropy_dir_input, 1)
+
+        btn_refresh_entropy = QPushButton("↻ Refresh")
+        btn_refresh_entropy.clicked.connect(self._refresh_entropy_table)
+        btn_refresh_entropy.setStyleSheet(
+            "background: #2f3a59; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;"
+        )
+        entropy_toolbar.addWidget(btn_refresh_entropy)
+
+        entropy_layout.addLayout(entropy_toolbar)
+
+        # Status label for entropy module state
+        self.entropy_status_label = QLabel(
+            "⚠ Entropy module not available — install the 'entropy' and 'database' packages."
+            if not _ENTROPY_AVAILABLE else
+            "Entropy module ready.  Start the monitor to begin tracking."
+        )
+        self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        self.entropy_status_label.setWordWrap(True)
+        entropy_layout.addWidget(self.entropy_status_label)
+
+        # File explorer-style table
+        self.entropy_table = QTableWidget(0, 7)
+        self.entropy_table.setHorizontalHeaderLabels([
+            "File Name",
+            "Current Entropy",
+            "Previous Entropy",
+            "Δ Entropy",
+            "File Size",
+            "Last Scan",
+            "Status",
+        ])
+        self.entropy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.entropy_table.horizontalHeader().setStretchLastSection(True)
+        self.entropy_table.setColumnWidth(0, 240)
+        self.entropy_table.setColumnWidth(1, 120)
+        self.entropy_table.setColumnWidth(2, 120)
+        self.entropy_table.setColumnWidth(3, 100)
+        self.entropy_table.setColumnWidth(4, 90)
+        self.entropy_table.setColumnWidth(5, 160)
+        self.entropy_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.entropy_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.entropy_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.entropy_table.setSortingEnabled(True)
+        self.entropy_table.setStyleSheet(
+            "QTableWidget { background: #1f2430; font-size: 12px; }"
+            "QHeaderView::section { padding: 8px; }"
+        )
+        entropy_layout.addWidget(self.entropy_table)
+
+        self.page_stack.addWidget(self.entropy_page)
+
         bottom_bar = QWidget()
         bottom_layout = QHBoxLayout()
         bottom_layout.setContentsMargins(18, 12, 18, 12)
@@ -827,27 +1017,33 @@ class RdrsGui(QWidget):
 
     def select_page(self, index: int):
         self.page_stack.setCurrentIndex(index)
+        # Reset all buttons to inactive style
+        _inactive = "font-weight: bold; color: #ffffff; background: transparent;"
+        _active   = "font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;"
+
+        self.home_button.setStyleSheet(_inactive)
+        self.monitoring_button.setStyleSheet(_inactive)
+        self.processes_button.setStyleSheet(_inactive)
+        self.entropy_button.setStyleSheet(_inactive)
+
+        self.home_button.setText("▶ Home")
+        self.monitoring_button.setText("▶ File Monitoring")
+        self.processes_button.setText("▶ Processes")
+        self.entropy_button.setText("▶ Entropy Monitor")
+
         if index == 0:
             self.home_button.setText("▼ Home")
-            self.monitoring_button.setText("▶ File Monitoring")
-            self.processes_button.setText("▶ Processes")
-            self.home_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
-            self.monitoring_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
-            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+            self.home_button.setStyleSheet(_active)
         elif index == 1:
-            self.home_button.setText("▶ Home")
             self.monitoring_button.setText("▼ File Monitoring")
-            self.processes_button.setText("▶ Processes")
-            self.home_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
-            self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
-            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
-        else:
-            self.home_button.setText("▶ Home")
-            self.monitoring_button.setText("▶ File Monitoring")
+            self.monitoring_button.setStyleSheet(_active)
+        elif index == 2:
             self.processes_button.setText("▼ Processes")
-            self.home_button.setStyleSheet("font-weight: bold; color: #ffffff; background: transparent;")
-            self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
-            self.processes_button.setStyleSheet("font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;")
+            self.processes_button.setStyleSheet(_active)
+        elif index == 3:
+            self.entropy_button.setText("▼ Entropy Monitor")
+            self.entropy_button.setStyleSheet(_active)
+            self._refresh_entropy_table()
 
     def start_monitor(self):
         if self.monitor_session is not None and self.monitor_session.is_running:
@@ -859,8 +1055,60 @@ class RdrsGui(QWidget):
             self.handle_error(f"Monitor path does not exist: {monitor_path}")
             return
 
+        # Keep the Entropy Monitor page aligned with the active monitored
+        # directory so its table queries the same tree the file monitor is
+        # watching. Without this, the entropy table can stay empty even though
+        # metadata.db contains rows for the active directory.
+        if hasattr(self, "entropy_dir_input"):
+            self.entropy_dir_input.setText(str(monitor_path))
+
         self._pending_log_lines.clear()
         self.append_raw_line(f"Starting monitor for: {monitor_path}")
+        logger.info("[ENTROPY_TRACE][GUI] start_monitor path=%s entropy_available=%s", monitor_path, _ENTROPY_AVAILABLE)
+
+        # --- Start entropy monitor first (if available) -------------------
+        if _ENTROPY_AVAILABLE:
+            try:
+                cfg = get_config() if _CONFIG_AVAILABLE else None
+                ent_cfg = cfg.entropy if cfg else None
+                db_cfg  = cfg.database if cfg else None
+
+                meta_db   = get_metadata_db()
+                logs_db   = get_logs_db()
+                alerts_db = get_alerts_db()
+
+                allowed_ext = set(ent_cfg.file_extensions) if ent_cfg else set()
+                sample_size = ent_cfg.sample_size_bytes if ent_cfg else 5 * 1024 * 1024
+                threshold   = ent_cfg.threshold if ent_cfg else 1.4
+                retention   = db_cfg.metadata_retention_days if db_cfg else 30
+
+                self._entropy_monitor = EntropyMonitor(
+                    metadata_db=meta_db,
+                    logs_db=logs_db,
+                    alerts_db=alerts_db,
+                    allowed_extensions=allowed_ext,
+                    sample_size_bytes=sample_size,
+                    threshold=threshold,
+                    on_entropy_alert=self._entropy_alert_callback,
+                    retention_days=retention,
+                )
+                self._entropy_monitor.start()
+                logger.info(
+                    "[ENTROPY_TRACE][GUI] entropy_monitor_started threshold=%.3f sample_size=%s extensions=%s",
+                    threshold,
+                    sample_size,
+                    sorted(list(allowed_ext))[:20],
+                )
+                self.entropy_status_label.setText(
+                    f"Entropy module active  |  threshold: {threshold:.2f} bits  |  "
+                    f"watching {len(allowed_ext)} extension(s)"
+                )
+                self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+                self._entropy_refresh_timer.start()
+            except Exception as exc:
+                logger.exception("[ENTROPY_TRACE][GUI] entropy_monitor_start_failed: %s", exc)
+                self.entropy_status_label.setText(f"Entropy module failed to start: {exc}")
+                self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
 
         self.monitor_session = MonitorSession(
             target_path=monitor_path,
@@ -869,6 +1117,7 @@ class RdrsGui(QWidget):
             emit_error=self.output_bridge.error_occurred.emit,
             emit_started=self.output_bridge.process_started.emit,
             emit_stopped=self._on_monitor_stopped,
+            event_callback=self._on_filesystem_event,
         )
 
         if not self.monitor_session.start():
@@ -880,6 +1129,81 @@ class RdrsGui(QWidget):
         self.total_events_label.setText("Total events: 0")
         self._update_runtime_display()
         self.runtime_timer.start()
+
+    def _on_filesystem_event(
+        self,
+        event_type: str,
+        file_path: str,
+        process_name: str,
+        pid: Optional[int],
+        executable: str,
+        parent: str,
+    ) -> None:
+        """Handle raw filesystem events from the monitor callback.
+
+        This callback runs on watchdog's observer thread. It must stay light:
+        - persist event to logs.db (best effort)
+        - forward event to EntropyMonitor (if active)
+        """
+        logger.info(
+            "[ENTROPY_TRACE][GUI_CALLBACK] recv event=%s file=%s pid=%s proc=%s entropy_monitor=%s",
+            event_type,
+            file_path,
+            pid,
+            process_name,
+            self._entropy_monitor is not None,
+        )
+
+        if self._logs_db is not None:
+            try:
+                self._logs_db.log_event(
+                    event_type=event_type,
+                    file_path=file_path,
+                    file_name=Path(file_path).name,
+                    process=process_name,
+                    pid=pid,
+                    executable=executable,
+                    parent=parent,
+                )
+                logger.info(
+                    "[ENTROPY_TRACE][GUI_CALLBACK] logs_db_write_ok event=%s file=%s",
+                    event_type,
+                    file_path,
+                )
+            except Exception:
+                logger.exception(
+                    "[ENTROPY_TRACE][GUI_CALLBACK] logs_db_write_error event=%s file=%s",
+                    event_type,
+                    file_path,
+                )
+
+        if self._entropy_monitor is not None:
+            try:
+                self._entropy_monitor.on_file_event(
+                    event_type,
+                    file_path,
+                    process_name=process_name,
+                    pid=pid,
+                    executable=executable,
+                    parent=parent,
+                )
+                logger.info(
+                    "[ENTROPY_TRACE][GUI_CALLBACK] forwarded_to_entropy event=%s file=%s",
+                    event_type,
+                    file_path,
+                )
+            except Exception:
+                logger.exception(
+                    "[ENTROPY_TRACE][GUI_CALLBACK] forward_error event=%s file=%s",
+                    event_type,
+                    file_path,
+                )
+        else:
+            logger.warning(
+                "[ENTROPY_TRACE][GUI_CALLBACK] entropy monitor is None; skip forward event=%s file=%s",
+                event_type,
+                file_path,
+            )
 
     def stop_monitor(self):
         if self.monitor_session is None:
@@ -894,6 +1218,14 @@ class RdrsGui(QWidget):
             self.runtime_timer.stop()
         except Exception:
             pass
+        # Stop entropy monitor
+        if self._entropy_monitor is not None:
+            try:
+                self._entropy_monitor.stop()
+            except Exception:
+                pass
+            self._entropy_monitor = None
+        self._entropy_refresh_timer.stop()
 
     def on_process_started(self):
         self.start_button.setEnabled(False)
@@ -958,6 +1290,38 @@ class RdrsGui(QWidget):
             self.log_table.setItem(row, col_index, item)
         self._update_suspicious_process_table(entry)
         self._update_process_state_table(entry)
+
+    def _load_persisted_logs(self, limit: int = 300) -> None:
+        """Load recent persisted logs from logs.db into the File Monitoring page."""
+        if self._logs_db is None:
+            return
+        try:
+            rows = self._logs_db.get_recent(limit=limit)
+        except Exception:
+            return
+
+        # rows are newest-first; render oldest-first for natural timeline.
+        for row in reversed(rows):
+            ts = row["timestamp"]
+            try:
+                ts_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts_str = ""
+
+            entry = {
+                "timestamp": ts_str,
+                "level": "INFO",
+                "event_type": row["event_type"] or "",
+                "file": row["file_path"] or "",
+                "file_name": row["file_name"] or "",
+                "process": row["process"] or "",
+                "pid": str(row["pid"]) if row["pid"] is not None else "",
+                "executable": row["executable"] or "",
+                "parent_process": row["parent"] or "",
+                "message": "Loaded from logs.db",
+                "raw_event": "",
+            }
+            self.add_log_row(entry)
 
     def on_table_selection_changed(self):
         """Handle log table selection changes."""
@@ -1314,6 +1678,17 @@ class RdrsGui(QWidget):
             item = QTableWidgetItem(value)
             self.home_table.setItem(row, col_index, item)
 
+        # Show alert banner if score meets or exceeds configured threshold.
+        try:
+            threshold = get_config().alerts.process_alert_threshold if _CONFIG_AVAILABLE else 70
+        except Exception:
+            threshold = 70
+        if score >= threshold and not self._alert_banner_visible:
+            process = entry.get("process") or entry.get("executable") or "Unknown process"
+            self._show_alert_banner(
+                f"⚠  {process}  has reached a threat score of {score}."
+            )
+
     def _update_process_state_table(self, entry: dict) -> None:
         if entry.get("event_type") != "PROCESS_STATE":
             return
@@ -1399,6 +1774,155 @@ class RdrsGui(QWidget):
         else:
             self.raw_output_window.raise_()
             self.raw_output_window.activateWindow()
+
+    # ------------------------------------------------------------------
+    # Entropy alert handling (called from the worker thread → Qt signal)
+    # ------------------------------------------------------------------
+
+    def _entropy_alert_callback(self, event) -> None:
+        """Called by EntropyMonitor on the worker thread when an alert fires.
+
+        Args:
+            event: EntropyIncreaseDetected dataclass instance.
+        """
+        # Must cross to the Qt main thread via a signal.
+        try:
+            self.output_bridge.entropy_alert.emit(
+                event.file_path,
+                event.process_name or "",
+                event.previous_entropy,
+                event.current_entropy,
+                event.delta,
+            )
+        except Exception:
+            pass
+
+    def _on_entropy_alert_signal(
+        self,
+        file_path: str,
+        process_name: str,
+        previous_entropy: float,
+        current_entropy: float,
+        delta: float,
+    ) -> None:
+        """Receives an entropy alert on the Qt main thread and shows the banner.
+
+        The Engine score logic should be triggered here.  For now we display
+        the alert banner and record a score delta via the existing detection
+        infrastructure.
+        """
+        msg = (
+            f"🔐  Entropy spike detected in  {Path(file_path).name}  "
+            f"(+{delta:.2f} bits/byte)"
+        )
+        if process_name:
+            msg += f"  ·  Process: {process_name}"
+        self._show_alert_banner(msg)
+
+    def _show_alert_banner(self, message: str) -> None:
+        """Display the red alert banner on the Home page.
+
+        Args:
+            message: Text to show inside the banner.
+        """
+        self._alert_text.setText(message)
+        self.alert_banner.setVisible(True)
+        self._alert_banner_visible = True
+        # Ensure the user can see the banner by switching to Home.
+        # (only switch if not already on Home to avoid interrupting other tasks)
+        # We intentionally do NOT force page navigation here to respect user flow.
+
+    def _dismiss_alert_banner(self) -> None:
+        """Hide the alert banner when the user clicks Ignore."""
+        self.alert_banner.setVisible(False)
+        self._alert_banner_visible = False
+
+    # ------------------------------------------------------------------
+    # Entropy Monitor page refresh
+    # ------------------------------------------------------------------
+
+    def _refresh_entropy_table(self) -> None:
+        """Populate the Entropy Monitor table with the latest metadata.db data."""
+        if not _ENTROPY_AVAILABLE or self._entropy_monitor is None:
+            return
+
+        directory_filter = self.entropy_dir_input.text().strip()
+
+        try:
+            if directory_filter:
+                rows = self._entropy_monitor.get_files_in_directory(directory_filter)
+            else:
+                rows = self._entropy_monitor.get_monitored_files()
+        except Exception:
+            return
+
+        self.entropy_table.setSortingEnabled(False)
+        self.entropy_table.setRowCount(0)
+
+        for r in rows:
+            row_idx = self.entropy_table.rowCount()
+            self.entropy_table.insertRow(row_idx)
+
+            file_name    = r["file_name"] or ""
+            curr_ent     = r["current_entropy"]
+            prev_ent     = r["previous_entropy"]
+            file_size    = r["file_size"]
+            last_scan    = r["last_scan_ts"]
+            exists       = r["exists"]
+
+            # Δ entropy
+            if curr_ent is not None and prev_ent is not None:
+                delta = curr_ent - prev_ent
+                delta_str = f"{delta:+.4f}"
+            else:
+                delta = None
+                delta_str = "—"
+
+            curr_str    = f"{curr_ent:.4f}" if curr_ent is not None else "—"
+            prev_str    = f"{prev_ent:.4f}" if prev_ent is not None else "—"
+            size_str    = self._format_size(file_size) if file_size else "—"
+            scan_str    = (
+                datetime.fromtimestamp(last_scan).strftime("%Y-%m-%d %H:%M:%S")
+                if last_scan else "—"
+            )
+            status_str  = "Exists" if exists else "Deleted"
+
+            values = [file_name, curr_str, prev_str, delta_str, size_str, scan_str, status_str]
+            for col, val in enumerate(values):
+                item = QTableWidgetItem(val)
+                # Colour delta column red if suspicious
+                if col == 3 and delta is not None:
+                    try:
+                        cfg = get_config() if _CONFIG_AVAILABLE else None
+                        threshold = cfg.entropy.threshold if cfg else 1.4
+                    except Exception:
+                        threshold = 1.4
+                    if delta >= threshold:
+                        item.setForeground(QBrush(QColor("#ff4444")))
+                        item.setFont(QFont("Arial", 10, QFont.Bold))
+                    elif delta > 0.5:
+                        item.setForeground(QBrush(QColor("#ff9800")))
+                if col == 6 and status_str == "Deleted":
+                    item.setForeground(QBrush(QColor("#808080")))
+                self.entropy_table.setItem(row_idx, col, item)
+
+        self.entropy_table.setSortingEnabled(True)
+
+    @staticmethod
+    def _format_size(size_bytes: int) -> str:
+        """Convert a byte count to a human-readable string.
+
+        Args:
+            size_bytes: Number of bytes.
+
+        Returns:
+            String like '12.4 KB', '3.1 MB'.
+        """
+        for unit in ("B", "KB", "MB", "GB"):
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f} TB"
 
 
 def main():

@@ -48,13 +48,31 @@ class MonitorSession:
         emit_error: Callable[[str], None],
         emit_started: Optional[Callable[[], None]] = None,
         emit_stopped: Optional[Callable[[], None]] = None,
+        event_callback: Optional[Callable] = None,
     ) -> None:
+        """Initialise the session.
+
+        Args:
+            target_path:    Directory to monitor.
+            recursive:      Monitor subdirectories recursively.
+            emit_line:      Callback for formatted log lines (GUI thread-safe via Qt signal).
+            emit_error:     Callback for error strings.
+            emit_started:   Called on the background thread when the monitor starts.
+            emit_stopped:   Called on the background thread when the monitor stops.
+            event_callback: Optional raw event callback forwarded to
+                            :class:`~monitor.filesystem_monitor.FileSystemMonitor`.
+                            Signature: ``(event_type, file_path, process_name,
+                            pid, executable, parent) -> None``.
+                            Must be non-blocking.  Pass ``EntropyMonitor.on_file_event``
+                            here to wire entropy analysis.
+        """
         self._target_path = target_path
         self._recursive = recursive
         self._emit_line = emit_line
         self._emit_error = emit_error
         self._emit_started = emit_started
         self._emit_stopped = emit_stopped
+        self._event_callback = event_callback
 
         self._thread: Optional[threading.Thread] = None
         self._monitor: Optional[FileSystemMonitor] = None
@@ -120,6 +138,7 @@ class MonitorSession:
                 target_path=self._target_path,
                 recursive=self._recursive,
                 logger=logger,
+                event_callback=self._event_callback,
             )
             with self._stop_lock:
                 self._monitor = monitor

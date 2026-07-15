@@ -924,17 +924,38 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         All calls to behavior_tracker are thread-safe.
     """
 
-    def __init__(self, logger: logging.Logger, behavior_tracker: ProcessBehaviorTracker):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        behavior_tracker: ProcessBehaviorTracker,
+        event_callback: Optional[Callable] = None,
+    ):
         """Initialize the handler.
         
         Args:
             logger: Logger instance.
             behavior_tracker: ProcessBehaviorTracker instance.
+            event_callback: Optional callable invoked for every file event
+                *after* the behavior tracker has been updated.  Signature::
+
+                    callback(
+                        event_type: str,
+                        file_path: str,
+                        process_name: Optional[str],
+                        pid: Optional[int],
+                        executable: Optional[str],
+                        parent: Optional[str],
+                    ) -> None
+
+                The callback is called on the watchdog observer thread; it
+                MUST NOT block.  Pass work to a queue if non-trivial I/O is
+                needed (see EntropyMonitor.on_file_event).
         """
         super().__init__()
         self.logger = logger
         self.behavior_tracker = behavior_tracker
         self._process_resolver = ProcessResolver()
+        self._event_callback: Optional[Callable] = event_callback
 
     def on_created(self, event: FileCreatedEvent) -> None:
         """Handle file creation events.
@@ -1016,6 +1037,44 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             output.append("=" * 38)
 
             self.logger.info("\n" + "\n".join(output))
+
+            # --- Notify external modules (e.g. EntropyMonitor) ----------
+            # The callback receives lightweight primitives only; it must not
+            # block.  Errors in the callback must not crash the monitor.
+            if self._event_callback is not None:
+                try:
+                    self.logger.info(
+                        "[ENTROPY_TRACE][FSM->CALLBACK] event=%s file=%s pid=%s proc=%s",
+                        event_type,
+                        str(resolved_path),
+                        process_metadata.pid,
+                        process_metadata.name,
+                    )
+                    self._event_callback(
+                        event_type,
+                        str(resolved_path),
+                        process_metadata.name,
+                        process_metadata.pid,
+                        process_metadata.executable,
+                        process_metadata.parent_name,
+                    )
+                    self.logger.info(
+                        "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_ok event=%s file=%s",
+                        event_type,
+                        str(resolved_path),
+                    )
+                except Exception as cb_exc:
+                    self.logger.error(
+                        "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_error file=%s err=%s",
+                        src_path,
+                        cb_exc,
+                    )
+            else:
+                self.logger.warning(
+                    "[ENTROPY_TRACE][FSM->CALLBACK] event_callback is None; event dropped file=%s",
+                    src_path,
+                )
+
         except Exception as exc:
             self.logger.error(f"Failed to report filesystem event for {src_path}: {exc}", exc_info=True)
 
@@ -1030,13 +1089,24 @@ class FileSystemMonitor:
         The observer runs in a separate thread. All components are thread-safe.
     """
 
-    def __init__(self, target_path: Path, recursive: bool, logger: logging.Logger):
+    def __init__(
+        self,
+        target_path: Path,
+        recursive: bool,
+        logger: logging.Logger,
+        event_callback: Optional[Callable] = None,
+    ):
         """Initialize the filesystem monitor.
         
         Args:
-            target_path: Directory to monitor.
-            recursive: Whether to monitor recursively.
-            logger: Logger instance.
+            target_path:    Directory to monitor.
+            recursive:      Whether to monitor recursively.
+            logger:         Logger instance.
+            event_callback: Optional callback forwarded to
+                            :class:`FileSystemMonitorHandler`.  Called for
+                            every file event with
+                            (event_type, file_path, process_name, pid,
+                             executable, parent) — all on the observer thread.
         """
         self.target_path = target_path
         self.recursive = recursive
@@ -1046,6 +1116,7 @@ class FileSystemMonitor:
         self.handler = FileSystemMonitorHandler(
             logger=self.logger,
             behavior_tracker=self.behavior_tracker,
+            event_callback=event_callback,
         )
 
     def start(self) -> None:
