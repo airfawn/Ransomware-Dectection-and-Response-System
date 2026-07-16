@@ -238,7 +238,7 @@ class ProcessDetailsDialog(QDialog):
         info_layout = QVBoxLayout()
         
         info_title = QLabel("General Information")
-        info_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
+        info_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
         info_layout.addWidget(info_title)
         
         # Grid layout for info fields
@@ -279,7 +279,7 @@ class ProcessDetailsDialog(QDialog):
         activity_layout = QVBoxLayout()
         
         activity_title = QLabel("Activity Summary")
-        activity_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
+        activity_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff; margin-bottom: 8px;")
         activity_layout.addWidget(activity_title)
         
         # Counter grid
@@ -329,7 +329,7 @@ class ProcessDetailsDialog(QDialog):
         
         timeline_header_layout = QHBoxLayout()
         timeline_title = QLabel("File Activity Timeline")
-        timeline_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
+        timeline_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
         timeline_header_layout.addWidget(timeline_title)
         timeline_header_layout.addStretch()
         
@@ -369,7 +369,15 @@ class ProcessDetailsDialog(QDialog):
         self.timeline_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.timeline_table.setSelectionMode(QTableWidget.SingleSelection)
         self.timeline_table.setSortingEnabled(True)
-        self.timeline_table.setStyleSheet("QTableWidget { background: #171b25; font-size: 11px; }")
+        self.timeline_table.verticalHeader().setDefaultSectionSize(34)
+        self.timeline_table.horizontalHeader().setFixedHeight(38)
+        self.timeline_table.horizontalHeader().setFont(QFont("Segoe UI", 13, QFont.Bold))
+        self.timeline_table.setFont(QFont("Segoe UI", 11))
+        self.timeline_table.setStyleSheet(
+            "QTableWidget { background: #171b25; font-size: 11pt; }"
+            "QHeaderView::section { background: #242b3a; color: white; font-size: 13pt; font-weight: bold; padding: 8px; border: none; }"
+            "QTableWidget::item { padding: 8px; }"
+        )
         
         timeline_layout.addWidget(self.timeline_table)
         timeline_frame.setLayout(timeline_layout)
@@ -589,10 +597,11 @@ class RdrsGui(QWidget):
         self.setWindowTitle("RDRS GUI Monitor")
         self.setStyleSheet(
             "QWidget { background: #171b25; color: #f0f0f0; font-family: Segoe UI, Arial, sans-serif; }"
-            "QPushButton { border: none; padding: 10px 12px; text-align: left; }"
+            "QPushButton { border: none; padding: 10px 12px; text-align: left; min-height: 40px; }"
             "QPushButton:hover { background: #2b3140; }"
-            "QHeaderView::section { background: #242b3a; color: white; padding: 8px; border: none; }"
-            "QTableWidget { background: #1f2430; gridline-color: #2d3547; }"
+            "QHeaderView::section { background: #242b3a; color: white; padding: 8px; border: none; font-size: 13pt; font-weight: bold; }"
+            "QTableWidget { background: #1f2430; gridline-color: #2d3547; font-size: 11pt; }"
+            "QTableWidget::item { padding: 8px; }"
         )
         self.build_ui()
         self._load_persisted_logs(limit=300)
@@ -604,7 +613,7 @@ class RdrsGui(QWidget):
 
         sidebar = QWidget()
         sidebar_layout = QVBoxLayout()
-        sidebar_layout.setContentsMargins(16, 16, 16, 16)
+        sidebar_layout.setContentsMargins(16, 12, 16, 16)
         sidebar_layout.setSpacing(10)
         sidebar.setLayout(sidebar_layout)
         sidebar.setMinimumWidth(240)
@@ -639,7 +648,7 @@ class RdrsGui(QWidget):
         sidebar_layout.addSpacing(12)
 
         controls_label = QLabel("Monitor Settings")
-        controls_label.setStyleSheet("font-weight: bold; color: #d9d9d9; margin-top: 12px;")
+        controls_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #d9d9d9; margin-top: 10px;")
         sidebar_layout.addWidget(controls_label)
 
         path_label = QLabel("Monitor Path:")
@@ -673,7 +682,7 @@ class RdrsGui(QWidget):
         self.home_page.setLayout(home_layout)
 
         home_title = QLabel("Suspicious Behaviour")
-        home_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        home_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
         home_layout.addWidget(home_title)
 
         dashboard_stats = QHBoxLayout()
@@ -766,11 +775,11 @@ class RdrsGui(QWidget):
             "Unique Directories",
             "Last Activity",
         ])
-        self.home_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.home_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.home_table.horizontalHeader().setStretchLastSection(False)
         self.home_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.home_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.home_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.home_table.setStyleSheet("QTableWidget { background: #1f2430; }")
         self.home_table.setAlternatingRowColors(True)
         home_layout.addWidget(self.home_table)
         self.page_stack.addWidget(self.home_page)
@@ -782,7 +791,7 @@ class RdrsGui(QWidget):
         self.file_monitoring_page.setLayout(file_layout)
 
         file_title = QLabel("File Monitoring")
-        file_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        file_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
         file_layout.addWidget(file_title)
 
         file_toolbar = QHBoxLayout()
@@ -823,14 +832,14 @@ class RdrsGui(QWidget):
             "Parent Process",
             "Message",
         ])
-        self.log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.log_table.horizontalHeader().setStretchLastSection(False)
         self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.log_table.setSelectionMode(QTableWidget.SingleSelection)
         self.log_table.setColumnCount(10)
         self.log_table.setAlternatingRowColors(True)
         self.log_table.itemSelectionChanged.connect(self.on_table_selection_changed)
-        self.log_table.setStyleSheet("QTableWidget { background: #1f2430; }")
         file_layout.addWidget(self.log_table)
 
         raw_output_btn = QPushButton("View Raw Output")
@@ -847,7 +856,7 @@ class RdrsGui(QWidget):
         self.processes_page.setLayout(processes_layout)
 
         processes_title = QLabel("Processes")
-        processes_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #ffffff;")
+        processes_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
         processes_layout.addWidget(processes_title)
 
         process_description = QLabel("Active and inactive process summaries are shown here. Each row reflects the current process state from the monitor.")
@@ -866,7 +875,7 @@ class RdrsGui(QWidget):
         active_container.setLayout(active_layout)
 
         active_label = QLabel("Active Processes")
-        active_label.setStyleSheet("font-size: 17px; font-weight: bold; color: #ffffff;")
+        active_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
         active_layout.addWidget(active_label)
 
         self.active_process_table = QTableWidget(0, 7)
@@ -879,15 +888,11 @@ class RdrsGui(QWidget):
             "Status",
             "Last Activity",
         ])
-        self.active_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.active_process_table.horizontalHeader().setStretchLastSection(True)
+        self.active_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.active_process_table.horizontalHeader().setStretchLastSection(False)
         self.active_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.active_process_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.active_process_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.active_process_table.setStyleSheet(
-            "QTableWidget { background: #1f2430; font-size: 13px; }"
-            "QHeaderView::section { padding: 10px; }"
-        )
         self.active_process_table.setAlternatingRowColors(True)
         self.active_process_table.doubleClicked.connect(self.on_process_double_click)
         active_layout.addWidget(self.active_process_table)
@@ -899,7 +904,7 @@ class RdrsGui(QWidget):
         inactive_container.setLayout(inactive_layout)
 
         inactive_label = QLabel("Inactive Processes")
-        inactive_label.setStyleSheet("font-size: 17px; font-weight: bold; color: #ffffff;")
+        inactive_label.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
         inactive_layout.addWidget(inactive_label)
 
         self.inactive_process_table = QTableWidget(0, 7)
@@ -912,15 +917,11 @@ class RdrsGui(QWidget):
             "Status",
             "Last Activity",
         ])
-        self.inactive_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.inactive_process_table.horizontalHeader().setStretchLastSection(True)
+        self.inactive_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.inactive_process_table.horizontalHeader().setStretchLastSection(False)
         self.inactive_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.inactive_process_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.inactive_process_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.inactive_process_table.setStyleSheet(
-            "QTableWidget { background: #1f2430; font-size: 13px; }"
-            "QHeaderView::section { padding: 10px; }"
-        )
         self.inactive_process_table.setAlternatingRowColors(True)
         self.inactive_process_table.doubleClicked.connect(self.on_process_double_click)
         inactive_layout.addWidget(self.inactive_process_table)
@@ -934,12 +935,12 @@ class RdrsGui(QWidget):
         # ---- Entropy Monitor page ----------------------------------------
         self.entropy_page = QWidget()
         entropy_layout = QVBoxLayout()
-        entropy_layout.setContentsMargins(24, 24, 24, 24)
-        entropy_layout.setSpacing(14)
+        entropy_layout.setContentsMargins(20, 14, 20, 18)
+        entropy_layout.setSpacing(10)
         self.entropy_page.setLayout(entropy_layout)
 
         entropy_title = QLabel("Entropy Monitor")
-        entropy_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        entropy_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
         entropy_layout.addWidget(entropy_title)
 
         entropy_desc = QLabel(
@@ -947,7 +948,7 @@ class RdrsGui(QWidget):
             "High entropy increases may indicate encryption by ransomware."
         )
         entropy_desc.setWordWrap(True)
-        entropy_desc.setStyleSheet("color: #d1d1d1; font-size: 12px; margin-bottom: 6px;")
+        entropy_desc.setStyleSheet("color: #d1d1d1; font-size: 11pt; margin-bottom: 2px;")
         entropy_layout.addWidget(entropy_desc)
 
         # Toolbar row (directory selector + refresh button)
@@ -979,40 +980,71 @@ class RdrsGui(QWidget):
             if not _ENTROPY_AVAILABLE else
             "Entropy module ready.  Start the monitor to begin tracking."
         )
-        self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11pt;")
         self.entropy_status_label.setWordWrap(True)
         entropy_layout.addWidget(self.entropy_status_label)
 
-        # File explorer-style table
-        self.entropy_table = QTableWidget(0, 7)
+        entropy_content_split = QSplitter(Qt.Horizontal)
+        entropy_content_split.setChildrenCollapsible(False)
+        entropy_content_split.setHandleWidth(8)
+
+        # SOC-style condensed table: critical fields only
+        self.entropy_table = QTableWidget(0, 4)
         self.entropy_table.setHorizontalHeaderLabels([
             "File Name",
             "Current Entropy",
-            "Previous Entropy",
             "Δ Entropy",
-            "File Size",
-            "Last Scan",
             "Status",
         ])
         self.entropy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.entropy_table.horizontalHeader().setStretchLastSection(True)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.entropy_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setStretchLastSection(False)
         self.entropy_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.entropy_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.entropy_table.setSelectionMode(QTableWidget.SingleSelection)
         self.entropy_table.setSortingEnabled(True)
-        self.entropy_table.setStyleSheet(
-            "QTableWidget { background: #1f2430; font-size: 12px; }"
-            "QHeaderView::section { padding: 8px; }"
-        )
         self.entropy_table.setAlternatingRowColors(True)
-        entropy_layout.addWidget(self.entropy_table)
+        self.entropy_table.itemSelectionChanged.connect(self._on_entropy_selection_changed)
+        entropy_content_split.addWidget(self.entropy_table)
+
+        self.entropy_details_panel = QFrame()
+        self.entropy_details_panel.setStyleSheet(
+            "QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }"
+        )
+        details_layout = QVBoxLayout()
+        details_layout.setContentsMargins(14, 14, 14, 14)
+        details_layout.setSpacing(10)
+        self.entropy_details_panel.setLayout(details_layout)
+
+        details_title = QLabel("Selected File Details")
+        details_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        details_layout.addWidget(details_title)
+
+        self.entropy_details_hint = QLabel("Select a row to inspect previous entropy, scan time, and file size.")
+        self.entropy_details_hint.setWordWrap(True)
+        self.entropy_details_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        details_layout.addWidget(self.entropy_details_hint)
+
+        self.entropy_detail_labels = {}
+        detail_fields = [
+            ("File Name", "file_name"),
+            ("Current Entropy", "current_entropy"),
+            ("Previous Entropy", "previous_entropy"),
+            ("Delta Entropy", "delta_entropy"),
+            ("File Size", "file_size"),
+            ("Last Scan", "last_scan"),
+            ("Status", "status"),
+        ]
+        for title, key in detail_fields:
+            label = QLabel(f"{title}: —")
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
+            details_layout.addWidget(label)
+            self.entropy_detail_labels[key] = label
+        details_layout.addStretch()
+
+        entropy_content_split.addWidget(self.entropy_details_panel)
+        entropy_content_split.setSizes([1000, 360])
+        entropy_layout.addWidget(entropy_content_split, 1)
 
         self.page_stack.addWidget(self.entropy_page)
 
@@ -1062,15 +1094,91 @@ class RdrsGui(QWidget):
         main_layout.addWidget(sidebar)
         main_layout.addWidget(content, 1)
         self.setLayout(main_layout)
+        self._apply_readability_to_tables()
+        self._set_initial_column_widths()
         self.select_page(0)
 
         self.select_page(0)
+
+    def _apply_readability_to_tables(self) -> None:
+        """Apply consistent readability settings across all primary tables."""
+        tables = [
+            self.home_table,
+            self.log_table,
+            self.active_process_table,
+            self.inactive_process_table,
+            self.entropy_table,
+        ]
+        for table in tables:
+            table.setFont(QFont("Segoe UI", 11))
+            table.verticalHeader().setDefaultSectionSize(34)
+            table.horizontalHeader().setFixedHeight(38)
+            table.horizontalHeader().setFont(QFont("Segoe UI", 13, QFont.Bold))
+            table.setStyleSheet(
+                "QTableWidget { background: #1f2430; font-size: 11pt; color: #f0f0f0; }"
+                "QTableWidget::item { padding: 8px; }"
+                "QHeaderView::section { background: #242b3a; color: white; font-size: 13pt; font-weight: bold; padding: 8px; border: none; }"
+            )
+
+    def _set_initial_column_widths(self) -> None:
+        """Set non-uniform default column widths for readability."""
+        self.home_table.setColumnWidth(0, 260)
+        self.home_table.setColumnWidth(1, 90)
+        self.home_table.setColumnWidth(2, 330)
+        self.home_table.setColumnWidth(3, 120)
+        self.home_table.setColumnWidth(4, 110)
+        self.home_table.setColumnWidth(5, 110)
+        self.home_table.setColumnWidth(6, 110)
+        self.home_table.setColumnWidth(7, 170)
+        self.home_table.setColumnWidth(8, 180)
+
+        self.log_table.setColumnWidth(0, 180)
+        self.log_table.setColumnWidth(1, 90)
+        self.log_table.setColumnWidth(2, 140)
+        self.log_table.setColumnWidth(3, 340)
+        self.log_table.setColumnWidth(4, 230)
+        self.log_table.setColumnWidth(5, 170)
+        self.log_table.setColumnWidth(6, 90)
+        self.log_table.setColumnWidth(7, 300)
+        self.log_table.setColumnWidth(8, 190)
+        self.log_table.setColumnWidth(9, 360)
+
+        for table in (self.active_process_table, self.inactive_process_table):
+            table.setColumnWidth(0, 260)
+            table.setColumnWidth(1, 90)
+            table.setColumnWidth(2, 140)
+            table.setColumnWidth(3, 120)
+            table.setColumnWidth(4, 130)
+            table.setColumnWidth(5, 130)
+            table.setColumnWidth(6, 190)
+
+    def _resize_entropy_columns(self) -> None:
+        """Keep File Name at ~45% while sizing other columns to content."""
+        available = max(400, self.entropy_table.viewport().width())
+        file_name_width = int(available * 0.45)
+
+        self.entropy_table.setColumnWidth(1, max(180, self.entropy_table.sizeHintForColumn(1) + 20))
+        self.entropy_table.setColumnWidth(2, max(150, self.entropy_table.sizeHintForColumn(2) + 20))
+        self.entropy_table.setColumnWidth(3, max(120, self.entropy_table.sizeHintForColumn(3) + 20))
+        self.entropy_table.setColumnWidth(0, file_name_width)
+
+    def resizeEvent(self, event) -> None:
+        """Keep responsive table proportions as the window size changes."""
+        super().resizeEvent(event)
+        if hasattr(self, "entropy_table"):
+            self._resize_entropy_columns()
 
     def select_page(self, index: int):
         self.page_stack.setCurrentIndex(index)
         # Reset all buttons to inactive style
-        _inactive = "font-weight: bold; color: #ffffff; background: transparent;"
-        _active   = "font-weight: bold; color: white; background: #2d3a5a; border-radius: 8px;"
+        _inactive = (
+            "font-size: 12pt; font-weight: bold; color: #ffffff; background: transparent; "
+            "min-height: 40px; padding: 8px 12px; text-align: left; border-radius: 8px;"
+        )
+        _active = (
+            "font-size: 12pt; font-weight: bold; color: white; background: #2d3a5a; "
+            "min-height: 40px; padding: 8px 12px; text-align: left; border-radius: 8px;"
+        )
 
         self.home_button.setStyleSheet(_inactive)
         self.monitoring_button.setStyleSheet(_inactive)
@@ -1999,11 +2107,24 @@ class RdrsGui(QWidget):
             )
             status_str  = "Exists" if exists else "Deleted"
 
-            values = [file_name, curr_str, prev_str, delta_str, size_str, scan_str, status_str]
+            details_payload = {
+                "file_name": file_name or "—",
+                "current_entropy": curr_str,
+                "previous_entropy": prev_str,
+                "delta_entropy": delta_str,
+                "file_size": size_str,
+                "last_scan": scan_str,
+                "status": status_str,
+            }
+
+            values = [file_name, curr_str, delta_str, status_str]
             for col, val in enumerate(values):
                 item = QTableWidgetItem(val)
+                if col == 0:
+                    item.setData(Qt.UserRole, details_payload)
+
                 # Colour delta column red if suspicious
-                if col == 3 and delta is not None:
+                if col == 2 and delta is not None:
                     try:
                         cfg = get_config() if _CONFIG_AVAILABLE else None
                         threshold = cfg.entropy.threshold if cfg else 1.4
@@ -2014,11 +2135,36 @@ class RdrsGui(QWidget):
                         item.setFont(QFont("Arial", 10, QFont.Bold))
                     elif delta > 0.5:
                         item.setForeground(QBrush(QColor("#ff9800")))
-                if col == 6 and status_str == "Deleted":
+                if col == 3 and status_str == "Deleted":
                     item.setForeground(QBrush(QColor("#808080")))
                 self.entropy_table.setItem(row_idx, col, item)
 
         self.entropy_table.setSortingEnabled(True)
+        self._resize_entropy_columns()
+
+    def _on_entropy_selection_changed(self) -> None:
+        """Update the details panel with data from the selected entropy row."""
+        selected = self.entropy_table.selectedItems()
+        if not selected:
+            return
+
+        row = selected[0].row()
+        anchor_item = self.entropy_table.item(row, 0)
+        if anchor_item is None:
+            return
+
+        payload = anchor_item.data(Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+
+        self.entropy_details_hint.setVisible(False)
+        self.entropy_detail_labels["file_name"].setText(f"File Name: {payload.get('file_name', '—')}")
+        self.entropy_detail_labels["current_entropy"].setText(f"Current Entropy: {payload.get('current_entropy', '—')}")
+        self.entropy_detail_labels["previous_entropy"].setText(f"Previous Entropy: {payload.get('previous_entropy', '—')}")
+        self.entropy_detail_labels["delta_entropy"].setText(f"Delta Entropy: {payload.get('delta_entropy', '—')}")
+        self.entropy_detail_labels["file_size"].setText(f"File Size: {payload.get('file_size', '—')}")
+        self.entropy_detail_labels["last_scan"].setText(f"Last Scan: {payload.get('last_scan', '—')}")
+        self.entropy_detail_labels["status"].setText(f"Status: {payload.get('status', '—')}")
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:
@@ -2038,6 +2184,9 @@ class RdrsGui(QWidget):
 
 
 def main():
+    # Enable Windows-friendly HiDPI scaling so fonts/layout remain readable on scaled displays.
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     window = RdrsGui()
     window.show()
