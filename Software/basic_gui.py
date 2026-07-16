@@ -819,6 +819,25 @@ class RdrsGui(QWidget):
 
         file_layout.addLayout(file_toolbar)
 
+        file_stats_row = QHBoxLayout()
+        file_stats_row.setSpacing(10)
+        self.file_event_counter_labels = {}
+        for label_text, key, color in [
+            ("Created", "FILE CREATED", "#007a00"),
+            ("Modified", "FILE MODIFIED", "#003a9e"),
+            ("Moved", "FILE MOVED", "#ff9800"),
+            ("Deleted", "FILE DELETED", "#a00000"),
+        ]:
+            counter = QLabel(f"{label_text}: 0")
+            counter.setStyleSheet(
+                f"background: #1f2430; border: 1px solid #2d3547; border-radius: 6px; "
+                f"padding: 8px 12px; font-size: 11pt; font-weight: bold; color: {color};"
+            )
+            file_stats_row.addWidget(counter)
+            self.file_event_counter_labels[key] = counter
+        file_stats_row.addStretch()
+        file_layout.addLayout(file_stats_row)
+
         self.log_table = QTableWidget(0, 10)
         self.log_table.setHorizontalHeaderLabels([
             "Timestamp",
@@ -1117,6 +1136,8 @@ class RdrsGui(QWidget):
             table.setStyleSheet(
                 "QTableWidget { background: #1f2430; font-size: 11pt; color: #f0f0f0; }"
                 "QTableWidget::item { padding: 8px; }"
+                "QTableWidget::item:selected { background: #2f3f58; color: #ffffff; }"
+                "QTableWidget::item:selected:!active { background: #27364d; color: #dfe7f2; }"
                 "QHeaderView::section { background: #242b3a; color: white; font-size: 13pt; font-weight: bold; padding: 8px; border: none; }"
             )
 
@@ -1429,6 +1450,7 @@ class RdrsGui(QWidget):
             pass
 
         self._refresh_log_table_view()
+        self._refresh_file_event_counters()
         self._update_suspicious_process_table(entry)
         self._update_process_state_table(entry)
         self._refresh_dashboard_metrics()
@@ -1465,6 +1487,7 @@ class RdrsGui(QWidget):
             }
             self.add_log_row(entry)
         self._refresh_log_table_view()
+        self._refresh_file_event_counters()
 
     def on_table_selection_changed(self):
         """Handle log table selection changes."""
@@ -1957,6 +1980,27 @@ class RdrsGui(QWidget):
                 self.log_table.setItem(row, col_index, item)
 
         self.log_table.setSortingEnabled(True)
+
+    def _refresh_file_event_counters(self) -> None:
+        """Update Created/Modified/Moved/Deleted counters from loaded events."""
+        if not hasattr(self, "file_event_counter_labels"):
+            return
+
+        counts = {
+            "FILE CREATED": 0,
+            "FILE MODIFIED": 0,
+            "FILE MOVED": 0,
+            "FILE DELETED": 0,
+        }
+        for row in self.event_rows:
+            event_type = (row.get("event_type") or "").upper()
+            if event_type in counts:
+                counts[event_type] += 1
+
+        self.file_event_counter_labels["FILE CREATED"].setText(f"Created: {counts['FILE CREATED']}")
+        self.file_event_counter_labels["FILE MODIFIED"].setText(f"Modified: {counts['FILE MODIFIED']}")
+        self.file_event_counter_labels["FILE MOVED"].setText(f"Moved: {counts['FILE MOVED']}")
+        self.file_event_counter_labels["FILE DELETED"].setText(f"Deleted: {counts['FILE DELETED']}")
 
     def _process_is_active(self, last_activity: str) -> bool:
         if not last_activity:

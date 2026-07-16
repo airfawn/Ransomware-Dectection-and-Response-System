@@ -21,6 +21,7 @@ Thread Safety:
 import logging
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -165,29 +166,49 @@ class ProcessResolver:
         Returns:
             ProcessMetadata or unknown metadata if process not found.
         """
+        event_type_upper = (event_type or "").upper()
+
+        # Deleted files are often already gone from open handle tables on Windows,
+        # so a full scan adds latency and causes event backlog under heavy writes.
+        if event_type_upper == "FILE DELETED":
+            return ProcessMetadata(pid=None, name=None, executable=None, parent_name=None, start_time=None)
+
+        # Keep process-resolution latency bounded so the watchdog queue remains healthy.
+        deadline = time.perf_counter() + 0.35
+
         try:
-            for process in psutil.process_iter(["pid", "name", "exe", "ppid"]):
-                try:
-                    for open_file in process.open_files():
-                        if self._normalize_path(Path(open_file.path)) == normalized_target:
-                            return self._extract_process_metadata(process)
-                    if normalized_previous is not None:
-                        for open_file in process.open_files():
-                            if self._normalize_path(Path(open_file.path)) == normalized_previous:
-                                return self._extract_process_metadata(process)
-                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
-                    continue
-                except Exception as exc:
-                    # Log but don't crash on unexpected errors
-                    logging.debug("Unexpected error checking process handles: %s", exc)
-                    continue
-                if os.name == "nt" and event_type in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
+            if os.name == "nt" and event_type_upper in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
+                parent_norm = self._normalize_path(path.parent)
+                for process in psutil.process_iter(["pid", "name", "exe", "ppid"]):
+                    if time.perf_counter() > deadline:
+                        break
                     try:
                         cwd = process.cwd()
-                        if cwd and self._normalize_path(Path(cwd)) == self._normalize_path(path.parent):
+                        if cwd and self._normalize_path(Path(cwd)) == parent_norm:
                             return self._extract_process_metadata(process)
                     except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
-                        pass
+                        continue
+                    except Exception as exc:
+                        logging.debug("Unexpected error checking process cwd: %s", exc)
+
+            # Open-file scans are expensive, so only attempt them for modify events
+            # and while within a strict time budget.
+            if event_type_upper == "FILE MODIFIED":
+                for process in psutil.process_iter(["pid", "name", "exe", "ppid"]):
+                    if time.perf_counter() > deadline:
+                        break
+                    try:
+                        for open_file in process.open_files():
+                            open_norm = self._normalize_path(Path(open_file.path))
+                            if open_norm == normalized_target or (
+                                normalized_previous is not None and open_norm == normalized_previous
+                            ):
+                                return self._extract_process_metadata(process)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                        continue
+                    except Exception as exc:
+                        logging.debug("Unexpected error checking process handles: %s", exc)
+                        continue
         except Exception as exc:
             logging.debug("Error iterating processes: %s", exc)
         
