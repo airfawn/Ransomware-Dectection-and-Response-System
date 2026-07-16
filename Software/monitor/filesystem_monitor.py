@@ -28,7 +28,13 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 import psutil
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileDeletedEvent, FileModifiedEvent
+from watchdog.events import (
+    FileSystemEventHandler,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+)
 from watchdog.observers import Observer
 
 try:
@@ -74,10 +80,17 @@ class ProcessResolver:
             max_cache_size: Maximum number of path-to-process mappings to cache.
         """
         self._cache: Dict[str, ProcessMetadata] = {}
+        self._directory_cache: Dict[str, ProcessMetadata] = {}
         self._max_cache_size = max_cache_size
         self._lock = threading.Lock()
 
-    def resolve(self, path: Path) -> ProcessMetadata:
+    def resolve(
+        self,
+        path: Path,
+        *,
+        previous_path: Optional[Path] = None,
+        event_type: Optional[str] = None,
+    ) -> ProcessMetadata:
         """Return process metadata matching an open file handle for the path.
         
         Uses a simple cache to avoid repeated scans of the same file. If the file
@@ -88,19 +101,31 @@ class ProcessResolver:
         
         Args:
             path: The filesystem path to resolve.
+            previous_path: Optional original path for moved/renamed/deleted files.
+            event_type: Optional event type hint used for Windows-specific fallbacks.
             
         Returns:
             ProcessMetadata with process information or None values if unknown.
         """
         normalized_target = self._normalize_path(path)
+        normalized_previous = self._normalize_path(previous_path) if previous_path is not None else None
+        directory_target = self._normalize_path(path.parent)
         
         # Check cache first (thread-safe)
         with self._lock:
             if normalized_target in self._cache:
                 return self._cache[normalized_target]
+            if normalized_previous and normalized_previous in self._cache:
+                return self._cache[normalized_previous]
+            if directory_target in self._directory_cache:
+                return self._directory_cache[directory_target]
+            if normalized_previous is not None:
+                previous_directory = self._normalize_path(Path(previous_path).parent)
+                if previous_directory in self._directory_cache:
+                    return self._directory_cache[previous_directory]
         
         # Resolve without holding lock
-        result = self._resolve_uncached(path, normalized_target)
+        result = self._resolve_uncached(path, normalized_target, normalized_previous, event_type)
         
         # Update cache (thread-safe)
         with self._lock:
@@ -109,10 +134,28 @@ class ProcessResolver:
                 items = list(self._cache.items())
                 self._cache = dict(items[len(items) // 2:])
             self._cache[normalized_target] = result
+            self._directory_cache[directory_target] = result
+            if normalized_previous is not None:
+                self._cache[normalized_previous] = result
+                self._directory_cache[self._normalize_path(Path(previous_path).parent)] = result
         
         return result
 
-    def _resolve_uncached(self, path: Path, normalized_target: str) -> ProcessMetadata:
+    def remember(self, path: Path, metadata: ProcessMetadata) -> None:
+        """Record a successful mapping for exact-path and directory reuse."""
+        normalized_target = self._normalize_path(path)
+        directory_target = self._normalize_path(path.parent)
+        with self._lock:
+            self._cache[normalized_target] = metadata
+            self._directory_cache[directory_target] = metadata
+
+    def _resolve_uncached(
+        self,
+        path: Path,
+        normalized_target: str,
+        normalized_previous: Optional[str],
+        event_type: Optional[str],
+    ) -> ProcessMetadata:
         """Perform uncached process resolution by scanning process handles.
         
         Args:
@@ -128,12 +171,23 @@ class ProcessResolver:
                     for open_file in process.open_files():
                         if self._normalize_path(Path(open_file.path)) == normalized_target:
                             return self._extract_process_metadata(process)
+                    if normalized_previous is not None:
+                        for open_file in process.open_files():
+                            if self._normalize_path(Path(open_file.path)) == normalized_previous:
+                                return self._extract_process_metadata(process)
                 except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                     continue
                 except Exception as exc:
                     # Log but don't crash on unexpected errors
                     logging.debug("Unexpected error checking process handles: %s", exc)
                     continue
+                if os.name == "nt" and event_type in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
+                    try:
+                        cwd = process.cwd()
+                        if cwd and self._normalize_path(Path(cwd)) == self._normalize_path(path.parent):
+                            return self._extract_process_metadata(process)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                        pass
         except Exception as exc:
             logging.debug("Error iterating processes: %s", exc)
         
@@ -939,13 +993,14 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                 *after* the behavior tracker has been updated.  Signature::
 
                     callback(
-                        event_type: str,
-                        file_path: str,
-                        process_name: Optional[str],
-                        pid: Optional[int],
-                        executable: Optional[str],
-                        parent: Optional[str],
-                    ) -> None
+                            event_type: str,
+                            file_path: str,
+                            process_name: Optional[str],
+                            pid: Optional[int],
+                            executable: Optional[str],
+                            parent: Optional[str],
+                            previous_path: Optional[str] = None,
+                        ) -> None
 
                 The callback is called on the watchdog observer thread; it
                 MUST NOT block.  Pass work to a queue if non-trivial I/O is
@@ -987,7 +1042,17 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             return
         self._report_event("FILE MODIFIED", event.src_path)
 
-    def _report_event(self, event_type: str, src_path: str) -> None:
+    def on_moved(self, event: FileMovedEvent) -> None:
+        """Handle file moved/renamed events.
+
+        Args:
+            event: File moved event.
+        """
+        if event.is_directory:
+            return
+        self._report_event("FILE MOVED", event.dest_path, previous_path=event.src_path)
+
+    def _report_event(self, event_type: str, src_path: str, previous_path: Optional[str] = None) -> None:
         """Format and log an event report.
         
         Args:
@@ -999,7 +1064,11 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             # Resolve process metadata
-            process_metadata = self._process_resolver.resolve(path)
+            process_metadata = self._process_resolver.resolve(
+                path,
+                previous_path=Path(previous_path) if previous_path else None,
+                event_type=event_type,
+            )
 
             # Update behavioral tracker
             self.behavior_tracker.record_event(event_type, src_path, process_metadata)
@@ -1022,6 +1091,10 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             output.append("")
             output.append("File Name:")
             output.append(path.name)
+            if previous_path:
+                output.append("")
+                output.append("Previous Path:")
+                output.append(previous_path)
             output.append("")
             output.append("Process:")
             output.append(process_metadata.name or "Unknown")
@@ -1037,6 +1110,10 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             output.append("=" * 38)
 
             self.logger.info("\n" + "\n".join(output))
+
+            self._process_resolver.remember(path, process_metadata)
+            if previous_path:
+                self._process_resolver.remember(Path(previous_path), process_metadata)
 
             # --- Notify external modules (e.g. EntropyMonitor) ----------
             # The callback receives lightweight primitives only; it must not
@@ -1057,6 +1134,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                         process_metadata.pid,
                         process_metadata.executable,
                         process_metadata.parent_name,
+                        previous_path,
                     )
                     self.logger.info(
                         "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_ok event=%s file=%s",

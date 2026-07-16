@@ -40,7 +40,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Set
+from typing import Callable, Iterable, List, Optional, Sequence, Set
 
 from entropy.calculator import calculate_entropy
 from database.metadata_db import MetadataDatabase
@@ -74,12 +74,21 @@ class EntropyIncreaseDetected:
 
 class _FileEvent:
     """Internal event payload placed on the worker queue."""
-    __slots__ = ("event_type", "file_path", "process_name", "pid", "executable", "parent")
+    __slots__ = (
+        "event_type",
+        "file_path",
+        "previous_path",
+        "process_name",
+        "pid",
+        "executable",
+        "parent",
+    )
 
     def __init__(
         self,
         event_type: str,
         file_path: str,
+        previous_path: Optional[str],
         process_name: Optional[str],
         pid: Optional[int],
         executable: Optional[str],
@@ -87,6 +96,7 @@ class _FileEvent:
     ) -> None:
         self.event_type = event_type
         self.file_path = file_path
+        self.previous_path = previous_path
         self.process_name = process_name
         self.pid = pid
         self.executable = executable
@@ -128,6 +138,7 @@ class EntropyMonitor:
         logs_db: LogsDatabase,
         alerts_db: AlertsDatabase,
         allowed_extensions: Set[str],
+        monitored_roots: Optional[Sequence[Path]] = None,
         sample_size_bytes: int = 5 * 1024 * 1024,
         threshold: float = 1.4,
         on_entropy_alert: Optional[Callable[[EntropyIncreaseDetected], None]] = None,
@@ -137,6 +148,7 @@ class EntropyMonitor:
         self._logs_db = logs_db
         self._alerts_db = alerts_db
         self._allowed_extensions: Set[str] = {e.lower().lstrip(".") for e in allowed_extensions}
+        self._monitored_roots = [Path(root).expanduser() for root in (monitored_roots or [])]
         self._sample_size = sample_size_bytes
         self._threshold = threshold
         self._on_entropy_alert = on_entropy_alert
@@ -144,6 +156,7 @@ class EntropyMonitor:
 
         self._queue: queue.Queue[Optional[_FileEvent]] = queue.Queue(maxsize=2000)
         self._worker_thread: Optional[threading.Thread] = None
+        self._baseline_thread: Optional[threading.Thread] = None
         self._running = False
 
     # ------------------------------------------------------------------
@@ -161,6 +174,13 @@ class EntropyMonitor:
             daemon=True,
         )
         self._worker_thread.start()
+        if self._monitored_roots:
+            self._baseline_thread = threading.Thread(
+                target=self._baseline_scan,
+                name="rdrs-entropy-baseline",
+                daemon=True,
+            )
+            self._baseline_thread.start()
         logger.info("EntropyMonitor started (threshold=%.2f bits, extensions=%s)",
                     self._threshold, sorted(self._allowed_extensions))
         # Run a cleanup pass for old deleted records.
@@ -180,6 +200,8 @@ class EntropyMonitor:
             pass
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
+        if self._baseline_thread is not None:
+            self._baseline_thread.join(timeout=5.0)
         logger.info("EntropyMonitor stopped.")
 
     # ------------------------------------------------------------------
@@ -191,6 +213,7 @@ class EntropyMonitor:
         event_type: str,
         file_path: str,
         *,
+        previous_path: Optional[str] = None,
         process_name: Optional[str] = None,
         pid: Optional[int] = None,
         executable: Optional[str] = None,
@@ -221,6 +244,7 @@ class EntropyMonitor:
         evt = _FileEvent(
             event_type=event_type,
             file_path=file_path,
+            previous_path=previous_path,
             process_name=process_name,
             pid=pid,
             executable=executable,
@@ -241,6 +265,66 @@ class EntropyMonitor:
                 event_type,
                 file_path,
             )
+
+    def _baseline_scan(self) -> None:
+        """Prime the entropy cache for all monitored roots without blocking the UI."""
+        for root in self._monitored_roots:
+            if not self._running:
+                return
+            if not root.exists():
+                continue
+            if root.is_file():
+                self._scan_file_for_cache(root)
+                continue
+            for path in root.rglob("*"):
+                if not self._running:
+                    return
+                if not path.is_file():
+                    continue
+                self._scan_file_for_cache(path)
+
+    def _scan_file_for_cache(self, path: Path) -> None:
+        """Populate persistent cache rows for a single file if it should be tracked."""
+        if path.suffix.lower().lstrip(".") not in self._allowed_extensions:
+            return
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+
+        existing_cache = self._metadata_db.get_entropy_record(str(path))
+        existing_legacy = self._metadata_db.get_file(str(path))
+        entropy = None
+        if (
+            existing_cache is not None
+            and existing_cache["exists"] == 1
+            and existing_cache["file_size"] == stat.st_size
+            and existing_cache["modified_time"] == stat.st_mtime
+            and existing_cache["entropy"] is not None
+        ):
+            entropy = existing_cache["entropy"]
+        else:
+            entropy = calculate_entropy(path, self._sample_size)
+
+        if entropy is None:
+            return
+
+        self._metadata_db.upsert_entropy_cache(
+            path=str(path),
+            entropy=entropy,
+            file_size=stat.st_size,
+            modified_time=stat.st_mtime,
+            exists=True,
+        )
+        previous_entropy = existing_legacy["current_entropy"] if existing_legacy else None
+        self._metadata_db.upsert_file(
+            file_path=str(path),
+            file_name=path.name,
+            current_entropy=entropy,
+            previous_entropy=previous_entropy,
+            file_size=stat.st_size,
+            last_modified_ts=stat.st_mtime,
+        )
 
     # ------------------------------------------------------------------
     # Worker loop (background thread)
@@ -306,9 +390,22 @@ class EntropyMonitor:
         )
 
         # -----------------------------------------------------------------
-        # 2. Handle deletion — mark as deleted, log to events DB
+        # 2. Handle move/rename and deletion events up front
         # -----------------------------------------------------------------
-        if "DELETE" in evt.event_type.upper():
+        event_type_upper = evt.event_type.upper()
+        if "MOVE" in event_type_upper or "RENAME" in event_type_upper:
+            if evt.previous_path:
+                try:
+                    self._metadata_db.rename_entropy_path(evt.previous_path, file_path)
+                except Exception as exc:
+                    logger.warning("Failed to rename entropy cache %s -> %s: %s", evt.previous_path, file_path, exc)
+            if "MOVE" in event_type_upper or "RENAME" in event_type_upper:
+                try:
+                    self._metadata_db.mark_deleted(evt.previous_path or file_path)
+                except Exception:
+                    pass
+
+        if "DELETE" in event_type_upper:
             try:
                 self._metadata_db.mark_deleted(file_path)
                 logger.info(
@@ -317,6 +414,7 @@ class EntropyMonitor:
                 )
             except Exception as exc:
                 logger.warning("Failed to mark deleted: %s — %s", file_path, exc)
+            self._log_event(evt)
             return
 
         # -----------------------------------------------------------------
@@ -338,9 +436,12 @@ class EntropyMonitor:
         # 4. Fetch existing record to get previous entropy
         # -----------------------------------------------------------------
         existing = self._metadata_db.get_file(file_path)
+        existing_cache = self._metadata_db.get_entropy_record(file_path)
         previous_entropy: Optional[float] = None
         if existing:
             previous_entropy = existing["current_entropy"]
+        elif existing_cache is not None:
+            previous_entropy = existing_cache["entropy"]
         logger.info(
             "[ENTROPY_TRACE][ENTROPY.worker] metadata_lookup existing=%s prev_entropy=%s file=%s",
             existing is not None,
@@ -351,7 +452,17 @@ class EntropyMonitor:
         # -----------------------------------------------------------------
         # 5. Calculate current entropy
         # -----------------------------------------------------------------
-        current_entropy = calculate_entropy(file_path, self._sample_size)
+        current_entropy: Optional[float]
+        if (
+            existing_cache is not None
+            and existing_cache["exists"] == 1
+            and existing_cache["file_size"] == file_size
+            and existing_cache["modified_time"] == last_modified
+            and existing_cache["entropy"] is not None
+        ):
+            current_entropy = existing_cache["entropy"]
+        else:
+            current_entropy = calculate_entropy(file_path, self._sample_size)
         if current_entropy is None:
             # Unreadable file — skip entropy update.
             logger.warning(
@@ -369,6 +480,13 @@ class EntropyMonitor:
         # -----------------------------------------------------------------
         # 6. Upsert metadata database
         # -----------------------------------------------------------------
+        self._metadata_db.upsert_entropy_cache(
+            path=file_path,
+            entropy=current_entropy,
+            file_size=file_size,
+            modified_time=last_modified,
+            exists=True,
+        )
         self._metadata_db.upsert_file(
             file_path=file_path,
             file_name=path.name,
@@ -388,13 +506,15 @@ class EntropyMonitor:
         # 7. Alert check — only on modifications (not initial creation scans)
         # -----------------------------------------------------------------
         if (
-            "MODIF" in evt.event_type.upper()
+            "MODIF" in event_type_upper
             and previous_entropy is not None
             and current_entropy is not None
         ):
             delta = current_entropy - previous_entropy
             if delta >= self._threshold:
                 self._trigger_alert(evt, previous_entropy, current_entropy, delta)
+
+        self._log_event(evt)
 
     def _log_event(self, evt: _FileEvent) -> None:
         """Persist a filesystem event to logs_db.

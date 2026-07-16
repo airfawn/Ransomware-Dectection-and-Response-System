@@ -547,6 +547,7 @@ class RdrsGui(QWidget):
         self.monitor_session: Optional[MonitorSession] = None
         self._pending_log_lines: List[str] = []
         self.event_rows: List[dict] = []
+        self._displayed_event_rows: List[dict] = []
         self.suspicious_process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.active_process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.inactive_process_rows: Dict[Tuple[Optional[str], str], int] = {}
@@ -606,7 +607,8 @@ class RdrsGui(QWidget):
         sidebar_layout.setContentsMargins(16, 16, 16, 16)
         sidebar_layout.setSpacing(10)
         sidebar.setLayout(sidebar_layout)
-        sidebar.setMaximumWidth(280)
+        sidebar.setMinimumWidth(240)
+        sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         sidebar.setStyleSheet("background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #171b25, stop:1 #20263a);")
 
         header = QLabel("RDRS Monitor")
@@ -673,6 +675,32 @@ class RdrsGui(QWidget):
         home_title = QLabel("Suspicious Behaviour")
         home_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
         home_layout.addWidget(home_title)
+
+        dashboard_stats = QHBoxLayout()
+        dashboard_stats.setSpacing(12)
+        self.dashboard_metric_labels = {}
+        for title, key in [
+            ("Monitored", "monitored"),
+            ("Suspicious", "suspicious"),
+            ("Highest Score", "highest_score"),
+            ("Current Alerts", "alerts"),
+            ("Events/sec", "events_sec"),
+        ]:
+            card = QFrame()
+            card.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }")
+            card_layout = QVBoxLayout()
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            card_layout.setSpacing(2)
+            title_label = QLabel(title)
+            title_label.setStyleSheet("color: #d1d1d1; font-size: 11px; font-weight: bold;")
+            value_label = QLabel("0")
+            value_label.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: 900;")
+            card_layout.addWidget(title_label)
+            card_layout.addWidget(value_label)
+            card.setLayout(card_layout)
+            dashboard_stats.addWidget(card, 1)
+            self.dashboard_metric_labels[key] = value_label
+        home_layout.addLayout(dashboard_stats)
 
         # ---- Alert banner (hidden by default; shown when score >= threshold) ----
         self.alert_banner = QFrame()
@@ -743,6 +771,7 @@ class RdrsGui(QWidget):
         self.home_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.home_table.setSelectionMode(QTableWidget.SingleSelection)
         self.home_table.setStyleSheet("QTableWidget { background: #1f2430; }")
+        self.home_table.setAlternatingRowColors(True)
         home_layout.addWidget(self.home_table)
         self.page_stack.addWidget(self.home_page)
 
@@ -755,6 +784,31 @@ class RdrsGui(QWidget):
         file_title = QLabel("File Monitoring")
         file_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
         file_layout.addWidget(file_title)
+
+        file_toolbar = QHBoxLayout()
+        file_toolbar.setSpacing(10)
+
+        search_label = QLabel("Search:")
+        search_label.setStyleSheet("color: #d9d9d9;")
+        file_toolbar.addWidget(search_label)
+
+        self.log_search_input = QLineEdit()
+        self.log_search_input.setPlaceholderText("File, process, PID, or message")
+        self.log_search_input.setStyleSheet("background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;")
+        self.log_search_input.textChanged.connect(self._refresh_log_table_view)
+        file_toolbar.addWidget(self.log_search_input, 1)
+
+        filter_label = QLabel("Type:")
+        filter_label.setStyleSheet("color: #d9d9d9;")
+        file_toolbar.addWidget(filter_label)
+
+        self.log_filter_combo = QComboBox()
+        self.log_filter_combo.addItems(["All Events", "FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED", "DETECTION", "PROCESS_STATE"])
+        self.log_filter_combo.currentIndexChanged.connect(self._refresh_log_table_view)
+        self.log_filter_combo.setStyleSheet("background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;")
+        file_toolbar.addWidget(self.log_filter_combo)
+
+        file_layout.addLayout(file_toolbar)
 
         self.log_table = QTableWidget(0, 10)
         self.log_table.setHorizontalHeaderLabels([
@@ -773,8 +827,9 @@ class RdrsGui(QWidget):
         self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.log_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.log_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.log_table.setColumnCount(10)
+        self.log_table.setAlternatingRowColors(True)
+        self.log_table.itemSelectionChanged.connect(self.on_table_selection_changed)
         self.log_table.setStyleSheet("QTableWidget { background: #1f2430; }")
         file_layout.addWidget(self.log_table)
 
@@ -800,8 +855,9 @@ class RdrsGui(QWidget):
         process_description.setStyleSheet("color: #d1d1d1; font-size: 12px; margin-bottom: 10px;")
         processes_layout.addWidget(process_description)
 
-        processes_split_layout = QHBoxLayout()
-        processes_split_layout.setSpacing(16)
+        processes_split_layout = QSplitter(Qt.Vertical)
+        processes_split_layout.setChildrenCollapsible(False)
+        processes_split_layout.setHandleWidth(8)
 
         active_container = QWidget()
         active_layout = QVBoxLayout()
@@ -810,33 +866,29 @@ class RdrsGui(QWidget):
         active_container.setLayout(active_layout)
 
         active_label = QLabel("Active Processes")
-        active_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        active_label.setStyleSheet("font-size: 17px; font-weight: bold; color: #ffffff;")
         active_layout.addWidget(active_label)
 
-        self.active_process_table = QTableWidget(0, 13)
+        self.active_process_table = QTableWidget(0, 7)
         self.active_process_table.setHorizontalHeaderLabels([
             "Process Name",
             "PID",
-            "Process Age",
-            "Executable Path",
-            "Files Created",
             "Files Modified",
-            "Files Deleted",
-            "Unique Files",
             "Events/sec",
-            "Events/min",
             "Current Score",
-            "Classification",
+            "Status",
             "Last Activity",
         ])
         self.active_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.active_process_table.horizontalHeader().setStretchLastSection(True)
         self.active_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.active_process_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.active_process_table.setSelectionMode(QTableWidget.SingleSelection)
         self.active_process_table.setStyleSheet(
-            "QTableWidget { background: #1f2430; font-size: 12px; }"
+            "QTableWidget { background: #1f2430; font-size: 13px; }"
             "QHeaderView::section { padding: 10px; }"
         )
+        self.active_process_table.setAlternatingRowColors(True)
         self.active_process_table.doubleClicked.connect(self.on_process_double_click)
         active_layout.addWidget(self.active_process_table)
 
@@ -847,39 +899,36 @@ class RdrsGui(QWidget):
         inactive_container.setLayout(inactive_layout)
 
         inactive_label = QLabel("Inactive Processes")
-        inactive_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        inactive_label.setStyleSheet("font-size: 17px; font-weight: bold; color: #ffffff;")
         inactive_layout.addWidget(inactive_label)
 
-        self.inactive_process_table = QTableWidget(0, 13)
+        self.inactive_process_table = QTableWidget(0, 7)
         self.inactive_process_table.setHorizontalHeaderLabels([
             "Process Name",
             "PID",
-            "Process Age",
-            "Executable Path",
-            "Files Created",
             "Files Modified",
-            "Files Deleted",
-            "Unique Files",
             "Events/sec",
-            "Events/min",
             "Current Score",
-            "Classification",
+            "Status",
             "Last Activity",
         ])
         self.inactive_process_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.inactive_process_table.horizontalHeader().setStretchLastSection(True)
         self.inactive_process_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.inactive_process_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.inactive_process_table.setSelectionMode(QTableWidget.SingleSelection)
         self.inactive_process_table.setStyleSheet(
-            "QTableWidget { background: #1f2430; font-size: 12px; }"
+            "QTableWidget { background: #1f2430; font-size: 13px; }"
             "QHeaderView::section { padding: 10px; }"
         )
+        self.inactive_process_table.setAlternatingRowColors(True)
         self.inactive_process_table.doubleClicked.connect(self.on_process_double_click)
         inactive_layout.addWidget(self.inactive_process_table)
 
-        processes_split_layout.addWidget(active_container, 1)
-        processes_split_layout.addWidget(inactive_container, 1)
-        processes_layout.addLayout(processes_split_layout)
+        processes_split_layout.addWidget(active_container)
+        processes_split_layout.addWidget(inactive_container)
+        processes_split_layout.setSizes([420, 420])
+        processes_layout.addWidget(processes_split_layout, 1)
         self.page_stack.addWidget(self.processes_page)
 
         # ---- Entropy Monitor page ----------------------------------------
@@ -947,12 +996,13 @@ class RdrsGui(QWidget):
         ])
         self.entropy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.entropy_table.horizontalHeader().setStretchLastSection(True)
-        self.entropy_table.setColumnWidth(0, 240)
-        self.entropy_table.setColumnWidth(1, 120)
-        self.entropy_table.setColumnWidth(2, 120)
-        self.entropy_table.setColumnWidth(3, 100)
-        self.entropy_table.setColumnWidth(4, 90)
-        self.entropy_table.setColumnWidth(5, 160)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.entropy_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.entropy_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.entropy_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.entropy_table.setSelectionMode(QTableWidget.SingleSelection)
@@ -961,6 +1011,7 @@ class RdrsGui(QWidget):
             "QTableWidget { background: #1f2430; font-size: 12px; }"
             "QHeaderView::section { padding: 8px; }"
         )
+        self.entropy_table.setAlternatingRowColors(True)
         entropy_layout.addWidget(self.entropy_table)
 
         self.page_stack.addWidget(self.entropy_page)
@@ -1087,6 +1138,7 @@ class RdrsGui(QWidget):
                     logs_db=logs_db,
                     alerts_db=alerts_db,
                     allowed_extensions=allowed_ext,
+                    monitored_roots=[monitor_path],
                     sample_size_bytes=sample_size,
                     threshold=threshold,
                     on_entropy_alert=self._entropy_alert_callback,
@@ -1138,6 +1190,7 @@ class RdrsGui(QWidget):
         pid: Optional[int],
         executable: str,
         parent: str,
+        previous_path: Optional[str] = None,
     ) -> None:
         """Handle raw filesystem events from the monitor callback.
 
@@ -1182,6 +1235,7 @@ class RdrsGui(QWidget):
                 self._entropy_monitor.on_file_event(
                     event_type,
                     file_path,
+                    previous_path=previous_path,
                     process_name=process_name,
                     pid=pid,
                     executable=executable,
@@ -1258,22 +1312,7 @@ class RdrsGui(QWidget):
             self._update_process_state_table(entry)
             return
 
-        row = self.log_table.rowCount()
-        self.log_table.insertRow(row)
         self.event_rows.append(entry)
-
-        columns = [
-            "timestamp",
-            "level",
-            "event_type",
-            "file",
-            "file_name",
-            "process",
-            "pid",
-            "executable",
-            "parent_process",
-            "message",
-        ]
 
         self.event_count += 1
         try:
@@ -1281,15 +1320,10 @@ class RdrsGui(QWidget):
         except Exception:
             pass
 
-        text_color = self._text_color_for_event(entry.get("event_type", ""))
-        for col_index, key in enumerate(columns):
-            value = entry.get(key, "") or ""
-            item = QTableWidgetItem(value)
-            if text_color is not None:
-                item.setForeground(QBrush(text_color))
-            self.log_table.setItem(row, col_index, item)
+        self._refresh_log_table_view()
         self._update_suspicious_process_table(entry)
         self._update_process_state_table(entry)
+        self._refresh_dashboard_metrics()
 
     def _load_persisted_logs(self, limit: int = 300) -> None:
         """Load recent persisted logs from logs.db into the File Monitoring page."""
@@ -1322,6 +1356,7 @@ class RdrsGui(QWidget):
                 "raw_event": "",
             }
             self.add_log_row(entry)
+        self._refresh_log_table_view()
 
     def on_table_selection_changed(self):
         """Handle log table selection changes."""
@@ -1329,8 +1364,8 @@ class RdrsGui(QWidget):
         if not selected_items:
             return
         row = selected_items[0].row()
-        if 0 <= row < len(self.event_rows):
-            entry = self.event_rows[row]
+        if 0 <= row < len(self._displayed_event_rows):
+            entry = self._displayed_event_rows[row]
             dialog = EventDetailsDialog(self, entry)
             dialog.exec_()
     
@@ -1688,6 +1723,7 @@ class RdrsGui(QWidget):
             self._show_alert_banner(
                 f"⚠  {process}  has reached a threat score of {score}."
             )
+        self._refresh_dashboard_metrics()
 
     def _update_process_state_table(self, entry: dict) -> None:
         if entry.get("event_type") != "PROCESS_STATE":
@@ -1723,20 +1759,96 @@ class RdrsGui(QWidget):
             values = [
                 entry.get("process", ""),
                 entry.get("pid", ""),
-                entry.get("process_age", ""),
-                entry.get("executable", ""),
-                entry.get("files_created", ""),
                 entry.get("files_modified", ""),
-                entry.get("files_deleted", ""),
-                entry.get("unique_files", ""),
                 entry.get("events_sec", ""),
-                entry.get("events_min", ""),
                 entry.get("score", ""),
                 entry.get("classification", ""),
                 entry.get("last_activity", ""),
             ]
             for col_index, value in enumerate(values):
                 target_table.setItem(row, col_index, QTableWidgetItem(value))
+        self._refresh_dashboard_metrics()
+
+    def _refresh_dashboard_metrics(self) -> None:
+        """Refresh the summary cards on the Home dashboard."""
+        if not hasattr(self, "dashboard_metric_labels"):
+            return
+
+        monitored = len(self.process_state_cache)
+        suspicious = len(self.suspicious_process_rows)
+        highest_score = 0
+        total_events_sec = 0
+        for entry in self.process_state_cache.values():
+            try:
+                highest_score = max(highest_score, int(entry.get("score", "0") or 0))
+            except Exception:
+                pass
+            try:
+                total_events_sec += int(entry.get("events_sec", "0") or 0)
+            except Exception:
+                pass
+
+        alerts = sum(1 for row in self.event_rows if row.get("event_type") == "DETECTION")
+        metrics = {
+            "monitored": str(monitored),
+            "suspicious": str(suspicious),
+            "highest_score": str(highest_score),
+            "alerts": str(alerts),
+            "events_sec": str(total_events_sec),
+        }
+        for key, value in metrics.items():
+            label = self.dashboard_metric_labels.get(key)
+            if label is not None:
+                label.setText(value)
+
+    def _refresh_log_table_view(self) -> None:
+        """Apply search and type filters to the File Monitoring table."""
+        search_text = self.log_search_input.text().strip().lower() if hasattr(self, "log_search_input") else ""
+        filter_text = self.log_filter_combo.currentText() if hasattr(self, "log_filter_combo") else "All Events"
+
+        filtered_rows = []
+        for entry in self.event_rows:
+            event_type = (entry.get("event_type") or "").upper()
+            if filter_text != "All Events" and event_type != filter_text:
+                continue
+
+            haystack = " ".join(
+                str(entry.get(key, "") or "")
+                for key in ("timestamp", "level", "event_type", "file", "file_name", "process", "pid", "executable", "parent_process", "message")
+            ).lower()
+            if search_text and search_text not in haystack:
+                continue
+            filtered_rows.append(entry)
+
+        self._displayed_event_rows = filtered_rows
+        self.log_table.setSortingEnabled(False)
+        self.log_table.setRowCount(0)
+
+        columns = [
+            "timestamp",
+            "level",
+            "event_type",
+            "file",
+            "file_name",
+            "process",
+            "pid",
+            "executable",
+            "parent_process",
+            "message",
+        ]
+
+        for entry in filtered_rows:
+            row = self.log_table.rowCount()
+            self.log_table.insertRow(row)
+            text_color = self._text_color_for_event(entry.get("event_type", ""))
+            for col_index, key in enumerate(columns):
+                value = entry.get(key, "") or ""
+                item = QTableWidgetItem(value)
+                if text_color is not None:
+                    item.setForeground(QBrush(text_color))
+                self.log_table.setItem(row, col_index, item)
+
+        self.log_table.setSortingEnabled(True)
 
     def _process_is_active(self, last_activity: str) -> bool:
         if not last_activity:

@@ -1,25 +1,34 @@
 """Metadata database access layer for RDRS.
 
-Stores one row per monitored file.
+Stores the entropy cache and optional legacy file metadata.
 
 Schema:
-    file_metadata
-        file_path           TEXT PRIMARY KEY   — absolute, normalised path
-        file_name           TEXT               — basename only
-        sha256_hash         TEXT               — hex digest (future use; may be NULL)
-        current_entropy     REAL               — Shannon entropy (bits/byte) of current scan
-        previous_entropy    REAL               — entropy from the previous scan
-        file_size           INTEGER            — bytes
-        last_modified_ts    REAL               — mtime epoch
-        last_scan_ts        REAL               — epoch of our last scan
-        exists              INTEGER            — 1 = file exists, 0 = deleted
-        deleted_ts          REAL               — epoch when deletion was detected (NULL if exists)
+        entropy_cache
+                path             TEXT PRIMARY KEY   — absolute, normalised path
+                entropy          REAL               — Shannon entropy (bits/byte)
+                file_size        INTEGER            — bytes
+                modified_time    REAL               — mtime epoch
+                last_scan        REAL               — epoch of our last scan
+                exists           INTEGER            — 1 = file exists, 0 = deleted
+
+        file_metadata
+                file_path           TEXT PRIMARY KEY   — absolute, normalised path
+                file_name           TEXT               — basename only
+                sha256_hash         TEXT               — hex digest (future use; may be NULL)
+                current_entropy     REAL               — Shannon entropy (bits/byte) of current scan
+                previous_entropy    REAL               — entropy from the previous scan
+                file_size           INTEGER            — bytes
+                last_modified_ts    REAL               — mtime epoch
+                last_scan_ts        REAL               — epoch of our last scan
+                exists              INTEGER            — 1 = file exists, 0 = deleted
+                deleted_ts          REAL               — epoch when deletion was detected (NULL if exists)
 
 Behaviour:
-    - If a file record already exists it is updated (upsert).
-    - If a file is deleted it is NOT removed; instead exists=0 and deleted_ts is set.
-    - A cleanup method removes records for files that have been deleted for more
-      than ``retention_days`` days.
+        - The entropy cache is durable across restarts and reused whenever the
+            file size and modification time are unchanged.
+        - File deletions are retained so historical entropy can still be queried.
+        - Legacy file metadata remains available for compatibility with existing
+            callers and UI code.
 """
 
 from __future__ import annotations
@@ -50,6 +59,18 @@ class MetadataDatabase(BaseDatabase):
 
     def _get_schema_sql(self) -> List[str]:
         return [
+            """
+            CREATE TABLE IF NOT EXISTS entropy_cache (
+                path           TEXT    NOT NULL PRIMARY KEY,
+                entropy        REAL,
+                file_size      INTEGER,
+                modified_time  REAL,
+                last_scan      REAL    NOT NULL,
+                "exists"      INTEGER NOT NULL DEFAULT 1
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_entropy_cache_scan ON entropy_cache (last_scan);",
+            "CREATE INDEX IF NOT EXISTS idx_entropy_cache_exists ON entropy_cache (\"exists\");",
             """
             CREATE TABLE IF NOT EXISTS file_metadata (
                 file_path        TEXT    NOT NULL PRIMARY KEY,
@@ -133,6 +154,106 @@ class MetadataDatabase(BaseDatabase):
                 now,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Entropy cache operations
+    # ------------------------------------------------------------------
+
+    def upsert_entropy_cache(
+        self,
+        *,
+        path: str,
+        entropy: Optional[float],
+        file_size: Optional[int],
+        modified_time: Optional[float],
+        exists: bool = True,
+    ) -> None:
+        """Insert or update a persistent entropy cache record."""
+        now = time.time()
+        path = self._normalize_path(path)
+        self.execute(
+            """
+            INSERT INTO entropy_cache
+                (path, entropy, file_size, modified_time, last_scan, "exists")
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                entropy       = excluded.entropy,
+                file_size     = excluded.file_size,
+                modified_time = excluded.modified_time,
+                last_scan     = excluded.last_scan,
+                "exists"     = excluded."exists"
+            """,
+            (path, entropy, file_size, modified_time, now, 1 if exists else 0),
+        )
+
+    def mark_entropy_deleted(self, path: str) -> None:
+        """Mark a cached entropy entry as deleted without removing it."""
+        now = time.time()
+        path = self._normalize_path(path)
+        self.execute(
+            """
+            INSERT INTO entropy_cache (path, entropy, file_size, modified_time, last_scan, "exists")
+            VALUES (?, NULL, NULL, NULL, ?, 0)
+            ON CONFLICT(path) DO UPDATE SET
+                "exists" = 0,
+                last_scan = excluded.last_scan
+            """,
+            (path, now),
+        )
+
+    def rename_entropy_path(self, old_path: str, new_path: str) -> None:
+        """Move an entropy cache entry to a new path after rename/move."""
+        old_path = self._normalize_path(old_path)
+        new_path = self._normalize_path(new_path)
+        row = self.fetchone("SELECT * FROM entropy_cache WHERE path = ?", (old_path,))
+        if row is None:
+            return
+        self.execute(
+            "DELETE FROM entropy_cache WHERE path = ?",
+            (old_path,),
+        )
+        self.execute(
+            """
+            INSERT INTO entropy_cache (path, entropy, file_size, modified_time, last_scan, "exists")
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_path,
+                row["entropy"],
+                row["file_size"],
+                row["modified_time"],
+                time.time(),
+                row["exists"],
+            ),
+        )
+
+    def get_entropy_record(self, path: str):
+        """Fetch a single entropy cache record."""
+        path = self._normalize_path(path)
+        return self.fetchone("SELECT * FROM entropy_cache WHERE path = ?", (path,))
+
+    def get_entropy_records(self, directory: Optional[str] = None):
+        """Return entropy cache rows, optionally filtered by directory prefix."""
+        if directory is None:
+            return self.fetchall("SELECT * FROM entropy_cache ORDER BY last_scan DESC")
+        directory = self._normalize_path(directory)
+        return self.fetchall(
+            "SELECT * FROM entropy_cache WHERE path LIKE ? ORDER BY last_scan DESC",
+            (directory.rstrip("/\\") + "%",),
+        )
+
+    def get_entropy_existing(self):
+        """Return only existing entropy cache rows."""
+        return self.fetchall('SELECT * FROM entropy_cache WHERE "exists" = 1 ORDER BY last_scan DESC')
+
+    def cleanup_old_deleted_entropy(self, retention_days: int) -> int:
+        """Remove old deleted entropy cache records."""
+        cutoff = time.time() - retention_days * 86_400
+        cursor = self.execute(
+            'DELETE FROM entropy_cache WHERE "exists" = 0 AND last_scan < ?',
+            (cutoff,),
+        )
+        return cursor.rowcount
 
     def mark_deleted(self, file_path: str) -> None:
         """Mark a file as deleted without removing its metadata record.

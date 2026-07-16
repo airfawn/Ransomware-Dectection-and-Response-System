@@ -1,43 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+
 a = Analysis(
     ['basic_gui.py'],
     pathex=[],
     binaries=[],
-    # Bundle config.yaml as a read-only asset so the app can find it at runtime.
-    # Databases are stored in get_data_dir() (user app data), never inside the bundle.
-    datas=[
-        ('config.yaml', '.'),
-    ],
-    hiddenimports=[
-        # Existing modules
-        'monitor',
-        'monitor.filesystem_monitor',
-        'monitor.session',
-        'utils',
-        'utils.logger',
-        'utils.paths',
-        # New: config with YAML support
-        'config',
-        'yaml',
-        # New: database layer
-        'database',
-        'database.base_db',
-        'database.metadata_db',
-        'database.logs_db',
-        'database.alerts_db',
-        # New: entropy module
-        'entropy',
-        'entropy.calculator',
-        'entropy.monitor',
-        # stdlib extras that PyInstaller may miss
-        'sqlite3',
-        'math',
-        'hashlib',
-        'platform',
-        'threading',
-        'queue',
-    ],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

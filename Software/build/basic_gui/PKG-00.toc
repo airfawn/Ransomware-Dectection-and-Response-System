@@ -63,29 +63,33 @@
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/styles/libqmacstyle.dylib',
    'BINARY'),
-  ('PyQt5/Qt5/plugins/imageformats/libqsvg.dylib',
+  ('PyQt5/Qt5/plugins/imageformats/libqjpeg.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqsvg.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/platformthemes/libqxdgdesktopportal.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platformthemes/libqxdgdesktopportal.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/imageformats/libqmacheif.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqmacheif.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/imageformats/libqtiff.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqtiff.dylib',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqjpeg.dylib',
    'BINARY'),
   ('PyQt5/Qt5/plugins/imageformats/libqtga.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqtga.dylib',
    'BINARY'),
-  ('PyQt5/Qt5/plugins/platforms/libqoffscreen.dylib',
+  ('PyQt5/Qt5/plugins/iconengines/libqsvgicon.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqoffscreen.dylib',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/iconengines/libqsvgicon.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/imageformats/libqico.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqico.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/platforms/libqcocoa.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqcocoa.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/platforms/libqminimal.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqminimal.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/platformthemes/libqxdgdesktopportal.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platformthemes/libqxdgdesktopportal.dylib',
    'BINARY'),
   ('PyQt5/Qt5/plugins/imageformats/libqicns.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
@@ -95,54 +99,47 @@
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqgif.dylib',
    'BINARY'),
-  ('PyQt5/Qt5/plugins/imageformats/libqjpeg.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqjpeg.dylib',
-   'BINARY'),
   ('PyQt5/Qt5/plugins/imageformats/libqmacjp2.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqmacjp2.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/imageformats/libqico.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqico.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/platforms/libqwebgl.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqwebgl.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/platforms/libqminimal.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqminimal.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/generic/libqtuiotouchplugin.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/generic/libqtuiotouchplugin.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/platforms/libqcocoa.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqcocoa.dylib',
    'BINARY'),
   ('PyQt5/Qt5/plugins/imageformats/libqwebp.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqwebp.dylib',
    'BINARY'),
+  ('PyQt5/Qt5/plugins/platforms/libqwebgl.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqwebgl.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/platforms/libqoffscreen.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/platforms/libqoffscreen.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/generic/libqtuiotouchplugin.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/generic/libqtuiotouchplugin.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/imageformats/libqsvg.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqsvg.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/imageformats/libqtiff.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqtiff.dylib',
+   'BINARY'),
+  ('PyQt5/Qt5/plugins/imageformats/libqmacheif.dylib',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqmacheif.dylib',
+   'BINARY'),
   ('PyQt5/Qt5/plugins/imageformats/libqwbmp.dylib',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/imageformats/libqwbmp.dylib',
-   'BINARY'),
-  ('PyQt5/Qt5/plugins/iconengines/libqsvgicon.dylib',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/plugins/iconengines/libqsvgicon.dylib',
    'BINARY'),
   ('python3.14/lib-dynload/_statistics.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_statistics.cpython-314-darwin.so',
    'EXTENSION'),
   ('python3.14/lib-dynload/_decimal.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_decimal.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_pickle.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_pickle.cpython-314-darwin.so',
    'EXTENSION'),
   ('python3.14/lib-dynload/_hashlib.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_hashlib.cpython-314-darwin.so',
@@ -207,36 +204,11 @@
   ('python3.14/lib-dynload/binascii.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/binascii.cpython-314-darwin.so',
    'EXTENSION'),
-  ('python3.14/lib-dynload/_ssl.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_ssl.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_hmac.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_hmac.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_queue.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_queue.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_ctypes.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_ctypes.cpython-314-darwin.so',
-   'EXTENSION'),
   ('python3.14/lib-dynload/_posixsubprocess.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_posixsubprocess.cpython-314-darwin.so',
    'EXTENSION'),
   ('python3.14/lib-dynload/fcntl.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/fcntl.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_scproxy.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_scproxy.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/pyexpat.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/pyexpat.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('_watchdog_fsevents.cpython-314-darwin.so',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/_watchdog_fsevents.cpython-314-darwin.so',
-   'EXTENSION'),
-  ('python3.14/lib-dynload/_heapq.cpython-314-darwin.so',
-   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_heapq.cpython-314-darwin.so',
    'EXTENSION'),
   ('python3.14/lib-dynload/_multibytecodec.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_multibytecodec.cpython-314-darwin.so',
@@ -258,6 +230,41 @@
    'EXTENSION'),
   ('python3.14/lib-dynload/_codecs_hk.cpython-314-darwin.so',
    '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_codecs_hk.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_heapq.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_heapq.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_pickle.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_pickle.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/readline.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/readline.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_sqlite3.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_sqlite3.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_queue.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_queue.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_ctypes.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_ctypes.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_scproxy.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_scproxy.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/_ssl.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_ssl.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('python3.14/lib-dynload/pyexpat.cpython-314-darwin.so',
+   '/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/pyexpat.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('yaml/_yaml.cpython-314-darwin.so',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/yaml/_yaml.cpython-314-darwin.so',
+   'EXTENSION'),
+  ('_watchdog_fsevents.cpython-314-darwin.so',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/_watchdog_fsevents.cpython-314-darwin.so',
    'EXTENSION'),
   ('PyQt5/QtWidgets.abi3.so',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
@@ -299,9 +306,9 @@
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtDBus.framework/Versions/5/QtDBus',
    'BINARY'),
-  ('PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
+  ('PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
    'BINARY'),
   ('PyQt5/Qt5/lib/QtQmlModels.framework/Versions/5/QtQmlModels',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
@@ -311,17 +318,17 @@
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtQuick.framework/Versions/5/QtQuick',
    'BINARY'),
-  ('PyQt5/Qt5/lib/QtNetwork.framework/Versions/5/QtNetwork',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtNetwork.framework/Versions/5/QtNetwork',
-   'BINARY'),
   ('PyQt5/Qt5/lib/QtQml.framework/Versions/5/QtQml',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtQml.framework/Versions/5/QtQml',
    'BINARY'),
-  ('PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
+  ('PyQt5/Qt5/lib/QtNetwork.framework/Versions/5/QtNetwork',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtNetwork.framework/Versions/5/QtNetwork',
+   'BINARY'),
+  ('PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
    'BINARY'),
   ('libmpdec.4.dylib',
    '/opt/homebrew/opt/mpdecimal/lib/libmpdec.4.dylib',
@@ -331,364 +338,367 @@
    'BINARY'),
   ('libzstd.1.dylib', '/opt/homebrew/opt/zstd/lib/libzstd.1.dylib', 'BINARY'),
   ('liblzma.5.dylib', '/opt/homebrew/opt/xz/lib/liblzma.5.dylib', 'BINARY'),
+  ('libsqlite3.dylib',
+   '/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib',
+   'BINARY'),
   ('libssl.3.dylib',
    '/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib',
    'BINARY'),
-  ('PyQt5/Qt5/translations/qtbase_bg.qm',
+  ('PyQt5/Qt5/translations/qt_help_ko.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_bg.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_hr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_hr.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ko.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qt_help_pt_BR.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_pt_BR.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_de.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_de.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_fi.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fi.qm',
-   'DATA'),
   ('PyQt5/Qt5/translations/qtbase_he.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_he.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_sk.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_sk.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_ca.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ca.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_de.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_de.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_gl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_gl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_nl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_nl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_sk.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sk.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_pt_BR.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_pt_BR.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_ko.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ko.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_fr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_fr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_pt_BR.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pt_BR.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_sv.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sv.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_zh_CN.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_zh_CN.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_es.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_es.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_cs.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_cs.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_tr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_tr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_pl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_pl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_lv.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_lv.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_hr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_hr.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qtbase_en.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_en.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_sl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_sl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_ca.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ca.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_bg.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_bg.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_tr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_tr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_fr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_da.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_da.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_ja.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ja.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_ko.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ko.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_gd.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_gd.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_en.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_en.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_tr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_tr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_ru.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ru.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_zh_TW.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_zh_TW.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_nn.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_nn.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_uk.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_uk.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_bg.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_bg.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_hu.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_hu.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_ar.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ar.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_gd.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_gd.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_zh_TW.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_zh_TW.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_zh_CN.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_zh_CN.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_nn.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_nn.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_fr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_hu.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_hu.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_lt.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_lt.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_uk.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_uk.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_fa.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fa.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_es.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_es.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_it.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_it.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_pt_PT.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pt_PT.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_he.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_he.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_ar.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ar.qm',
-   'DATA'),
   ('PyQt5/Qt5/translations/qtbase_nl.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_nl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_hu.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_hu.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_fi.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fi.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_es.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_es.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_it.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_it.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_nl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_nl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_ar.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ar.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_zh_TW.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_zh_TW.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_sl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_hr.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_hr.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_zh_CN.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_zh_CN.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_cs.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_cs.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_ja.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ja.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qt_lv.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_lv.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_ko.qm',
+  ('PyQt5/Qt5/translations/qt_de.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ko.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_de.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_gd.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_gd.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qt_help_ru.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ru.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_ru.qm',
+  ('PyQt5/Qt5/translations/qt_fi.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ru.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_pl.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pl.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_it.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_it.qm',
-   'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_ja.qm',
-   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ja.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fi.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qt_nn.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_nn.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_da.qm',
+  ('PyQt5/Qt5/translations/qt_ko.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_da.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ko.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_sk.qm',
+  ('PyQt5/Qt5/translations/qt_hu.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_sk.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_hu.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_pl.qm',
+  ('PyQt5/Qt5/translations/qt_sl.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_pl.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_it.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_it.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_sl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_sl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_nn.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_nn.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_ca.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ca.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_nl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_nl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_ar.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ar.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_es.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_es.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_fa.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fa.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_ru.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ru.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_he.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_he.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_pt_BR.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_pt_BR.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_hr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_hr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_hr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_hr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_ca.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ca.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_en.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_en.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_zh_TW.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_zh_TW.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_cs.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_cs.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qt_help_en.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_en.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_da.qm',
+  ('PyQt5/Qt5/translations/qt_help_uk.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_da.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_uk.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_hu.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_hu.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_tr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_tr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_da.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_da.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_ar.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ar.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_zh_CN.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_zh_CN.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_fa.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fa.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_ja.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ja.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_fr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_fr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_it.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_it.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qtbase_de.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_de.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_gl.qm',
+  ('PyQt5/Qt5/translations/qt_ru.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_gl.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_ru.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qt_help_ca.qm',
+  ('PyQt5/Qt5/translations/qt_pt_BR.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ca.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pt_BR.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_zh_CN.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_zh_CN.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_de.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_de.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_bg.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_bg.qm',
    'DATA'),
   ('PyQt5/Qt5/translations/qtbase_cs.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_cs.qm',
    'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_sk.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_sk.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_sk.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_sk.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_lt.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_lt.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_gl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_gl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_lv.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_lv.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_nn.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_nn.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_zh_TW.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_zh_TW.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_zh_TW.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_zh_TW.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_tr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_tr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_ko.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ko.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_sv.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sv.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_fr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_ja.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ja.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_nl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_nl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_es.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_es.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_pt_PT.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pt_PT.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_hu.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_hu.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_bg.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_bg.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_tr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_tr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_sk.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_sk.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_fr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_fr.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_it.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_it.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_pl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_pl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_zh_CN.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_zh_CN.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_hr.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_hr.qm',
+   'DATA'),
   ('PyQt5/Qt5/translations/qtbase_uk.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
    'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_uk.qm',
    'DATA'),
-  ('PyQt5/Qt5/translations/qtbase_fa.qm',
+  ('PyQt5/Qt5/translations/qt_help_cs.qm',
    '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
-   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fa.qm',
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_cs.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_es.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_es.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_pl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_pl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_da.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_da.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_uk.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_uk.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_gd.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_gd.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_ca.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_ca.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_ja.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ja.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_da.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_da.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_gl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_gl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_pl.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_pl.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_fi.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_fi.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qt_help_bg.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qt_help_bg.qm',
+   'DATA'),
+  ('PyQt5/Qt5/translations/qtbase_ar.qm',
+   '/Users/airfawn737/Desktop/internmo/Ransomware Dectection and Response '
+   'System/Software/rdrs/lib/python3.14/site-packages/PyQt5/Qt5/translations/qtbase_ar.qm',
    'DATA'),
   ('Python', 'Python.framework/Versions/3.14/Python', 'SYMLINK'),
   ('base_library.zip',
@@ -702,19 +712,19 @@
   ('QtCore', 'PyQt5/Qt5/lib/QtCore.framework/Versions/5/QtCore', 'SYMLINK'),
   ('QtSvg', 'PyQt5/Qt5/lib/QtSvg.framework/Versions/5/QtSvg', 'SYMLINK'),
   ('QtDBus', 'PyQt5/Qt5/lib/QtDBus.framework/Versions/5/QtDBus', 'SYMLINK'),
-  ('QtWebSockets',
-   'PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
+  ('QtPrintSupport',
+   'PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
    'SYMLINK'),
   ('QtQmlModels',
    'PyQt5/Qt5/lib/QtQmlModels.framework/Versions/5/QtQmlModels',
    'SYMLINK'),
   ('QtQuick', 'PyQt5/Qt5/lib/QtQuick.framework/Versions/5/QtQuick', 'SYMLINK'),
+  ('QtQml', 'PyQt5/Qt5/lib/QtQml.framework/Versions/5/QtQml', 'SYMLINK'),
   ('QtNetwork',
    'PyQt5/Qt5/lib/QtNetwork.framework/Versions/5/QtNetwork',
    'SYMLINK'),
-  ('QtQml', 'PyQt5/Qt5/lib/QtQml.framework/Versions/5/QtQml', 'SYMLINK'),
-  ('QtPrintSupport',
-   'PyQt5/Qt5/lib/QtPrintSupport.framework/Versions/5/QtPrintSupport',
+  ('QtWebSockets',
+   'PyQt5/Qt5/lib/QtWebSockets.framework/Versions/5/QtWebSockets',
    'SYMLINK'),
   ('PyQt5/Qt5/lib/QtCore.framework/QtCore',
    'Versions/Current/QtCore',
