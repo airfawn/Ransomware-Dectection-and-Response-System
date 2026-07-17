@@ -5,8 +5,8 @@ a = Analysis(
     ['ransomwaredetector.py'],
     pathex=[],
     binaries=[],
-    datas=[('config.yaml', '.')],
-    hiddenimports=['yaml'],
+    datas=[],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,10 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-app = BUNDLE(
-    exe,
-    name='ransomwaredetector.app',
-    icon=None,
-    bundle_identifier=None,
 )

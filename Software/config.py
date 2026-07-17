@@ -214,6 +214,8 @@ class EntropyConfig:
         "py", "js", "ts", "html", "xml", "json",
         "db", "sqlite", "sqlite3",
     ])
+    enabled: bool = True
+    """Master on/off switch for the entropy detection rule."""
 
     # Directories to watch — resolved at runtime so "~" is expanded.
     directories: List[str] = field(default_factory=lambda: ["~"])
@@ -700,7 +702,11 @@ def _patch_scalar_in_section(
 
     key_pattern = re.compile(rf'(?mi)^(\s*{re.escape(key)}:\s*)(?:{value_pattern})[ \t]*$')
     if key_pattern.search(section_body):
-        section_body = key_pattern.sub(rf'\g<1>{new_value}', section_body, count=1)
+        section_body = key_pattern.sub(
+        lambda m: m.group(1) + new_value,
+        section_body,
+        count=1,
+        )
     else:
         section_body = f"  {key}: {new_value}\n" + section_body.lstrip("\n")
 
