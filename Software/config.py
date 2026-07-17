@@ -16,7 +16,7 @@ import re
 import sys
 import logging
 
-from utils.paths import get_base_dir, get_log_dir, get_config_dir
+from utils.paths import get_base_dir, get_log_dir, get_config_dir, get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -310,35 +310,103 @@ class AppConfig:
 # YAML loading helpers
 # ---------------------------------------------------------------------------
 
+def _get_persisted_config_yaml_path() -> Path:
+    """Return the writable config.yaml path used for persisted user changes.
+
+    Frozen builds must never write into ``sys._MEIPASS`` because that bundle
+    extraction directory is temporary/read-only from the application's point of
+    view. Persisted settings therefore live in the platform user data folder.
+    Source runs keep using the repository-local config.yaml.
+    """
+    if getattr(sys, "frozen", False):
+        return get_data_dir() / "config.yaml"
+
+    return Path(__file__).resolve().parent / "config.yaml"
+
+
+def _get_fallback_config_yaml_candidates() -> List[Path]:
+    """Return readable fallback config.yaml locations in priority order."""
+    candidates: List[Path] = []
+
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / "config.yaml")
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(Path(sys._MEIPASS) / "config.yaml")
+    else:
+        candidates.append(Path(__file__).resolve().parent / "config.yaml")
+
+    candidates.append(Path.cwd() / "config.yaml")
+    return candidates
+
+
 def _find_config_yaml() -> Optional[Path]:
     """Search for config.yaml in order of priority.
 
     Priority:
-    1. Next to the executable / sys._MEIPASS (frozen builds).
-    2. Next to this source file's parent (Software/ directory).
-    3. Current working directory.
+    1. Writable persisted config location.
+    2. Fallback config next to the executable (frozen builds).
+    3. Bundled config inside ``sys._MEIPASS`` (frozen builds).
+    4. Source-tree config.yaml.
+    5. Current working directory.
 
     Returns:
         Path to config.yaml or None if not found.
     """
-    candidates: List[Path] = []
+    candidates: List[Path] = [_get_persisted_config_yaml_path()]
+    candidates.extend(_get_fallback_config_yaml_candidates())
 
-    if getattr(sys, "frozen", False):
-        # PyInstaller: bundled assets are in sys._MEIPASS
-        candidates.append(Path(sys._MEIPASS) / "config.yaml")
-        # Also check next to the actual executable
-        candidates.append(Path(sys.executable).parent / "config.yaml")
-    else:
-        # Source mode: config.yaml sits in Software/
-        candidates.append(Path(__file__).resolve().parent / "config.yaml")
-
-    candidates.append(Path.cwd() / "config.yaml")
-
+    seen: set[Path] = set()
     for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         if candidate.is_file():
             return candidate
 
     return None
+
+
+def _build_default_yaml_text() -> str:
+    """Serialize the current in-memory config to YAML for first-run persistence."""
+    data = _config.to_dict()
+    try:
+        import yaml
+
+        return yaml.safe_dump(data, sort_keys=False, allow_unicode=False)
+    except ImportError:
+        return (
+            "monitoring:\n"
+            f'  directories:\n    - "{_config.entropy.directories[0]}"\n'
+            f'  file_monitor_directory: "{_config.monitoring.file_monitor_directory}"\n'
+        )
+
+
+def _read_or_create_persisted_config_yaml() -> Optional[tuple[Path, str]]:
+    """Return writable config text, creating a first-run copy when needed."""
+    yaml_path = _get_persisted_config_yaml_path()
+
+    try:
+        yaml_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("Failed to create config directory for %s: %s", yaml_path, exc)
+        return None
+
+    if yaml_path.is_file():
+        try:
+            return yaml_path, yaml_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read persisted config.yaml while saving startup directories: %s", exc)
+            return None
+
+    for candidate in _get_fallback_config_yaml_candidates():
+        if not candidate.is_file():
+            continue
+        try:
+            return yaml_path, candidate.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to read fallback config.yaml from %s: %s", candidate, exc)
+
+    return yaml_path, _build_default_yaml_text()
 
 
 def _load_yaml_config(path: Path) -> Dict[str, Any]:
@@ -500,16 +568,10 @@ def save_rule_settings(rule_weights: Dict[str, int], rule_enabled: Dict[str, boo
     _config.detection.rule_weights.update(rule_weights)
     _config.detection.rule_enabled.update(rule_enabled)
 
-    yaml_path = _find_config_yaml()
-    if yaml_path is None:
-        logger.warning("config.yaml not found — rule changes applied in-memory only (not persisted).")
+    persisted = _read_or_create_persisted_config_yaml()
+    if persisted is None:
         return False
-
-    try:
-        text = yaml_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Failed to read config.yaml for saving rule settings: %s", exc)
-        return False
+    yaml_path, text = persisted
 
     # Weight lines look like "  Rule1_FileBurst: 20" — the numeric value
     # unambiguously distinguishes them from the boolean rule_enabled lines.
@@ -542,10 +604,17 @@ def save_rule_settings(rule_weights: Dict[str, int], rule_enabled: Dict[str, boo
         match = weights_block_pattern.search(text)
         lines = [
             "",
+            "  # Score contributed by each behavioral rule while active.",
+            "  rule_weights:",
+        ]
+        for rule_name in cfg_rule_order():
+            lines.append(f"    {rule_name}: {int(_config.detection.rule_weights.get(rule_name, 0))}")
+        lines.extend([
+            "",
             "  # Per-rule enable/disable switches. A disabled rule never",
             "  # contributes to a process's score, even if its trigger condition holds.",
             "  rule_enabled:",
-        ]
+        ])
         for rule_name in cfg_rule_order():
             lines.append(f"    {rule_name}: {str(bool(rule_enabled.get(rule_name, True))).lower()}")
         insertion = "\n".join(lines)
@@ -553,9 +622,7 @@ def save_rule_settings(rule_weights: Dict[str, int], rule_enabled: Dict[str, boo
             insert_at = match.end()
             text = text[:insert_at] + insertion + text[insert_at:]
         else:
-            text += "\ndetection:\n  rule_enabled:\n" + "\n".join(
-                f"    {r}: {str(bool(rule_enabled.get(r, True))).lower()}" for r in cfg_rule_order()
-            ) + "\n"
+            text += "\ndetection:\n" + insertion.lstrip("\n") + "\n"
 
     try:
         yaml_path.write_text(text, encoding="utf-8")
@@ -712,16 +779,10 @@ def save_startup_directories(entropy_directory: str, file_monitor_directory: str
     _config.entropy.directories = [entropy_path]
     _config.monitoring.file_monitor_directory = file_monitor_path
 
-    yaml_path = _find_config_yaml()
-    if yaml_path is None:
-        logger.warning("config.yaml not found — startup directory changes applied in-memory only.")
+    persisted = _read_or_create_persisted_config_yaml()
+    if persisted is None:
         return False
-
-    try:
-        text = yaml_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Failed to read config.yaml while saving startup directories: %s", exc)
-        return False
+    yaml_path, text = persisted
 
     text = _patch_list_in_section(text, "monitoring", "directories", [f'"{entropy_path}"'])
     text = _patch_scalar_in_section(
@@ -762,16 +823,10 @@ def save_entropy_rule_settings(score: Optional[int] = None, enabled: Optional[bo
     if enabled is not None:
         _config.entropy.enabled = bool(enabled)
 
-    yaml_path = _find_config_yaml()
-    if yaml_path is None:
-        logger.warning("config.yaml not found — entropy rule change applied in-memory only (not persisted).")
+    persisted = _read_or_create_persisted_config_yaml()
+    if persisted is None:
         return False
-
-    try:
-        text = yaml_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Failed to read config.yaml for saving entropy settings: %s", exc)
-        return False
+    yaml_path, text = persisted
 
     if score is not None:
         text = _patch_scalar_in_section(text, "entropy", "score", str(int(score)), r'\d+')
