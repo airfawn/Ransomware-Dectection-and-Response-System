@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QObject, QThread
+from PyQt5.QtCore import QObject, QThread, QTimer
 
 from startup_worker import StartupWorker
 from splash_screen import InitializationSplashScreen
@@ -74,10 +74,20 @@ class InitializationManager(QObject):
             )
 
         self._main_window.show()
+        if hasattr(self._main_window, "raise_"):
+            self._main_window.raise_()
+        if hasattr(self._main_window, "activateWindow"):
+            self._main_window.activateWindow()
+
         if self._splash is not None:
-            self._splash.close()
-            self._splash.deleteLater()
+            splash = self._splash
             self._splash = None
+
+            def _close_splash() -> None:
+                splash.close()
+                splash.deleteLater()
+
+            QTimer.singleShot(0, _close_splash)
 
     def _on_thread_finished(self) -> None:
         """Release worker/thread references after initialization completes."""
