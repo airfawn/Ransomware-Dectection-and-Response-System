@@ -27,7 +27,7 @@ Event flow::
 Isolation guarantees
 --------------------
   - The entropy module NEVER modifies process scores.
-  - The entropy module NEVER imports from basic_gui.
+  - The entropy module NEVER imports from ransomwaredetector.
   - The GUI callback is injected at construction time, keeping this module
     decoupled from the presentation layer.
 """
@@ -371,7 +371,7 @@ class EntropyMonitor:
         # 1. Extension filter — only process allowed file types
         #
         # Note: filesystem event persistence to logs.db is handled by the
-        # monitor callback chain in basic_gui.py so that *all* events are
+        # monitor callback chain in ransomwaredetector.py so that *all* events are
         # stored, not only entropy-supported extensions.
         # -----------------------------------------------------------------
         extension = path.suffix.lower().lstrip(".")
