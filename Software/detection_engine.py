@@ -87,6 +87,17 @@ class ProcessContext(Protocol):
         """Directories touched in the last second."""
         ...
 
+    def count_extension_changes(self, window_seconds: float) -> int:
+        """Count of genuine file-extension-change events within a time window.
+
+        Args:
+            window_seconds: Size of the trailing time window, in seconds.
+
+        Returns:
+            Number of extension-change events recorded within the window.
+        """
+        ...
+
 
 class DetectionEngine(ABC):
     """Abstract base class for all detection engines.
@@ -242,18 +253,34 @@ class FileActivityEngine(DetectionEngine):
             return self._check_rule3(process_context)
         return False
     
+    def _is_rule_enabled(self, rule_name: str) -> bool:
+        """Return whether a rule is currently enabled.
+
+        Reads live from the config dict passed at construction time (which
+        is the actual ``__dict__`` of the shared ``DetectionConfig``
+        instance), so toggling a rule from the GUI's Active Rules page takes
+        effect immediately without recreating the engine.
+        """
+        return self._config.get("rule_enabled", {}).get(rule_name, True)
+
     def _check_rule1(self, ctx: ProcessContext) -> bool:
         """Check high operation rate rule."""
+        if not self._is_rule_enabled("Rule1_FileBurst"):
+            return False
         threshold = self._rules["Rule1_FileBurst"]["threshold"]
         return ctx.events_last_second > threshold
     
     def _check_rule2(self, ctx: ProcessContext) -> bool:
         """Check multiple directories rule."""
+        if not self._is_rule_enabled("Rule2_MultipleDirectories"):
+            return False
         threshold = self._rules["Rule2_MultipleDirectories"]["threshold"]
         return len(ctx.recent_directories_last_second) > threshold
     
     def _check_rule3(self, ctx: ProcessContext) -> bool:
         """Check young process burst rule."""
+        if not self._is_rule_enabled("Rule3_YoungProcessBurst"):
+            return False
         rule = self._rules["Rule3_YoungProcessBurst"]
         age_threshold = rule["age_threshold"]
         ops_threshold = rule["ops_threshold"]
@@ -354,6 +381,102 @@ class EntropyAnalysisEngine(DetectionEngine):
             with self._lock:
                 return len(self._pending_alerts) > 0
         return False
+
+
+class ExtensionChangeEngine(DetectionEngine):
+    """Detection engine for mass file-extension-change bursts.
+
+    Ransomware commonly renames files after encrypting their contents
+    (e.g. ``report.docx`` -> ``report.locked``).  A legitimate process
+    rarely changes the extensions of many files within a short window, so a
+    burst of such changes from a single process is a strong ransomware
+    signature.
+
+    This engine follows the exact same convention as ``FileActivityEngine``:
+    it exposes a ``_rules`` dict so ``DetectionOrchestrator.get_active_rules``
+    can auto-discover it, and the rule contributes its weight to
+    ``ProcessState.score`` only while the burst condition remains true —
+    i.e. the score bonus is applied once per detection window and is
+    automatically removed once the burst subsides (no manual bookkeeping
+    required to avoid double-counting).
+
+    Genuine extension-change detection itself (what counts as a "real"
+    change vs. benign autosave churn) lives in
+    ``monitor.extension_monitor`` — this engine only decides *scoring*
+    based on the per-process statistics already recorded on
+    ``ProcessState``.
+    """
+
+    def __init__(self, config: dict):
+        """Initialize the extension-change burst detection engine.
+
+        Args:
+            config: Configuration dictionary (``DetectionConfig.__dict__``)
+                with ``extension_change_threshold``,
+                ``extension_change_window_seconds`` and ``rule_weights``.
+        """
+        self._enabled = True
+        self._config = config
+        self._rules = {
+            "Rule4_ExtensionChangeBurst": {
+                "weight": config.get("rule_weights", {}).get("Rule4_ExtensionChangeBurst", 30),
+                "threshold": config.get("extension_change_threshold", 5),
+                "window_seconds": config.get("extension_change_window_seconds", 10.0),
+                "reason": (
+                    "Extension Change Detection rule triggered: more than {threshold} "
+                    "file extension changes within {window:.0f}s — possible mass encryption"
+                ),
+            },
+        }
+
+    @property
+    def name(self) -> str:
+        return "ExtensionChangeEngine"
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def evaluate(
+        self,
+        process_context: ProcessContext,
+        event_type: str,
+        timestamp: float,
+        file_path: str,
+    ) -> List[DetectionResult]:
+        """Evaluate the mass extension-change burst rule."""
+        results: List[DetectionResult] = []
+
+        if self._check_burst(process_context):
+            rule = self._rules["Rule4_ExtensionChangeBurst"]
+            results.append(DetectionResult(
+                rule_name="Rule4_ExtensionChangeBurst",
+                reason=rule["reason"].format(threshold=rule["threshold"], window=rule["window_seconds"]),
+                score_delta=rule["weight"],
+                severity="high",
+            ))
+
+        return results
+
+    def is_rule_active(self, rule_name: str, process_context: ProcessContext) -> bool:
+        """Check if the extension-change burst rule is currently active."""
+        if rule_name == "Rule4_ExtensionChangeBurst":
+            return self._check_burst(process_context)
+        return False
+
+    def _check_burst(self, ctx: ProcessContext) -> bool:
+        """Return True when extension changes within the window exceed the threshold."""
+        if not self._config.get("rule_enabled", {}).get("Rule4_ExtensionChangeBurst", True):
+            return False
+        rule = self._rules["Rule4_ExtensionChangeBurst"]
+        count_fn = getattr(ctx, "count_extension_changes", None)
+        if count_fn is None:
+            return False
+        try:
+            count = count_fn(rule["window_seconds"])
+        except Exception:
+            return False
+        return count >= rule["threshold"]
 
 
 class NetworkActivityEngine(DetectionEngine):

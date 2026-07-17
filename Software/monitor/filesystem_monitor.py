@@ -40,10 +40,21 @@ from watchdog.observers import Observer
 
 try:
     from config import get_config
-    from detection_engine import DetectionOrchestrator, FileActivityEngine, ProcessContext
+    from detection_engine import (
+        DetectionOrchestrator,
+        FileActivityEngine,
+        ExtensionChangeEngine,
+        ProcessContext,
+    )
     _CONFIG_AVAILABLE = True
 except ImportError:
     _CONFIG_AVAILABLE = False
+
+from monitor.extension_monitor import (
+    DEFAULT_IGNORED_TARGET_EXTENSIONS,
+    get_extension,
+    is_genuine_extension_change,
+)
 
 
 @dataclass(frozen=True)
@@ -364,6 +375,10 @@ class ProcessState:
     max_event_history: int = 1000
     event_window_seconds: float = 60.0
     recent_events: Deque[Tuple[float, str, str, str]] = field(default_factory=deque)
+    extension_change_timestamps: Deque[float] = field(default_factory=lambda: deque(maxlen=500))
+    """Bounded history of genuine extension-change event timestamps, used by
+    ExtensionChangeEngine to detect mass-rename bursts (see
+    monitor.extension_monitor and detection_engine.ExtensionChangeEngine)."""
 
     def record_event(self, event_type: str, src_path: str, timestamp: float) -> None:
         """Record a file system event for this process.
@@ -395,6 +410,36 @@ class ProcessState:
         
         # Enforce event history limit and time window simultaneously
         self._expire_old_events(timestamp)
+
+    def record_extension_change(self, timestamp: float) -> None:
+        """Record a genuine file-extension-change event for this process.
+
+        Called by ProcessBehaviorTracker after confirming (via
+        monitor.extension_monitor.is_genuine_extension_change) that a
+        FILE MOVED event actually changed a file's extension. Feeds
+        detection_engine.ExtensionChangeEngine's burst rule via
+        count_extension_changes().
+
+        Args:
+            timestamp: Epoch time of the extension-change event.
+        """
+        self.extension_change_count += 1
+        self.extension_change_timestamps.append(timestamp)
+
+    def count_extension_changes(self, window_seconds: float) -> int:
+        """Return the number of extension changes within a trailing time window.
+
+        Implements the ProcessContext.count_extension_changes protocol
+        method consumed by detection_engine.ExtensionChangeEngine.
+
+        Args:
+            window_seconds: Size of the trailing window, in seconds.
+
+        Returns:
+            Count of extension-change events within the window.
+        """
+        cutoff = datetime.now().timestamp() - window_seconds
+        return sum(1 for ts in self.extension_change_timestamps if ts >= cutoff)
 
     def _normalize_file_path(self, src_path: str) -> str:
         """Normalize a file path for consistent comparison.
@@ -501,6 +546,7 @@ class ProcessState:
                 "Rule1_FileBurst": 20,
                 "Rule2_MultipleDirectories": 30,
                 "Rule3_YoungProcessBurst": 10,
+                "Rule4_ExtensionChangeBurst": 30,
             }
         return sum(weights.get(rule_name, 0) for rule_name in self.active_rules)
 
@@ -615,6 +661,13 @@ class ProcessBehaviorTracker:
             self._orchestrator = DetectionOrchestrator()
             file_engine = FileActivityEngine(config.detection.__dict__)
             self._orchestrator.register_engine(file_engine)
+            extension_engine = ExtensionChangeEngine(config.detection.__dict__)
+            self._orchestrator.register_engine(extension_engine)
+
+            # File Extension Change Monitor settings (detection, not scoring).
+            ext_cfg = config.extension_monitor
+            self._extension_monitor_enabled = ext_cfg.enabled
+            self._ignored_extensions = {e.lower().lstrip(".") for e in ext_cfg.ignored_extensions}
         else:
             # Fallback defaults
             self._inactivity_threshold = 300.0
@@ -622,6 +675,8 @@ class ProcessBehaviorTracker:
             self._max_event_history = 1000
             self._event_window = 60.0
             self._orchestrator = None
+            self._extension_monitor_enabled = True
+            self._ignored_extensions = set(DEFAULT_IGNORED_TARGET_EXTENSIONS)
         
         # Cleanup scheduling
         self._last_cleanup_time = datetime.now().timestamp()
@@ -632,6 +687,7 @@ class ProcessBehaviorTracker:
         event_type: str,
         src_path: str,
         process_metadata: ProcessMetadata,
+        previous_path: Optional[str] = None,
     ) -> ProcessState:
         """Record a filesystem event and update process behavior state.
         
@@ -642,6 +698,9 @@ class ProcessBehaviorTracker:
             event_type: Type of event (FILE CREATED, FILE MODIFIED, FILE DELETED).
             src_path: Path to the affected file.
             process_metadata: Resolved process information.
+            previous_path: Original path for moved/renamed events (used to
+                detect genuine file-extension changes). None for other
+                event types.
         
         Returns:
             Updated ProcessState for the process.
@@ -663,6 +722,11 @@ class ProcessBehaviorTracker:
             # Record the event
             record.record_event(event_type, src_path, now)
             
+            # Detect genuine file-extension changes (independent of scoring
+            # rules, which are applied below via the detection orchestrator).
+            if previous_path:
+                self._handle_potential_extension_change(record, previous_path, src_path, now)
+            
             # Apply detection rules
             self._apply_rules(record, event_type, now, src_path)
             
@@ -673,6 +737,89 @@ class ProcessBehaviorTracker:
             self._maybe_cleanup_stale_processes(now)
             
             return record
+
+    def _handle_potential_extension_change(
+        self,
+        record: ProcessState,
+        previous_path: str,
+        new_path: str,
+        timestamp: float,
+    ) -> None:
+        """Detect and record a genuine file-extension change, if any.
+
+        Delegates the "is this a real extension change" decision to
+        monitor.extension_monitor.is_genuine_extension_change (pure, no
+        side effects), then updates the process's statistics and emits a
+        structured log entry consumed by the GUI exactly like existing
+        [Detection] / [ProcessState] blocks.
+
+        Must be called with lock held.
+
+        Args:
+            record: ProcessState for the process that touched the file.
+            previous_path: Original path before the rename/move.
+            new_path: Path after the rename/move.
+            timestamp: Epoch time of the event.
+        """
+        if not self._extension_monitor_enabled:
+            return
+
+        try:
+            genuine = is_genuine_extension_change(
+                previous_path,
+                new_path,
+                ignored_extensions=self._ignored_extensions,
+            )
+        except Exception as exc:
+            self.logger.debug(f"Extension-change check failed for {new_path}: {exc}")
+            return
+
+        if not genuine:
+            return
+
+        old_ext = get_extension(previous_path)
+        new_ext = get_extension(new_path)
+
+        record.record_extension_change(timestamp)
+        self._log_extension_change(record, previous_path, new_path, old_ext, new_ext)
+
+    def _log_extension_change(
+        self,
+        record: ProcessState,
+        previous_path: str,
+        new_path: str,
+        old_extension: str,
+        new_extension: str,
+    ) -> None:
+        """Emit a structured [ExtensionChange] log entry for a genuine change.
+
+        Parsed by the GUI (ransomwaredetector.py::_parse_extension_change_block)
+        into an EXTENSION_CHANGE table row, persisted to logs.db, and shown
+        using the existing File Monitoring log table — no bespoke GUI
+        plumbing required beyond that single parser.
+
+        Args:
+            record: ProcessState for the process that renamed the file.
+            previous_path: Original file path.
+            new_path: New file path.
+            old_extension: Extension before the change (no leading dot).
+            new_extension: Extension after the change (no leading dot).
+        """
+        lines = ["[ExtensionChange]", "", "Process:", record.process_name or "unknown"]
+        if record.pid is not None:
+            lines.extend(["", "PID:", str(record.pid)])
+        if record.executable:
+            lines.extend(["", "Executable:", record.executable])
+        lines.extend([
+            "", "Original Path:", previous_path,
+            "", "New Path:", new_path,
+            "", "Original Extension:", old_extension or "(none)",
+            "", "New Extension:", new_extension or "(none)",
+            "", "Timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ])
+        lines.append("")
+        lines.append("----------------------------")
+        self.logger.info("\n" + "\n".join(lines))
 
     def _get_or_create_process_state(
         self,
@@ -799,6 +946,10 @@ class ProcessBehaviorTracker:
         ):
             active_rules.add("Rule3_YoungProcessBurst")
         
+        # Rule 4: Mass extension-change burst
+        if record.count_extension_changes(10.0) >= 5:
+            active_rules.add("Rule4_ExtensionChangeBurst")
+        
         # Detect new activations
         new_activations = active_rules - record.active_rules
         record.active_rules = active_rules
@@ -817,6 +968,10 @@ class ProcessBehaviorTracker:
             "Rule1_FileBurst": "More than 10 file operations within 1 second",
             "Rule2_MultipleDirectories": "Touched multiple directories within 1 second",
             "Rule3_YoungProcessBurst": "Young process with high file activity",
+            "Rule4_ExtensionChangeBurst": (
+                "Extension Change Detection rule triggered: more than 5 file "
+                "extension changes within 10s — possible mass encryption"
+            ),
         }
         return reasons.get(rule_name, "Unknown rule")
 
@@ -1092,7 +1247,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             )
 
             # Update behavioral tracker
-            self.behavior_tracker.record_event(event_type, src_path, process_metadata)
+            self.behavior_tracker.record_event(event_type, src_path, process_metadata, previous_path=previous_path)
 
             # Log structured event
             output = ["=" * 38]

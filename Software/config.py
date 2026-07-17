@@ -11,7 +11,8 @@ back to the dataclass defaults — ensuring the application always starts.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
+import re
 import sys
 import logging
 
@@ -66,11 +67,30 @@ class DetectionConfig:
     young_process_ops_threshold: int = 10
     """Operations per second for young process rule."""
     
+    extension_change_threshold: int = 5
+    """Number of genuine file-extension changes by one process within the
+    detection window that is treated as a mass-encryption burst."""
+    
+    extension_change_window_seconds: float = 10.0
+    """Trailing time window (seconds) used to evaluate the extension-change
+    burst rule."""
+    
     # Scoring weights
     rule_weights: Dict[str, int] = field(default_factory=lambda: {
         "Rule1_FileBurst": 20,
         "Rule2_MultipleDirectories": 30,
         "Rule3_YoungProcessBurst": 10,
+        "Rule4_ExtensionChangeBurst": 30,
+    })
+
+    # Per-rule enable/disable switches. A disabled rule never contributes to
+    # a process's score, even while its trigger condition would otherwise
+    # hold true. Edited from the "Active Rules" GUI page.
+    rule_enabled: Dict[str, bool] = field(default_factory=lambda: {
+        "Rule1_FileBurst": True,
+        "Rule2_MultipleDirectories": True,
+        "Rule3_YoungProcessBurst": True,
+        "Rule4_ExtensionChangeBurst": True,
     })
     
     # Classification thresholds
@@ -229,6 +249,22 @@ class AlertsConfig:
 
 
 @dataclass
+class ExtensionMonitorConfig:
+    """Configuration for the File Extension Change Monitor."""
+
+    enabled: bool = True
+    """Master on/off switch for extension-change detection."""
+
+    ignored_extensions: List[str] = field(default_factory=lambda: [
+        "tmp", "temp", "swp", "swx", "swo", "bak",
+        "crdownload", "part", "partial", "download",
+    ])
+    """Destination extensions treated as benign churn (autosave/temp/partial
+    downloads) and therefore excluded from detection, even though they
+    technically change the extension."""
+
+
+@dataclass
 class AppConfig:
     """Master configuration container for the entire application."""
 
@@ -240,6 +276,7 @@ class AppConfig:
     entropy: EntropyConfig = field(default_factory=EntropyConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    extension_monitor: ExtensionMonitorConfig = field(default_factory=ExtensionMonitorConfig)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary for serialization."""
@@ -248,6 +285,7 @@ class AppConfig:
             "detection": {
                 **self.detection.__dict__,
                 "rule_weights": self.detection.rule_weights.copy(),
+                "rule_enabled": self.detection.rule_enabled.copy(),
             },
             "gui": {
                 **self.gui.__dict__,
@@ -257,6 +295,10 @@ class AppConfig:
             "entropy": self.entropy.__dict__,
             "database": self.database.__dict__,
             "alerts": self.alerts.__dict__,
+            "extension_monitor": {
+                **self.extension_monitor.__dict__,
+                "ignored_extensions": self.extension_monitor.ignored_extensions.copy(),
+            },
         }
 
 
@@ -340,6 +382,8 @@ def _apply_yaml_to_config(cfg: AppConfig, data: Dict[str, Any]) -> None:
         cfg.entropy.threshold = float(ent["threshold"])
     if "score" in ent:
         cfg.entropy.score = int(ent["score"])
+    if "enabled" in ent:
+        cfg.entropy.enabled = bool(ent["enabled"])
     if "file_extensions" in mon:
         exts = mon["file_extensions"]
         if isinstance(exts, list):
@@ -366,6 +410,26 @@ def _apply_yaml_to_config(cfg: AppConfig, data: Dict[str, Any]) -> None:
     al = data.get("alerts") or {}
     if "process_alert_threshold" in al:
         cfg.alerts.process_alert_threshold = int(al["process_alert_threshold"])
+
+    # -- detection section ----------------------------------------------------
+    det = data.get("detection") or {}
+    if "extension_change_threshold" in det:
+        cfg.detection.extension_change_threshold = int(det["extension_change_threshold"])
+    if "extension_change_window_seconds" in det:
+        cfg.detection.extension_change_window_seconds = float(det["extension_change_window_seconds"])
+    if "rule_weights" in det and isinstance(det["rule_weights"], dict):
+        cfg.detection.rule_weights.update({k: int(v) for k, v in det["rule_weights"].items()})
+    if "rule_enabled" in det and isinstance(det["rule_enabled"], dict):
+        cfg.detection.rule_enabled.update({k: bool(v) for k, v in det["rule_enabled"].items()})
+
+    # -- extension_monitor section --------------------------------------------
+    ext_mon = data.get("extension_monitor") or {}
+    if "enabled" in ext_mon:
+        cfg.extension_monitor.enabled = bool(ext_mon["enabled"])
+    if "ignored_extensions" in ext_mon and isinstance(ext_mon["ignored_extensions"], list):
+        cfg.extension_monitor.ignored_extensions = [
+            str(e).lower().lstrip(".") for e in ext_mon["ignored_extensions"]
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +460,216 @@ def reload_config() -> None:
         logger.debug("Loaded config.yaml from %s", yaml_path)
     else:
         logger.debug("config.yaml not found — using built-in defaults.")
+
+
+def save_rule_settings(rule_weights: Dict[str, int], rule_enabled: Dict[str, bool]) -> bool:
+    """Persist rule weight/enabled changes to both the live config and config.yaml.
+
+    Used by the GUI's "Active Rules" page. Updates the in-memory AppConfig
+    immediately (so running detection reflects the change on the very next
+    evaluated event) and performs a targeted text edit of config.yaml that
+    preserves all existing comments/formatting elsewhere in the file.
+
+    Args:
+        rule_weights: Mapping of rule name -> new score weight. May be a
+            partial update (only changed rules need to be included).
+        rule_enabled: Mapping of rule name -> new enabled flag. May be a
+            partial update.
+
+    Returns:
+        True if config.yaml was found and successfully rewritten on disk.
+        False if config.yaml could not be located/written (the in-memory
+        config is still updated in that case, so detection behavior changes
+        for the current session even though it won't survive a restart).
+    """
+    # Update the live config immediately regardless of on-disk outcome.
+    _config.detection.rule_weights.update(rule_weights)
+    _config.detection.rule_enabled.update(rule_enabled)
+
+    yaml_path = _find_config_yaml()
+    if yaml_path is None:
+        logger.warning("config.yaml not found — rule changes applied in-memory only (not persisted).")
+        return False
+
+    try:
+        text = yaml_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to read config.yaml for saving rule settings: %s", exc)
+        return False
+
+    # Weight lines look like "  Rule1_FileBurst: 20" — the numeric value
+    # unambiguously distinguishes them from the boolean rule_enabled lines.
+    for rule_name, weight in rule_weights.items():
+        pattern = re.compile(rf'(?m)^(\s*{re.escape(rule_name)}:\s*)\d+[ \t]*$')
+        if pattern.search(text):
+            text = pattern.sub(rf'\g<1>{int(weight)}', text)
+
+    if "rule_enabled:" in text:
+        for rule_name, enabled in rule_enabled.items():
+            pattern = re.compile(rf'(?mi)^(\s*{re.escape(rule_name)}:\s*)(?:true|false)[ \t]*$')
+            if pattern.search(text):
+                text = pattern.sub(rf'\g<1>{str(bool(enabled)).lower()}', text)
+            else:
+                # Rule not yet listed under rule_enabled — append it.
+                block_pattern = re.compile(r'(?m)^(\s*)rule_enabled:\s*$')
+                match = block_pattern.search(text)
+                if match:
+                    indent = match.group(1) + "  "
+                    insert_at = match.end()
+                    text = (
+                        text[:insert_at]
+                        + f"\n{indent}{rule_name}: {str(bool(enabled)).lower()}"
+                        + text[insert_at:]
+                    )
+    else:
+        # No rule_enabled mapping exists yet — insert one right after
+        # rule_weights so the new switches are discoverable and documented.
+        weights_block_pattern = re.compile(r'(?m)^(\s*)rule_weights:\s*(?:\n\1\s+\S+:\s*\d+\s*)+')
+        match = weights_block_pattern.search(text)
+        lines = [
+            "",
+            "  # Per-rule enable/disable switches. A disabled rule never",
+            "  # contributes to a process's score, even if its trigger condition holds.",
+            "  rule_enabled:",
+        ]
+        for rule_name in cfg_rule_order():
+            lines.append(f"    {rule_name}: {str(bool(rule_enabled.get(rule_name, True))).lower()}")
+        insertion = "\n".join(lines)
+        if match:
+            insert_at = match.end()
+            text = text[:insert_at] + insertion + text[insert_at:]
+        else:
+            text += "\ndetection:\n  rule_enabled:\n" + "\n".join(
+                f"    {r}: {str(bool(rule_enabled.get(r, True))).lower()}" for r in cfg_rule_order()
+            ) + "\n"
+
+    try:
+        yaml_path.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write config.yaml with updated rule settings: %s", exc)
+        return False
+
+    logger.info("Persisted rule settings to %s", yaml_path)
+    return True
+
+
+def cfg_rule_order() -> List[str]:
+    """Return the canonical rule name ordering used when writing config.yaml."""
+    return [
+        "Rule1_FileBurst",
+        "Rule2_MultipleDirectories",
+        "Rule3_YoungProcessBurst",
+        "Rule4_ExtensionChangeBurst",
+    ]
+
+
+def _find_top_level_section_span(text: str, section_name: str) -> Optional[Tuple[int, int]]:
+    """Return the (start, end) character span of a top-level YAML section's body.
+
+    The span covers everything from just after the "section_name:" line up to
+    (but not including) the next top-level key, or end of file. Used to scope
+    scalar-key edits to a single section so identically-named keys in other
+    sections (e.g. "enabled:" appears under both entropy: and
+    extension_monitor:) are never touched by mistake.
+
+    Args:
+        text: Full config.yaml contents.
+        section_name: Top-level section name (e.g. "entropy").
+
+    Returns:
+        (start, end) character offsets, or None if the section is not found.
+    """
+    section_pattern = re.compile(rf'(?m)^{re.escape(section_name)}:[ \t]*$')
+    match = section_pattern.search(text)
+    if not match:
+        return None
+    start = match.end()
+    next_top_level = re.compile(r'(?m)^[A-Za-z_][A-Za-z0-9_]*:\s*(#.*)?$')
+    next_match = next_top_level.search(text, start)
+    end = next_match.start() if next_match else len(text)
+    return start, end
+
+
+def _patch_scalar_in_section(
+    text: str,
+    section_name: str,
+    key: str,
+    new_value: str,
+    value_pattern: str,
+) -> str:
+    """Update (or insert) a top-level scalar key within a named YAML section.
+
+    Args:
+        text: Full config.yaml contents.
+        section_name: Top-level section name (e.g. "entropy").
+        key: Scalar key to update (e.g. "score", "enabled").
+        new_value: Replacement value, already formatted as YAML scalar text.
+        value_pattern: Regex fragment matching the key's existing value type
+            (e.g. r"\\d+" for ints, r"true|false" for booleans) so the same
+            key name in a different section is never accidentally matched.
+
+    Returns:
+        Updated text. Unchanged if the section could not be found.
+    """
+    span = _find_top_level_section_span(text, section_name)
+    if span is None:
+        return text
+    start, end = span
+    section_body = text[start:end]
+
+    key_pattern = re.compile(rf'(?mi)^(\s*{re.escape(key)}:\s*)(?:{value_pattern})[ \t]*$')
+    if key_pattern.search(section_body):
+        section_body = key_pattern.sub(rf'\g<1>{new_value}', section_body, count=1)
+    else:
+        section_body = f"  {key}: {new_value}\n" + section_body.lstrip("\n")
+
+    return text[:start] + section_body + text[end:]
+
+
+def save_entropy_rule_settings(score: Optional[int] = None, enabled: Optional[bool] = None) -> bool:
+    """Persist Entropy rule (score/enabled) changes to both the live config and config.yaml.
+
+    Mirrors save_rule_settings() but targets config.entropy.score/enabled
+    instead of config.detection.rule_weights/rule_enabled, since the Entropy
+    rule's tunables live in a different top-level YAML section. Used by the
+    GUI's "Active Rules" page for the Entropy row.
+
+    Args:
+        score: New score delta, or None to leave unchanged.
+        enabled: New enabled flag, or None to leave unchanged.
+
+    Returns:
+        True if config.yaml was found and successfully rewritten on disk.
+    """
+    if score is not None:
+        _config.entropy.score = int(score)
+    if enabled is not None:
+        _config.entropy.enabled = bool(enabled)
+
+    yaml_path = _find_config_yaml()
+    if yaml_path is None:
+        logger.warning("config.yaml not found — entropy rule change applied in-memory only (not persisted).")
+        return False
+
+    try:
+        text = yaml_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to read config.yaml for saving entropy settings: %s", exc)
+        return False
+
+    if score is not None:
+        text = _patch_scalar_in_section(text, "entropy", "score", str(int(score)), r'\d+')
+    if enabled is not None:
+        text = _patch_scalar_in_section(text, "entropy", "enabled", str(bool(enabled)).lower(), r'true|false')
+
+    try:
+        yaml_path.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write config.yaml with updated entropy settings: %s", exc)
+        return False
+
+    logger.info("Persisted entropy rule settings to %s", yaml_path)
+    return True
 
 
 # Apply YAML config at import time so the first call to get_config() is

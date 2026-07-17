@@ -62,6 +62,10 @@ entropy:
   # itself never modifies scores.
   score: 30
 
+  # Master on/off switch for the entropy-increase scoring rule. Edited from
+  # the GUI's "Active Rules" page alongside the other behavioral rules.
+  enabled: true
+
 database:
   # File names only — the application resolves the full path to a platform-
   # appropriate writable directory (e.g. ~/Library/Application Support/RDRS/).
@@ -82,3 +86,55 @@ alerts:
   # A process score at or above this value triggers the red alert banner
   # on the Home page and plays a notification sound.
   process_alert_threshold: 70
+
+detection:
+  # File Extension Change ("Rule4_ExtensionChangeBurst") burst detection.
+  #
+  # Ransomware renames files after encrypting them (e.g. report.docx ->
+  # report.locked). A single genuine rename is common and benign; a BURST
+  # of renames from the same process in a short window is not.
+  #
+  # If a process performs more than `extension_change_threshold` genuine
+  # extension changes within `extension_change_window_seconds`, the rule
+  # activates and its weight (see rule_weights below) is added to that
+  # process's score for as long as the burst continues. The bonus is
+  # removed automatically once the burst subsides (old events fall outside
+  # the window), so it is never double-counted for the same burst.
+  extension_change_threshold: 5
+  extension_change_window_seconds: 10
+
+  # Score contributed by each behavioral rule while active. Rule4 is the
+  # File Extension Change Monitor's burst rule.
+  rule_weights:
+    Rule1_FileBurst: 20
+    Rule2_MultipleDirectories: 30
+    Rule3_YoungProcessBurst: 20
+    Rule4_ExtensionChangeBurst: 35
+
+  # Per-rule enable/disable switches. A disabled rule never contributes to
+  # a process's score, even if its trigger condition holds. Edited from the
+  # "Active Rules" GUI page — changes here are written back automatically.
+  rule_enabled:
+    Rule1_FileBurst: true
+    Rule2_MultipleDirectories: true
+    Rule3_YoungProcessBurst: true
+    Rule4_ExtensionChangeBurst: true
+
+extension_monitor:
+  # Master on/off switch for the File Extension Change Monitor.
+  enabled: true
+
+  # Destination extensions treated as benign churn (autosave/temp files,
+  # partial downloads, editor swap files) and therefore never counted as a
+  # "genuine" extension change, even though the suffix technically differs.
+  ignored_extensions:
+    - tmp
+    - temp
+    - swp
+    - swx
+    - swo
+    - bak
+    - crdownload
+    - part
+    - partial
+    - download

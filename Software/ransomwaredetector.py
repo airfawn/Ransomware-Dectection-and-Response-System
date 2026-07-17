@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QPlainTextEdit,
     QCheckBox,
+    QSpinBox,
     QMessageBox,
     QDialog,
     QStackedWidget,
@@ -57,7 +58,7 @@ from PyQt5.QtWidgets import (
 from monitor.session import MonitorSession
 
 try:
-    from config import get_config
+    from config import get_config, save_rule_settings, save_entropy_rule_settings
     _CONFIG_AVAILABLE = True
 except ImportError:
     _CONFIG_AVAILABLE = False
@@ -80,6 +81,22 @@ except ImportError:
     EntropyMonitor = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
+
+
+# Human-readable descriptions shown on the Active Rules page. Unknown/custom
+# rule names fall back to a generic description rather than crashing.
+_RULE_DESCRIPTIONS: Dict[str, str] = {
+    "Rule1_FileBurst": "Triggers when a process performs more file operations than the configured threshold within 1 second.",
+    "Rule2_MultipleDirectories": "Triggers when a process touches more distinct directories than the configured threshold within 1 second.",
+    "Rule3_YoungProcessBurst": "Triggers when a recently started process (below the age threshold) generates high file activity.",
+    "Rule4_ExtensionChangeBurst": "Triggers on a burst of genuine file-extension changes (e.g. .docx \u2192 .locked) from one process within the configured window \u2014 a strong ransomware signature.",
+    "EntropyIncrease": "Triggers when a monitored file's Shannon entropy increases sharply between scans \u2014 a strong indicator that the file's contents were just encrypted.",
+}
+
+# Special sentinel used for the Entropy row in the Active Rules table, since
+# its weight/enabled flag live in config.entropy (score/enabled) rather than
+# config.detection.rule_weights/rule_enabled.
+_ENTROPY_RULE_NAME = "EntropyIncrease"
 
 
 class OutputBridge(QObject):
@@ -588,11 +605,16 @@ class RdrsGui(QWidget):
 
         # Persistent logs DB handle (available even when entropy module is not).
         self._logs_db = None
+        self._alerts_db = None
         if _DATABASE_AVAILABLE:
             try:
                 self._logs_db = get_logs_db()
             except Exception:
                 self._logs_db = None
+            try:
+                self._alerts_db = get_alerts_db()
+            except Exception:
+                self._alerts_db = None
 
         self.setWindowTitle("RDRS GUI Monitor")
         self.setStyleSheet(
@@ -644,6 +666,11 @@ class RdrsGui(QWidget):
         self.entropy_button.clicked.connect(lambda: self.select_page(3))
         self.entropy_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.entropy_button)
+
+        self.rules_button = QPushButton("▶ Active Rules")
+        self.rules_button.clicked.connect(lambda: self.select_page(4))
+        self.rules_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        sidebar_layout.addWidget(self.rules_button)
 
         sidebar_layout.addSpacing(12)
 
@@ -812,7 +839,7 @@ class RdrsGui(QWidget):
         file_toolbar.addWidget(filter_label)
 
         self.log_filter_combo = QComboBox()
-        self.log_filter_combo.addItems(["All Events", "FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED", "DETECTION", "PROCESS_STATE"])
+        self.log_filter_combo.addItems(["All Events", "FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED", "EXTENSION_CHANGE", "DETECTION", "PROCESS_STATE"])
         self.log_filter_combo.currentIndexChanged.connect(self._refresh_log_table_view)
         self.log_filter_combo.setStyleSheet("background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;")
         file_toolbar.addWidget(self.log_filter_combo)
@@ -827,6 +854,7 @@ class RdrsGui(QWidget):
             ("Modified", "FILE MODIFIED", "#003a9e"),
             ("Moved", "FILE MOVED", "#ff9800"),
             ("Deleted", "FILE DELETED", "#a00000"),
+            ("Ext. Changed", "EXTENSION_CHANGE", "#e91e63"),
         ]:
             counter = QLabel(f"{label_text}: 0")
             counter.setStyleSheet(
@@ -1067,6 +1095,104 @@ class RdrsGui(QWidget):
 
         self.page_stack.addWidget(self.entropy_page)
 
+        # ---- Active Rules page --------------------------------------------
+        self.rules_page = QWidget()
+        rules_layout = QVBoxLayout()
+        rules_layout.setContentsMargins(24, 24, 24, 24)
+        rules_layout.setSpacing(16)
+        self.rules_page.setLayout(rules_layout)
+
+        rules_title = QLabel("Active Rules")
+        rules_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
+        rules_layout.addWidget(rules_title)
+
+        rules_desc = QLabel(
+            "Behavioral detection rules that increase a process's suspicion score. "
+            "Untick a rule to disable it entirely, or edit its score to change how "
+            "much it contributes once triggered. Click a rule to see full details. "
+            "Changes apply immediately and are saved to config.yaml."
+        )
+        rules_desc.setWordWrap(True)
+        rules_desc.setStyleSheet("color: #d1d1d1; font-size: 11pt; margin-bottom: 2px;")
+        rules_layout.addWidget(rules_desc)
+
+        self.rules_save_status_label = QLabel("")
+        self.rules_save_status_label.setStyleSheet("color: #4CAF50; font-size: 10pt;")
+        self.rules_save_status_label.setWordWrap(True)
+        rules_layout.addWidget(self.rules_save_status_label)
+
+        rules_content_split = QSplitter(Qt.Horizontal)
+        rules_content_split.setChildrenCollapsible(False)
+        rules_content_split.setHandleWidth(8)
+
+        self.rules_table = QTableWidget(0, 4)
+        self.rules_table.setHorizontalHeaderLabels([
+            "Rule",
+            "Description",
+            "Enabled",
+            "Score",
+        ])
+        self.rules_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.rules_table.horizontalHeader().setStretchLastSection(True)
+        self.rules_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.rules_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rules_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.rules_table.setAlternatingRowColors(True)
+        self.rules_table.setWordWrap(True)
+        self.rules_table.verticalHeader().setVisible(False)
+        self.rules_table.itemSelectionChanged.connect(self._on_rule_row_selected)
+        rules_content_split.addWidget(self.rules_table)
+
+        self.rule_details_panel = QFrame()
+        self.rule_details_panel.setStyleSheet(
+            "QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }"
+        )
+        rule_details_layout = QVBoxLayout()
+        rule_details_layout.setContentsMargins(18, 18, 18, 18)
+        rule_details_layout.setSpacing(12)
+        self.rule_details_panel.setLayout(rule_details_layout)
+
+        self.rule_details_title = QLabel("Select a rule")
+        self.rule_details_title.setWordWrap(True)
+        self.rule_details_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        rule_details_layout.addWidget(self.rule_details_title)
+
+        self.rule_details_hint = QLabel("Click a rule on the left to see its full description, trigger conditions, and current settings.")
+        self.rule_details_hint.setWordWrap(True)
+        self.rule_details_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        rule_details_layout.addWidget(self.rule_details_hint)
+
+        self.rule_details_labels = {}
+        for title, key in [
+            ("Status", "status"),
+            ("Current Score", "score"),
+            ("Trigger Condition", "trigger"),
+        ]:
+            field_label = QLabel(f"{title}:")
+            field_label.setStyleSheet("color: #9aa4b8; font-size: 10pt; font-weight: bold; margin-top: 6px;")
+            rule_details_layout.addWidget(field_label)
+
+            value_label = QLabel("—")
+            value_label.setWordWrap(True)
+            value_label.setStyleSheet("color: #f0f0f0; font-size: 12pt;")
+            rule_details_layout.addWidget(value_label)
+            self.rule_details_labels[key] = value_label
+
+        rule_details_layout.addStretch()
+
+        rules_content_split.addWidget(self.rule_details_panel)
+        rules_content_split.setSizes([900, 420])
+        rules_layout.addWidget(rules_content_split, 1)
+
+        if not _CONFIG_AVAILABLE:
+            self.rules_save_status_label.setStyleSheet("color: #ff9800; font-size: 10pt;")
+            self.rules_save_status_label.setText(
+                "⚠ Config module not available — rule editing is disabled."
+            )
+            self.rules_table.setEnabled(False)
+
+        self.page_stack.addWidget(self.rules_page)
+
         bottom_bar = QWidget()
         bottom_layout = QHBoxLayout()
         bottom_layout.setContentsMargins(18, 12, 18, 12)
@@ -1115,6 +1241,7 @@ class RdrsGui(QWidget):
         self.setLayout(main_layout)
         self._apply_readability_to_tables()
         self._set_initial_column_widths()
+        self._populate_rules_table()
         self.select_page(0)
 
         self.select_page(0)
@@ -1127,6 +1254,7 @@ class RdrsGui(QWidget):
             self.active_process_table,
             self.inactive_process_table,
             self.entropy_table,
+            self.rules_table,
         ]
         for table in tables:
             table.setFont(QFont("Segoe UI", 11))
@@ -1140,6 +1268,17 @@ class RdrsGui(QWidget):
                 "QTableWidget::item:selected:!active { background: #27364d; color: #dfe7f2; }"
                 "QHeaderView::section { background: #242b3a; color: white; font-size: 13pt; font-weight: bold; padding: 8px; border: none; }"
             )
+
+        # The Active Rules table hosts wrapped descriptions plus embedded
+        # checkboxes/spin boxes, so it needs noticeably more vertical
+        # breathing room than the plain-text tables above (avoids the
+        # cramped look of a fixed 34px row).
+        self.rules_table.verticalHeader().setDefaultSectionSize(72)
+        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.rules_table.horizontalHeader().setStretchLastSection(False)
 
     def _set_initial_column_widths(self) -> None:
         """Set non-uniform default column widths for readability."""
@@ -1173,6 +1312,10 @@ class RdrsGui(QWidget):
             table.setColumnWidth(5, 130)
             table.setColumnWidth(6, 190)
 
+        self.rules_table.setColumnWidth(0, 240)
+        self.rules_table.setColumnWidth(2, 90)
+        self.rules_table.setColumnWidth(3, 100)
+
     def _resize_entropy_columns(self) -> None:
         """Keep File Name at ~45% while sizing other columns to content."""
         available = max(400, self.entropy_table.viewport().width())
@@ -1205,11 +1348,13 @@ class RdrsGui(QWidget):
         self.monitoring_button.setStyleSheet(_inactive)
         self.processes_button.setStyleSheet(_inactive)
         self.entropy_button.setStyleSheet(_inactive)
+        self.rules_button.setStyleSheet(_inactive)
 
         self.home_button.setText("▶ Home")
         self.monitoring_button.setText("▶ File Monitoring")
         self.processes_button.setText("▶ Processes")
         self.entropy_button.setText("▶ Entropy Monitor")
+        self.rules_button.setText("▶ Active Rules")
 
         if index == 0:
             self.home_button.setText("▼ Home")
@@ -1224,6 +1369,208 @@ class RdrsGui(QWidget):
             self.entropy_button.setText("▼ Entropy Monitor")
             self.entropy_button.setStyleSheet(_active)
             self._refresh_entropy_table()
+        elif index == 4:
+            self.rules_button.setText("▼ Active Rules")
+            self.rules_button.setStyleSheet(_active)
+
+    def _populate_rules_table(self) -> None:
+        """Populate the Active Rules table from the current configuration.
+
+        Each row represents one scoring rule (e.g. Rule1_FileBurst) with a
+        checkbox (DetectionConfig.rule_enabled) and an editable score spin
+        box (DetectionConfig.rule_weights). Edits are persisted immediately
+        via config.save_rule_settings(), which updates both the live config
+        and config.yaml on disk.
+        """
+        if not _CONFIG_AVAILABLE:
+            return
+
+        # Guard flag: suppresses save-on-change while widgets are being
+        # populated programmatically (setChecked/setValue would otherwise
+        # fire the same signals as a real user edit).
+        self._rules_table_loading = True
+        try:
+            cfg = get_config().detection
+            ecfg = get_config().entropy
+            # Entropy is appended last: its weight/enabled flag live in
+            # config.entropy rather than config.detection.rule_weights, but
+            # it is displayed and edited identically to the other rules.
+            rule_names = list(cfg.rule_weights.keys()) + [_ENTROPY_RULE_NAME]
+            self.rules_table.setRowCount(len(rule_names))
+
+            for row, rule_name in enumerate(rule_names):
+                name_item = QTableWidgetItem(rule_name)
+                name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+                self.rules_table.setItem(row, 0, name_item)
+
+                description = _RULE_DESCRIPTIONS.get(rule_name, "Custom detection rule.")
+                desc_item = QTableWidgetItem(description)
+                desc_item.setFlags(desc_item.flags() & ~Qt.ItemIsEditable)
+                desc_item.setToolTip(description)
+                self.rules_table.setItem(row, 1, desc_item)
+
+                if rule_name == _ENTROPY_RULE_NAME:
+                    row_enabled = bool(ecfg.enabled)
+                    row_score = int(ecfg.score)
+                else:
+                    row_enabled = bool(cfg.rule_enabled.get(rule_name, True))
+                    row_score = int(cfg.rule_weights.get(rule_name, 0))
+
+                checkbox = QCheckBox()
+                checkbox.setChecked(row_enabled)
+                checkbox.stateChanged.connect(
+                    lambda state, rn=rule_name: self._on_rule_enabled_changed(rn, state)
+                )
+                checkbox_container = QWidget()
+                checkbox_layout = QHBoxLayout()
+                checkbox_layout.setContentsMargins(0, 0, 0, 0)
+                checkbox_layout.setAlignment(Qt.AlignCenter)
+                checkbox_layout.addWidget(checkbox)
+                checkbox_container.setLayout(checkbox_layout)
+                self.rules_table.setCellWidget(row, 2, checkbox_container)
+
+                spin = QSpinBox()
+                spin.setRange(0, 1000)
+                spin.setValue(row_score)
+                spin.setStyleSheet(
+                    "background: #222938; color: white; border: 1px solid #2f3a59; "
+                    "padding: 4px 6px; border-radius: 4px; min-height: 26px;"
+                )
+                spin.valueChanged.connect(
+                    lambda value, rn=rule_name: self._on_rule_score_changed(rn, value)
+                )
+                self.rules_table.setCellWidget(row, 3, spin)
+        finally:
+            self._rules_table_loading = False
+
+        if self.rules_table.rowCount() > 0:
+            self.rules_table.selectRow(0)
+
+    def _format_rule_trigger_info(self, rule_name: str) -> str:
+        """Return a human-readable trigger-condition string using live config values."""
+        if not _CONFIG_AVAILABLE:
+            return "Unavailable — config module not loaded."
+
+        if rule_name == _ENTROPY_RULE_NAME:
+            ecfg = get_config().entropy
+            sample_mb = ecfg.sample_size_bytes // (1024 * 1024)
+            return (
+                f"A monitored file's Shannon entropy increases by more than {ecfg.threshold:.2f} "
+                f"bits/byte between two scans (sampling the first {sample_mb} MB of each file)."
+            )
+
+        dcfg = get_config().detection
+        if rule_name == "Rule1_FileBurst":
+            return f"The same process performs more than {dcfg.high_ops_threshold} file operations within 1 second."
+        if rule_name == "Rule2_MultipleDirectories":
+            return f"The same process touches more than {dcfg.multi_dir_threshold} distinct directories within 1 second."
+        if rule_name == "Rule3_YoungProcessBurst":
+            return (
+                f"A process younger than {dcfg.young_process_age_threshold:.0f}s performs more than "
+                f"{dcfg.young_process_ops_threshold} operations within 1 second."
+            )
+        if rule_name == "Rule4_ExtensionChangeBurst":
+            return (
+                f"{dcfg.extension_change_threshold}+ genuine file-extension changes "
+                f"(e.g. .docx \u2192 .locked) by the same process within "
+                f"{dcfg.extension_change_window_seconds:.0f} seconds."
+            )
+        return "Custom trigger condition."
+
+    def _on_rule_row_selected(self) -> None:
+        """Expand the selected rule into the details panel on the right.
+
+        Shows the full description, current enabled/score state, and the
+        precise trigger condition (formatted with live config values) so
+        users can understand exactly when a rule fires without leaving
+        the page.
+        """
+        selection_model = self.rules_table.selectionModel()
+        selected_rows = selection_model.selectedRows() if selection_model else []
+        if not selected_rows:
+            return
+
+        name_item = self.rules_table.item(selected_rows[0].row(), 0)
+        if name_item is None:
+            return
+        rule_name = name_item.text()
+
+        self.rule_details_title.setText(rule_name.replace("_", " "))
+        self.rule_details_hint.setText(_RULE_DESCRIPTIONS.get(rule_name, "Custom detection rule."))
+
+        if not _CONFIG_AVAILABLE:
+            return
+
+        if rule_name == _ENTROPY_RULE_NAME:
+            enabled = bool(get_config().entropy.enabled)
+            score = int(get_config().entropy.score)
+        else:
+            dcfg = get_config().detection
+            enabled = bool(dcfg.rule_enabled.get(rule_name, True))
+            score = int(dcfg.rule_weights.get(rule_name, 0))
+
+        status_label = self.rule_details_labels["status"]
+        status_label.setText("✅ Enabled" if enabled else "🚫 Disabled")
+        status_label.setStyleSheet(
+            f"font-size: 12pt; font-weight: bold; color: {'#4CAF50' if enabled else '#f44336'};"
+        )
+        self.rule_details_labels["score"].setText(f"+{score} points while active")
+        self.rule_details_labels["trigger"].setText(self._format_rule_trigger_info(rule_name))
+
+    def _on_rule_enabled_changed(self, rule_name: str, state: int) -> None:
+        """Handle a user tick/untick of a rule's Enabled checkbox."""
+        if getattr(self, "_rules_table_loading", False):
+            return
+        self._persist_rule_setting(rule_name, enabled=(state == Qt.Checked))
+
+    def _on_rule_score_changed(self, rule_name: str, value: int) -> None:
+        """Handle a user edit of a rule's Score spin box."""
+        if getattr(self, "_rules_table_loading", False):
+            return
+        self._persist_rule_setting(rule_name, weight=value)
+
+    def _persist_rule_setting(
+        self,
+        rule_name: str,
+        *,
+        weight: Optional[int] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        """Persist a single rule's weight/enabled change to config.yaml.
+
+        Updates take effect immediately in the running detection engines
+        (they read rule_weights/rule_enabled, or entropy.score/enabled, live
+        from the shared config object) and are written to config.yaml so
+        they survive a restart. The Entropy row is routed to
+        save_entropy_rule_settings() since its tunables live in a different
+        config section than the other rules.
+        """
+        if not _CONFIG_AVAILABLE:
+            return
+
+        try:
+            if rule_name == _ENTROPY_RULE_NAME:
+                persisted = save_entropy_rule_settings(score=weight, enabled=enabled)
+            else:
+                weight_update = {rule_name: weight} if weight is not None else {}
+                enabled_update = {rule_name: enabled} if enabled is not None else {}
+                persisted = save_rule_settings(weight_update, enabled_update)
+        except Exception as exc:
+            self.rules_save_status_label.setStyleSheet("color: #f44336; font-size: 10pt;")
+            self.rules_save_status_label.setText(f"Failed to save {rule_name}: {exc}")
+            return
+
+        if persisted:
+            self.rules_save_status_label.setStyleSheet("color: #4CAF50; font-size: 10pt;")
+            self.rules_save_status_label.setText(f"Saved — {rule_name} updated in config.yaml.")
+        else:
+            self.rules_save_status_label.setStyleSheet("color: #ff9800; font-size: 10pt;")
+            self.rules_save_status_label.setText(
+                f"{rule_name} updated for this session, but config.yaml could not be written."
+            )
+
+        # Refresh the details panel in case the edited row is the one on display.
+        self._on_rule_row_selected()
 
     def start_monitor(self):
         if self.monitor_session is not None and self.monitor_session.is_running:
@@ -1441,6 +1788,9 @@ class RdrsGui(QWidget):
             self._update_process_state_table(entry)
             return
 
+        if entry.get("event_type") == "EXTENSION_CHANGE":
+            self._persist_extension_change(entry)
+
         self.event_rows.append(entry)
 
         self.event_count += 1
@@ -1454,6 +1804,35 @@ class RdrsGui(QWidget):
         self._update_suspicious_process_table(entry)
         self._update_process_state_table(entry)
         self._refresh_dashboard_metrics()
+
+    def _persist_extension_change(self, entry: dict) -> None:
+        """Persist a confirmed file-extension-change event to logs.db.
+
+        The logs.db schema has no dedicated extension columns, so the
+        transition is encoded into ``file_name`` (e.g. "report.docx
+        (.docx -> .locked)") to avoid a breaking schema migration while
+        still preserving the detail for later inspection.
+        """
+        if self._logs_db is None:
+            return
+        file_path = entry.get("file") or entry.get("previous_path") or ""
+        original_ext = entry.get("original_extension") or "?"
+        new_ext = entry.get("new_extension") or "?"
+        base_name = Path(file_path).name if file_path else "?"
+        pid_value = entry.get("pid")
+        pid = int(pid_value) if str(pid_value or "").isdigit() else None
+        try:
+            self._logs_db.log_event(
+                event_type="FILE EXTENSION CHANGED",
+                file_path=file_path,
+                file_name=f"{base_name} (.{original_ext} -> .{new_ext})",
+                process=entry.get("process") or None,
+                pid=pid,
+                executable=entry.get("executable") or None,
+                parent=entry.get("parent_process") or None,
+            )
+        except Exception:
+            logger.exception("Failed to persist extension-change event to logs.db")
 
     def _load_persisted_logs(self, limit: int = 300) -> None:
         """Load recent persisted logs from logs.db into the File Monitoring page."""
@@ -1663,8 +2042,11 @@ class RdrsGui(QWidget):
         if body:
             is_detection_body = body.startswith("[Detection]") or "[Detection]" in body
             is_process_state = body.startswith("[ProcessState]") or "[ProcessState]" in body
+            is_extension_change = body.startswith("[ExtensionChange]") or "[ExtensionChange]" in body
             if is_process_state:
                 self._parse_process_state_block(body, log_record)
+            elif is_extension_change:
+                self._parse_extension_change_block(body, log_record)
             elif is_detection_body:
                 self._parse_detection_block(body, log_record)
             else:
@@ -1688,6 +2070,8 @@ class RdrsGui(QWidget):
                     log_record["event_type"] = "DETECTION"
                 elif is_process_state:
                     log_record["event_type"] = "PROCESS_STATE"
+                elif is_extension_change:
+                    log_record["event_type"] = "EXTENSION_CHANGE"
 
         return log_record
 
@@ -1758,6 +2142,50 @@ class RdrsGui(QWidget):
                     record["message"] += f"\n{line}"
                 current_key = None
 
+    def _parse_extension_change_block(self, body: str, record: dict) -> None:
+        """Parse a [ExtensionChange] block emitted by ProcessBehaviorTracker.
+
+        Populates ``record`` with the fields the File Extension Monitor
+        deliverable requires: timestamp, original/new path, original/new
+        extension, process name and PID (see
+        monitor.filesystem_monitor.ProcessBehaviorTracker._log_extension_change).
+        """
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        current_key = None
+        for line in lines:
+            if line.startswith("[ExtensionChange]"):
+                record["event_type"] = "EXTENSION_CHANGE"
+                continue
+            if line.endswith(":"):
+                current_key = line[:-1].lower().replace(" ", "_")
+                continue
+            if current_key and line:
+                if current_key == "process":
+                    record["process"] = line
+                elif current_key == "pid":
+                    record["pid"] = line
+                elif current_key == "executable":
+                    record["executable"] = line
+                elif current_key == "original_path":
+                    record["previous_path"] = line
+                elif current_key == "new_path":
+                    record["file"] = line
+                    record["file_name"] = Path(line).name
+                elif current_key == "original_extension":
+                    record["original_extension"] = line
+                elif current_key == "new_extension":
+                    record["new_extension"] = line
+                elif current_key == "timestamp":
+                    record["timestamp"] = line
+                else:
+                    record["message"] += f"\n{line}"
+                current_key = None
+
+        original_ext = record.get("original_extension", "")
+        new_ext = record.get("new_extension", "")
+        if original_ext or new_ext:
+            record["message"] = f".{original_ext or '?'}  →  .{new_ext or '?'}"
+
     def _parse_process_state_block(self, body: str, record: dict) -> None:
         lines = [line.rstrip() for line in body.splitlines()]
         current_key = None
@@ -1820,6 +2248,10 @@ class RdrsGui(QWidget):
             score = int(entry.get("score", "0"))
         except ValueError:
             score = 0
+
+        if "Extension Change Detection rule" in (entry.get("reason") or ""):
+            self._log_extension_change_alert(entry, score)
+
         if score < 50:
             return
 
@@ -1855,6 +2287,32 @@ class RdrsGui(QWidget):
                 f"⚠  {process}  has reached a threat score of {score}."
             )
         self._refresh_dashboard_metrics()
+
+    def _log_extension_change_alert(self, entry: dict, score: int) -> None:
+        """Persist a mass-extension-change burst alert to alerts.db.
+
+        Called exactly once per detection window: ``_apply_rules`` in
+        ProcessBehaviorTracker only emits a [Detection] block the moment
+        Rule4_ExtensionChangeBurst *newly* activates, so this never
+        double-writes for the same burst (see detection_engine.ExtensionChangeEngine
+        and monitor.filesystem_monitor.ProcessBehaviorTracker._apply_rules).
+        """
+        if self._alerts_db is None:
+            return
+        pid_value = entry.get("pid")
+        pid = int(pid_value) if str(pid_value or "").isdigit() else None
+        try:
+            self._alerts_db.log_alert(
+                alert_type="EXTENSION_CHANGE_BURST",
+                process_name=entry.get("process") or None,
+                pid=pid,
+                executable=entry.get("executable") or None,
+                process_score=score,
+                triggered_rules=["Rule4_ExtensionChangeBurst"],
+                notes=entry.get("reason"),
+            )
+        except Exception:
+            logger.exception("Failed to persist extension-change burst alert to alerts.db")
 
     def _update_process_state_table(self, entry: dict) -> None:
         if entry.get("event_type") != "PROCESS_STATE":
@@ -1991,6 +2449,7 @@ class RdrsGui(QWidget):
             "FILE MODIFIED": 0,
             "FILE MOVED": 0,
             "FILE DELETED": 0,
+            "EXTENSION_CHANGE": 0,
         }
         for row in self.event_rows:
             event_type = (row.get("event_type") or "").upper()
@@ -2001,6 +2460,7 @@ class RdrsGui(QWidget):
         self.file_event_counter_labels["FILE MODIFIED"].setText(f"Modified: {counts['FILE MODIFIED']}")
         self.file_event_counter_labels["FILE MOVED"].setText(f"Moved: {counts['FILE MOVED']}")
         self.file_event_counter_labels["FILE DELETED"].setText(f"Deleted: {counts['FILE DELETED']}")
+        self.file_event_counter_labels["EXTENSION_CHANGE"].setText(f"Ext. Changed: {counts['EXTENSION_CHANGE']}")
 
     def _process_is_active(self, last_activity: str) -> bool:
         if not last_activity:
@@ -2020,6 +2480,8 @@ class RdrsGui(QWidget):
             return QColor("#a00000")
         if "MODIF" in event_type or "MODIFIED" in event_type or "MODIFY" in event_type:
             return QColor("#003a9e")
+        if "EXTENSION" in event_type:
+            return QColor("#e91e63")
         return None
 
     def _update_runtime_display(self):
