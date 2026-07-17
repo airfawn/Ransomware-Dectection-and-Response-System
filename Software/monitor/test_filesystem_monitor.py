@@ -1,6 +1,7 @@
 import time
 import unittest
 
+from config import get_config
 from monitor.filesystem_monitor import ProcessBehaviorTracker, ProcessMetadata
 
 
@@ -61,7 +62,9 @@ class FileSystemMonitorScoringTest(unittest.TestCase):
         for i in range(11):
             record = self.tracker.record_event("FILE CREATED", f"/tmp/young/file{i}.txt", young_meta)
 
-        self.assertEqual(record.score, 30)
+        weights = get_config().detection.rule_weights
+        expected_score = weights["Rule1_FileBurst"] + weights["Rule3_YoungProcessBurst"]
+        self.assertEqual(record.score, expected_score)
         self.assertIn("Rule3_YoungProcessBurst", record.active_rules)
         self.assertIn("Rule1_FileBurst", record.active_rules)
         self.assertEqual(record.classification, "Suspicious")

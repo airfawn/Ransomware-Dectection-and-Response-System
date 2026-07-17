@@ -29,8 +29,8 @@ class _DummyTracker:
     def __init__(self):
         self.events = []
 
-    def record_event(self, event_type, src_path, process_metadata):
-        self.events.append((event_type, src_path, process_metadata))
+    def record_event(self, event_type, src_path, process_metadata, previous_path=None):
+        self.events.append((event_type, src_path, process_metadata, previous_path))
         return None
 
 
@@ -69,6 +69,7 @@ class WindowsPipelineValidationTest(unittest.TestCase):
         self.assertEqual([item[0] for item in captured], ["FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED"])
         self.assertEqual(captured[-1][-1], r"C:\temp\old.txt")
         self.assertEqual(len(tracker.events), 4)
+        self.assertEqual(tracker.events[-1][-1], r"C:\temp\old.txt")
 
     def test_process_resolver_reuses_directory_and_previous_path_cache(self):
         resolver = ProcessResolver()

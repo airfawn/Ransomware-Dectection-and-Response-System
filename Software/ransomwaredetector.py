@@ -17,6 +17,9 @@ import re
 import sys
 import time
 import logging
+import threading
+import shutil
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
@@ -26,7 +29,7 @@ try:
 except ImportError:
     psutil = None
 
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QThread
 from PyQt5.QtGui import QColor, QFont, QBrush
 from PyQt5.QtWidgets import (
     QApplication,
@@ -45,6 +48,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QMessageBox,
     QDialog,
+    QFileDialog,
     QStackedWidget,
     QSplitter,
     QComboBox,
@@ -56,9 +60,17 @@ from PyQt5.QtWidgets import (
 )
 
 from monitor.session import MonitorSession
+from entropy_loader import EntropyBuildWorker
+from splash_screen import EntropyRebuildDialog
+from utils.paths import get_data_dir
 
 try:
-    from config import get_config, save_rule_settings, save_entropy_rule_settings
+    from config import (
+        get_config,
+        save_rule_settings,
+        save_entropy_rule_settings,
+        save_startup_directories,
+    )
     _CONFIG_AVAILABLE = True
 except ImportError:
     _CONFIG_AVAILABLE = False
@@ -81,6 +93,24 @@ except ImportError:
     EntropyMonitor = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_export_name(value: str, fallback: str = "event") -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._")
+    return sanitized or fallback
+
+
+def _export_json_payload(parent: QWidget, payload: dict, suggested_name: str, title: str) -> Optional[Path]:
+    default_path = str(Path.home() / suggested_name)
+    target, _ = QFileDialog.getSaveFileName(parent, title, default_path, "JSON Files (*.json)")
+    if not target:
+        return None
+    target_path = Path(target)
+    if target_path.suffix.lower() != ".json":
+        target_path = target_path.with_suffix(".json")
+    with target_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
+    return target_path
 
 
 # Human-readable descriptions shown on the Active Rules page. Unknown/custom
@@ -153,6 +183,7 @@ class EventDetailsDialog(QDialog):
         text_edit.setReadOnly(True)
         text_edit.setFont(QFont("Courier", 11))
         text_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._entry = dict(entry)
 
         raw_event = entry.get("raw_event", "")
         if raw_event:
@@ -167,10 +198,36 @@ class EventDetailsDialog(QDialog):
 
         layout.addWidget(text_edit)
 
+        actions_layout = QHBoxLayout()
+        export_btn = QPushButton("Export JSON")
+        export_btn.clicked.connect(self._export_json)
+        actions_layout.addWidget(export_btn)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn)
+        actions_layout.addWidget(close_btn)
+        layout.addLayout(actions_layout)
         self.setLayout(layout)
+
+    def _export_json(self) -> None:
+        payload = {
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "event": self._entry,
+        }
+        event_type = _safe_export_name(self._entry.get("event_type", "event"), "event")
+        timestamp = _safe_export_name(self._entry.get("timestamp", ""), "time")
+        try:
+            exported_path = _export_json_payload(
+                self,
+                payload,
+                f"rdrs_{event_type.lower()}_{timestamp}.json",
+                "Export Event As JSON",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Failed", f"Could not export JSON: {exc}")
+            return
+        if exported_path is not None:
+            QMessageBox.information(self, "Export Complete", f"Saved JSON report to:\n{exported_path}")
 
 
 class ProcessDetailsDialog(QDialog):
@@ -574,6 +631,10 @@ class RdrsGui(QWidget):
         self.event_rows: List[dict] = []
         self._displayed_event_rows: List[dict] = []
         self.suspicious_process_rows: Dict[Tuple[Optional[str], str], int] = {}
+        self.suspicious_process_entries: Dict[Tuple[Optional[str], str], dict] = {}
+        self._last_alert_process_key: Optional[Tuple[Optional[str], str]] = None
+        self._selected_home_process_key: Optional[Tuple[Optional[str], str]] = None
+        self.response_action_rows: List[dict] = []
         self.active_process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.inactive_process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.process_state_cache: Dict[Tuple[Optional[str], str], dict] = {}
@@ -595,6 +656,10 @@ class RdrsGui(QWidget):
 
         # --- Entropy monitor (created lazily when monitor starts) ----------
         self._entropy_monitor: Optional[object] = None  # EntropyMonitor | None
+        self._entropy_rebuild_dialog: Optional[QDialog] = None
+        self._entropy_rebuild_thread: Optional[QThread] = None
+        self._entropy_rebuild_worker: Optional[EntropyBuildWorker] = None
+        self._last_applied_entropy_root: Optional[str] = None
 
         # --- Alert banner state -------------------------------------------
         self._alert_banner_visible: bool = False
@@ -626,7 +691,12 @@ class RdrsGui(QWidget):
             "QTableWidget::item { padding: 8px; }"
         )
         self.build_ui()
+        if hasattr(self, "entropy_dir_input"):
+            self._last_applied_entropy_root = str(
+                Path(self.entropy_dir_input.text().strip() or Path.home()).expanduser().resolve()
+            )
         self._load_persisted_logs(limit=300)
+        self._load_persisted_response_actions(limit=200)
 
     def build_ui(self):
         main_layout = QHBoxLayout()
@@ -772,13 +842,23 @@ class RdrsGui(QWidget):
         alert_banner_layout.addWidget(btn_ignore)
 
         btn_quarantine = QPushButton("Quarantine")
-        btn_quarantine.setStyleSheet(_stub_style)
-        btn_quarantine.setToolTip("Not yet implemented in v1.0")
+        btn_quarantine.setStyleSheet(
+            "QPushButton { background: #b36b00; color: white; font-weight: bold; "
+            "padding: 6px 14px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background: #cc7a00; }"
+        )
+        btn_quarantine.setToolTip("Terminate the detected process and move its executable to quarantine.")
+        btn_quarantine.clicked.connect(self._on_quarantine_alert_process)
         alert_banner_layout.addWidget(btn_quarantine)
 
         btn_delete = QPushButton("Delete")
-        btn_delete.setStyleSheet(_stub_style)
-        btn_delete.setToolTip("Not yet implemented in v1.0")
+        btn_delete.setStyleSheet(
+            "QPushButton { background: #a00000; color: white; font-weight: bold; "
+            "padding: 6px 14px; border-radius: 5px; border: none; }"
+            "QPushButton:hover { background: #c00000; }"
+        )
+        btn_delete.setToolTip("Terminate the detected process and delete its executable from disk.")
+        btn_delete.clicked.connect(self._on_delete_alert_process)
         alert_banner_layout.addWidget(btn_delete)
 
         btn_more = QPushButton("More Information")
@@ -808,7 +888,92 @@ class RdrsGui(QWidget):
         self.home_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.home_table.setSelectionMode(QTableWidget.SingleSelection)
         self.home_table.setAlternatingRowColors(True)
+        self.home_table.itemSelectionChanged.connect(self._on_home_selection_changed)
         home_layout.addWidget(self.home_table)
+
+        self.home_incident_panel = QFrame()
+        self.home_incident_panel.setStyleSheet(
+            "QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }"
+        )
+        incident_layout = QVBoxLayout()
+        incident_layout.setContentsMargins(14, 14, 14, 14)
+        incident_layout.setSpacing(10)
+        self.home_incident_panel.setLayout(incident_layout)
+
+        incident_header = QHBoxLayout()
+        incident_title = QLabel("Selected Incident")
+        incident_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        incident_header.addWidget(incident_title)
+        incident_header.addStretch()
+
+        self.home_export_button = QPushButton("Export JSON")
+        self.home_export_button.setStyleSheet("background: #2f3a59; color: #ffffff; font-weight: bold; padding: 8px 12px;")
+        self.home_export_button.clicked.connect(self._export_selected_home_incident_json)
+        self.home_export_button.setEnabled(False)
+        incident_header.addWidget(self.home_export_button)
+        incident_layout.addLayout(incident_header)
+
+        self.home_incident_hint = QLabel(
+            "Select a suspicious process above to see a readable incident summary, the reason it was flagged, and the containment result."
+        )
+        self.home_incident_hint.setWordWrap(True)
+        self.home_incident_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        incident_layout.addWidget(self.home_incident_hint)
+
+        self.home_incident_labels = {}
+        incident_columns = QHBoxLayout()
+        incident_columns.setSpacing(18)
+        left_column = QVBoxLayout()
+        left_column.setSpacing(8)
+        right_column = QVBoxLayout()
+        right_column.setSpacing(8)
+        for title, key, target_column in [
+            ("Severity", "severity", left_column),
+            ("Suspected Process", "process", left_column),
+            ("PID", "pid", left_column),
+            ("Executable", "executable", left_column),
+            ("Threat Score", "score", left_column),
+            ("Why Flagged", "reason", right_column),
+            ("First Seen", "first_seen", right_column),
+            ("Last Seen", "last_seen", right_column),
+            ("Current Status", "status", right_column),
+            ("Response Taken", "response", right_column),
+        ]:
+            label = QLabel(f"{title}: —")
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
+            target_column.addWidget(label)
+            self.home_incident_labels[key] = label
+        incident_columns.addLayout(left_column, 1)
+        incident_columns.addLayout(right_column, 1)
+        incident_layout.addLayout(incident_columns)
+
+        containment_title = QLabel("Containment Results")
+        containment_title.setStyleSheet("font-size: 13pt; font-weight: bold; color: #ffffff; margin-top: 4px;")
+        incident_layout.addWidget(containment_title)
+
+        self.home_response_hint = QLabel("No quarantine or delete attempts recorded for this incident yet.")
+        self.home_response_hint.setWordWrap(True)
+        self.home_response_hint.setStyleSheet("color: #d1d1d1; font-size: 10.5pt;")
+        incident_layout.addWidget(self.home_response_hint)
+
+        self.home_response_table = QTableWidget(0, 5)
+        self.home_response_table.setHorizontalHeaderLabels([
+            "Time",
+            "Action",
+            "File",
+            "Status",
+            "Result",
+        ])
+        self.home_response_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.home_response_table.horizontalHeader().setStretchLastSection(False)
+        self.home_response_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.home_response_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.home_response_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.home_response_table.setAlternatingRowColors(True)
+        incident_layout.addWidget(self.home_response_table)
+
+        home_layout.addWidget(self.home_incident_panel)
         self.page_stack.addWidget(self.home_page)
 
         self.file_monitoring_page = QWidget()
@@ -1009,7 +1174,8 @@ class RdrsGui(QWidget):
         self.entropy_dir_input.setStyleSheet(
             "background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;"
         )
-        self.entropy_dir_input.setPlaceholderText("Filter by directory prefix…")
+        self.entropy_dir_input.setPlaceholderText("Entropy monitoring directory…")
+        self.entropy_dir_input.editingFinished.connect(self._on_set_entropy_directory_clicked)
         entropy_toolbar.addWidget(self.entropy_dir_input, 1)
 
         btn_refresh_entropy = QPushButton("↻ Refresh")
@@ -1018,6 +1184,13 @@ class RdrsGui(QWidget):
             "background: #2f3a59; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;"
         )
         entropy_toolbar.addWidget(btn_refresh_entropy)
+
+        btn_apply_entropy_dir = QPushButton("Apply Entropy Directory")
+        btn_apply_entropy_dir.clicked.connect(self._on_set_entropy_directory_clicked)
+        btn_apply_entropy_dir.setStyleSheet(
+            "background: #345f2f; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;"
+        )
+        entropy_toolbar.addWidget(btn_apply_entropy_dir)
 
         entropy_layout.addLayout(entropy_toolbar)
 
@@ -1291,6 +1464,11 @@ class RdrsGui(QWidget):
         self.home_table.setColumnWidth(6, 110)
         self.home_table.setColumnWidth(7, 170)
         self.home_table.setColumnWidth(8, 180)
+        self.home_response_table.setColumnWidth(0, 170)
+        self.home_response_table.setColumnWidth(1, 120)
+        self.home_response_table.setColumnWidth(2, 320)
+        self.home_response_table.setColumnWidth(3, 120)
+        self.home_response_table.setColumnWidth(4, 440)
 
         self.log_table.setColumnWidth(0, 180)
         self.log_table.setColumnWidth(1, 90)
@@ -1582,12 +1760,12 @@ class RdrsGui(QWidget):
             self.handle_error(f"Monitor path does not exist: {monitor_path}")
             return
 
-        # Keep the Entropy Monitor page aligned with the active monitored
-        # directory so its table queries the same tree the file monitor is
-        # watching. Without this, the entropy table can stay empty even though
-        # metadata.db contains rows for the active directory.
-        if hasattr(self, "entropy_dir_input"):
-            self.entropy_dir_input.setText(str(monitor_path))
+        entropy_dir_text = self.entropy_dir_input.text().strip() if hasattr(self, "entropy_dir_input") else ""
+        entropy_root = Path(entropy_dir_text).expanduser() if entropy_dir_text else monitor_path
+        if not entropy_root.exists() or not entropy_root.is_dir():
+            entropy_root = monitor_path
+            if hasattr(self, "entropy_dir_input"):
+                self.entropy_dir_input.setText(str(entropy_root))
 
         self._pending_log_lines.clear()
         self.append_raw_line(f"Starting monitor for: {monitor_path}")
@@ -1609,30 +1787,36 @@ class RdrsGui(QWidget):
                 threshold   = ent_cfg.threshold if ent_cfg else 1.4
                 retention   = db_cfg.metadata_retention_days if db_cfg else 30
 
-                self._entropy_monitor = EntropyMonitor(
-                    metadata_db=meta_db,
-                    logs_db=logs_db,
-                    alerts_db=alerts_db,
-                    allowed_extensions=allowed_ext,
-                    monitored_roots=[monitor_path],
-                    sample_size_bytes=sample_size,
-                    threshold=threshold,
-                    on_entropy_alert=self._entropy_alert_callback,
-                    retention_days=retention,
-                )
-                self._entropy_monitor.start()
-                logger.info(
-                    "[ENTROPY_TRACE][GUI] entropy_monitor_started threshold=%.3f sample_size=%s extensions=%s",
-                    threshold,
-                    sample_size,
-                    sorted(list(allowed_ext))[:20],
-                )
-                self.entropy_status_label.setText(
-                    f"Entropy module active  |  threshold: {threshold:.2f} bits  |  "
-                    f"watching {len(allowed_ext)} extension(s)"
-                )
-                self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
-                self._entropy_refresh_timer.start()
+                entropy_enabled = bool(ent_cfg.enabled) if ent_cfg else True
+                if entropy_enabled:
+                    self._entropy_monitor = EntropyMonitor(
+                        metadata_db=meta_db,
+                        logs_db=logs_db,
+                        alerts_db=alerts_db,
+                        allowed_extensions=allowed_ext,
+                        monitored_roots=[entropy_root],
+                        sample_size_bytes=sample_size,
+                        threshold=threshold,
+                        on_entropy_alert=self._entropy_alert_callback,
+                        retention_days=retention,
+                        persist_events_to_logs=False,
+                    )
+                    self._entropy_monitor.start()
+                    logger.info(
+                        "[ENTROPY_TRACE][GUI] entropy_monitor_started threshold=%.3f sample_size=%s extensions=%s",
+                        threshold,
+                        sample_size,
+                        sorted(list(allowed_ext))[:20],
+                    )
+                    self.entropy_status_label.setText(
+                        f"Entropy module active  |  threshold: {threshold:.2f} bits  |  "
+                        f"watching {len(allowed_ext)} extension(s)"
+                    )
+                    self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+                    self._entropy_refresh_timer.start()
+                else:
+                    self.entropy_status_label.setText("Entropy rule disabled from Active Rules. Module not started.")
+                    self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
             except Exception as exc:
                 logger.exception("[ENTROPY_TRACE][GUI] entropy_monitor_start_failed: %s", exc)
                 self.entropy_status_label.setText(f"Entropy module failed to start: {exc}")
@@ -1734,6 +1918,151 @@ class RdrsGui(QWidget):
                 event_type,
                 file_path,
             )
+
+    def _on_set_entropy_directory_clicked(self) -> None:
+        """Rebuild entropy database asynchronously when entropy root changes."""
+        if not _CONFIG_AVAILABLE:
+            self.show_error("Config module unavailable; cannot update entropy directory.")
+            return
+        if not _DATABASE_AVAILABLE:
+            self.show_error("Database module unavailable; cannot rebuild entropy database.")
+            return
+
+        entropy_dir_text = self.entropy_dir_input.text().strip()
+        if not entropy_dir_text:
+            self.show_error("Please enter an entropy monitoring directory.")
+            return
+
+        entropy_root = Path(entropy_dir_text).expanduser()
+        if not entropy_root.exists() or not entropy_root.is_dir():
+            self.show_error(f"Invalid entropy directory: {entropy_root}")
+            return
+
+        try:
+            normalized_entropy_root = str(entropy_root.resolve())
+        except Exception:
+            normalized_entropy_root = str(entropy_root)
+
+        # Ignore no-op apply events (e.g., editingFinished focus changes).
+        if self._last_applied_entropy_root == normalized_entropy_root:
+            return
+
+        if self._entropy_rebuild_thread is not None and self._entropy_rebuild_thread.isRunning():
+            logger.info("Entropy rebuild request ignored: rebuild already running.")
+            return
+
+        cfg = get_config()
+        monitor_root = self.path_input.text().strip() or cfg.monitoring.file_monitor_directory
+        saved = save_startup_directories(str(entropy_root), str(Path(monitor_root).expanduser()))
+        if not saved:
+            self.show_error("Failed to save startup directories to config.yaml.")
+            return
+
+        self._last_applied_entropy_root = normalized_entropy_root
+
+        self._entropy_rebuild_dialog = EntropyRebuildDialog(self)
+        self._entropy_rebuild_dialog.show()
+
+        metadata_db = get_metadata_db()
+        self._entropy_rebuild_thread = QThread(self)
+        self._entropy_rebuild_worker = EntropyBuildWorker(
+            metadata_db=metadata_db,
+            root=entropy_root,
+            allowed_extensions=set(cfg.entropy.file_extensions),
+            sample_size_bytes=cfg.entropy.sample_size_bytes,
+        )
+        self._entropy_rebuild_worker.moveToThread(self._entropy_rebuild_thread)
+
+        self._entropy_rebuild_thread.started.connect(self._entropy_rebuild_worker.run)
+        self._entropy_rebuild_worker.progress.connect(self._on_entropy_rebuild_progress)
+        self._entropy_rebuild_worker.completed.connect(self._on_entropy_rebuild_finished)
+        self._entropy_rebuild_worker.failed.connect(self._on_entropy_rebuild_failed)
+        self._entropy_rebuild_worker.completed.connect(self._entropy_rebuild_thread.quit)
+        self._entropy_rebuild_worker.failed.connect(self._entropy_rebuild_thread.quit)
+        self._entropy_rebuild_thread.finished.connect(self._cleanup_entropy_rebuild_worker)
+
+        self._entropy_rebuild_thread.start()
+
+    def _on_entropy_rebuild_progress(self, current: int, total: int, file_name: str, percent: int) -> None:
+        if self._entropy_rebuild_dialog is not None:
+            self._entropy_rebuild_dialog.on_progress(current, total, file_name, percent)
+
+    def _on_entropy_rebuild_finished(self, total: int, processed: int) -> None:
+        if self._entropy_rebuild_dialog is not None:
+            self._entropy_rebuild_dialog.on_finished(total, processed)
+            self._entropy_rebuild_dialog.close()
+            self._entropy_rebuild_dialog.deleteLater()
+            self._entropy_rebuild_dialog = None
+
+        entropy_root = Path(self.entropy_dir_input.text().strip() or Path.home()).expanduser()
+        self._restart_entropy_monitor_for_new_root(entropy_root)
+        self.entropy_status_label.setText(
+            f"Entropy database updated. Processed {processed} / {total} files from {entropy_root}."
+        )
+        self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+        self._refresh_entropy_table()
+
+    def _on_entropy_rebuild_failed(self, message: str) -> None:
+        if self._entropy_rebuild_dialog is not None:
+            self._entropy_rebuild_dialog.on_failed(message)
+        self.show_error(f"Entropy rebuild failed: {message}")
+
+    def _cleanup_entropy_rebuild_worker(self) -> None:
+        if self._entropy_rebuild_worker is not None:
+            self._entropy_rebuild_worker.deleteLater()
+        if self._entropy_rebuild_thread is not None:
+            self._entropy_rebuild_thread.deleteLater()
+        self._entropy_rebuild_worker = None
+        self._entropy_rebuild_thread = None
+
+    def _restart_entropy_monitor_for_new_root(self, entropy_root: Path) -> None:
+        """Switch entropy monitor root without blocking the GUI thread."""
+        if not _ENTROPY_AVAILABLE:
+            return
+        if not _DATABASE_AVAILABLE:
+            return
+
+        try:
+            cfg = get_config() if _CONFIG_AVAILABLE else None
+            ent_cfg = cfg.entropy if cfg else None
+            db_cfg = cfg.database if cfg else None
+
+            if ent_cfg is not None and not ent_cfg.enabled:
+                self.entropy_status_label.setText("Entropy rule disabled from Active Rules. Module not started.")
+                self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+                return
+
+            meta_db = get_metadata_db()
+            logs_db = get_logs_db()
+            alerts_db = get_alerts_db()
+
+            allowed_ext = set(ent_cfg.file_extensions) if ent_cfg else set()
+            sample_size = ent_cfg.sample_size_bytes if ent_cfg else 5 * 1024 * 1024
+            threshold = ent_cfg.threshold if ent_cfg else 1.4
+            retention = db_cfg.metadata_retention_days if db_cfg else 30
+
+            old_monitor = self._entropy_monitor
+            self._entropy_monitor = EntropyMonitor(
+                metadata_db=meta_db,
+                logs_db=logs_db,
+                alerts_db=alerts_db,
+                allowed_extensions=allowed_ext,
+                monitored_roots=[entropy_root],
+                sample_size_bytes=sample_size,
+                threshold=threshold,
+                on_entropy_alert=self._entropy_alert_callback,
+                retention_days=retention,
+                persist_events_to_logs=False,
+            )
+            self._entropy_monitor.start()
+            self._entropy_refresh_timer.start()
+
+            # Stop old monitor in the background to keep UI responsive.
+            if old_monitor is not None:
+                threading.Thread(target=old_monitor.stop, daemon=True).start()
+        except Exception as exc:
+            logger.exception("Failed to restart entropy monitor for new root: %s", exc)
+            self.show_error(f"Failed to apply entropy root: {exc}")
 
     def stop_monitor(self):
         if self.monitor_session is None:
@@ -1867,6 +2196,236 @@ class RdrsGui(QWidget):
             self.add_log_row(entry)
         self._refresh_log_table_view()
         self._refresh_file_event_counters()
+
+    def _load_persisted_response_actions(self, limit: int = 200) -> None:
+        """Load persisted quarantine/delete action history from alerts.db."""
+        if self._alerts_db is None:
+            return
+
+        loaded_rows = []
+        for action_type in ("QUARANTINE_ACTION", "DELETE_ACTION"):
+            try:
+                rows = self._alerts_db.get_by_type(action_type, limit=limit)
+            except Exception:
+                continue
+            for row in rows:
+                payload = {}
+                notes = row["notes"] or ""
+                if notes:
+                    try:
+                        parsed = json.loads(notes)
+                        if isinstance(parsed, dict):
+                            payload = parsed
+                    except Exception:
+                        payload = {}
+                loaded_rows.append({
+                    "timestamp": datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp_epoch": row["timestamp"],
+                    "action_type": row["alert_type"] or action_type,
+                    "action_label": "Quarantine" if (row["alert_type"] or action_type) == "QUARANTINE_ACTION" else "Delete",
+                    "status": payload.get("status", "SUCCEEDED"),
+                    "process": row["process_name"] or "",
+                    "pid": str(row["pid"]) if row["pid"] is not None else "",
+                    "executable": row["executable"] or "",
+                    "source_path": payload.get("source_path") or row["file_path"] or row["executable"] or "",
+                    "result_path": payload.get("result_path") or "",
+                    "termination_status": payload.get("termination_status") or "",
+                    "message": payload.get("message") or notes,
+                })
+
+        self.response_action_rows = sorted(loaded_rows, key=lambda item: item.get("timestamp_epoch", 0.0))
+
+    def _selected_home_process_key_from_row(self, row: int) -> Optional[Tuple[Optional[str], str]]:
+        for key, mapped_row in self.suspicious_process_rows.items():
+            if mapped_row == row:
+                return key
+        return None
+
+    def _response_actions_for_process(self, process_key: Tuple[Optional[str], str]) -> List[dict]:
+        pid_value = str(process_key[0] or "")
+        executable = str(process_key[1] or "")
+        return [
+            action
+            for action in self.response_action_rows
+            if str(action.get("pid") or "") == pid_value and str(action.get("executable") or "") == executable
+        ]
+
+    def _incident_status_for(self, process_entry: dict, action_rows: List[dict]) -> str:
+        if action_rows:
+            latest = action_rows[-1]
+            if latest.get("status") == "SUCCEEDED":
+                return "Contained" if latest.get("action_type") == "QUARANTINE_ACTION" else "Removed"
+            if latest.get("status") == "FAILED":
+                return "Containment Failed"
+        last_activity = process_entry.get("last_activity", "")
+        return "Active" if self._process_is_active(last_activity) else "Inactive"
+
+    def _build_selected_home_incident_payload(self, process_key: Tuple[Optional[str], str]) -> Optional[dict]:
+        detection_entry = self.suspicious_process_entries.get(process_key, {}).copy()
+        process_state = self.process_state_cache.get(process_key, {}).copy()
+        if not detection_entry and not process_state:
+            return None
+
+        combined = process_state.copy()
+        combined.update({k: v for k, v in detection_entry.items() if v not in (None, "")})
+
+        score_text = str(combined.get("score") or "0")
+        try:
+            score_value = int(score_text)
+        except Exception:
+            score_value = 0
+
+        try:
+            threshold = get_config().alerts.process_alert_threshold if _CONFIG_AVAILABLE else 70
+        except Exception:
+            threshold = 70
+
+        if score_value >= threshold:
+            severity = "Critical"
+        elif score_value >= 50:
+            severity = "High"
+        elif score_value > 0:
+            severity = "Suspicious"
+        else:
+            severity = "Observed"
+
+        actions = self._response_actions_for_process(process_key)
+        latest_action = actions[-1] if actions else None
+        response_taken = "None"
+        if latest_action is not None:
+            response_taken = f"{latest_action.get('action_label', 'Action')} ({latest_action.get('status', 'UNKNOWN').title()})"
+
+        summary = {
+            "severity": severity,
+            "process": combined.get("process") or "Unknown process",
+            "pid": combined.get("pid") or "Unknown",
+            "executable": combined.get("executable") or "Unknown",
+            "score": score_text,
+            "reason": combined.get("reason") or "Behavioral thresholds exceeded.",
+            "first_seen": combined.get("first_activity") or combined.get("process_start_time") or combined.get("start_time") or "Unknown",
+            "last_seen": combined.get("last_activity") or combined.get("timestamp") or "Unknown",
+            "status": self._incident_status_for(combined, actions),
+            "response": response_taken,
+        }
+
+        return {
+            "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "incident_summary": summary,
+            "detection_entry": detection_entry,
+            "process_state": process_state,
+            "containment_actions": actions,
+        }
+
+    def _clear_home_incident_panel(self) -> None:
+        self._selected_home_process_key = None
+        self.home_export_button.setEnabled(False)
+        self.home_incident_hint.setVisible(True)
+        self.home_response_hint.setVisible(True)
+        for key, label in self.home_incident_labels.items():
+            title = key.replace("_", " ").title()
+            if key == "pid":
+                title = "PID"
+            elif key == "score":
+                title = "Threat Score"
+            elif key == "process":
+                title = "Suspected Process"
+            elif key == "reason":
+                title = "Why Flagged"
+            elif key == "first_seen":
+                title = "First Seen"
+            elif key == "last_seen":
+                title = "Last Seen"
+            elif key == "status":
+                title = "Current Status"
+            elif key == "response":
+                title = "Response Taken"
+            label.setText(f"{title}: —")
+        self.home_response_table.setRowCount(0)
+
+    def _refresh_home_response_table(self, process_key: Tuple[Optional[str], str]) -> None:
+        actions = self._response_actions_for_process(process_key)
+        self.home_response_table.setRowCount(0)
+        self.home_response_hint.setVisible(not actions)
+        if not actions:
+            return
+
+        for action in actions:
+            row = self.home_response_table.rowCount()
+            self.home_response_table.insertRow(row)
+            values = [
+                action.get("timestamp", ""),
+                action.get("action_label", ""),
+                action.get("result_path") or action.get("source_path") or "",
+                action.get("status", ""),
+                action.get("message") or action.get("termination_status") or "",
+            ]
+            for col_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value or ""))
+                if col_index == 3:
+                    status_value = str(action.get("status", "")).upper()
+                    if status_value == "SUCCEEDED":
+                        item.setForeground(QBrush(QColor("#00c853")))
+                    elif status_value == "FAILED":
+                        item.setForeground(QBrush(QColor("#ff5252")))
+                self.home_response_table.setItem(row, col_index, item)
+
+    def _on_home_selection_changed(self) -> None:
+        selected_items = self.home_table.selectedItems()
+        if not selected_items:
+            self._clear_home_incident_panel()
+            return
+
+        row = selected_items[0].row()
+        process_key = self._selected_home_process_key_from_row(row)
+        if process_key is None:
+            self._clear_home_incident_panel()
+            return
+
+        payload = self._build_selected_home_incident_payload(process_key)
+        if payload is None:
+            self._clear_home_incident_panel()
+            return
+
+        self._selected_home_process_key = process_key
+        self.home_export_button.setEnabled(True)
+        self.home_incident_hint.setVisible(False)
+        summary = payload["incident_summary"]
+        self.home_incident_labels["severity"].setText(f"Severity: {summary.get('severity', '—')}")
+        self.home_incident_labels["process"].setText(f"Suspected Process: {summary.get('process', '—')}")
+        self.home_incident_labels["pid"].setText(f"PID: {summary.get('pid', '—')}")
+        self.home_incident_labels["executable"].setText(f"Executable: {summary.get('executable', '—')}")
+        self.home_incident_labels["score"].setText(f"Threat Score: {summary.get('score', '—')}")
+        self.home_incident_labels["reason"].setText(f"Why Flagged: {summary.get('reason', '—')}")
+        self.home_incident_labels["first_seen"].setText(f"First Seen: {summary.get('first_seen', '—')}")
+        self.home_incident_labels["last_seen"].setText(f"Last Seen: {summary.get('last_seen', '—')}")
+        self.home_incident_labels["status"].setText(f"Current Status: {summary.get('status', '—')}")
+        self.home_incident_labels["response"].setText(f"Response Taken: {summary.get('response', '—')}")
+        self._refresh_home_response_table(process_key)
+
+    def _export_selected_home_incident_json(self) -> None:
+        if self._selected_home_process_key is None:
+            self.show_error("Select a suspicious process before exporting.")
+            return
+        payload = self._build_selected_home_incident_payload(self._selected_home_process_key)
+        if payload is None:
+            self.show_error("No incident data is available for the selected process.")
+            return
+
+        summary = payload.get("incident_summary", {})
+        process_name = _safe_export_name(str(summary.get("process") or "incident"), "incident")
+        timestamp = _safe_export_name(str(summary.get("last_seen") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")), "time")
+        try:
+            exported_path = _export_json_payload(
+                self,
+                payload,
+                f"rdrs_incident_{process_name}_{timestamp}.json",
+                "Export Incident As JSON",
+            )
+        except Exception as exc:
+            self.show_error(f"Could not export incident JSON: {exc}")
+            return
+        if exported_path is not None:
+            QMessageBox.information(self, "Export Complete", f"Saved JSON report to:\n{exported_path}")
 
     def on_table_selection_changed(self):
         """Handle log table selection changes."""
@@ -2256,6 +2815,7 @@ class RdrsGui(QWidget):
             return
 
         key = (entry.get("pid"), entry.get("executable", ""))
+        self.suspicious_process_entries[key] = entry.copy()
         row = self.suspicious_process_rows.get(key)
         values = [
             entry.get("process", ""),
@@ -2281,11 +2841,15 @@ class RdrsGui(QWidget):
             threshold = get_config().alerts.process_alert_threshold if _CONFIG_AVAILABLE else 70
         except Exception:
             threshold = 70
+        if score >= threshold:
+            self._last_alert_process_key = key
         if score >= threshold and not self._alert_banner_visible:
             process = entry.get("process") or entry.get("executable") or "Unknown process"
             self._show_alert_banner(
                 f"⚠  {process}  has reached a threat score of {score}."
             )
+        if self._selected_home_process_key == key:
+            self._on_home_selection_changed()
         self._refresh_dashboard_metrics()
 
     def _log_extension_change_alert(self, entry: dict, score: int) -> None:
@@ -2320,6 +2884,8 @@ class RdrsGui(QWidget):
         key = (entry.get("pid"), entry.get("executable", ""))
         self.process_state_cache[key] = entry.copy()
         self._refresh_process_state_tables()
+        if self._selected_home_process_key == key:
+            self._on_home_selection_changed()
 
     def _refresh_process_state_tables(self) -> None:
         self.active_process_table.setRowCount(0)
@@ -2563,6 +3129,262 @@ class RdrsGui(QWidget):
         self.alert_banner.setVisible(False)
         self._alert_banner_visible = False
 
+    def _get_response_target_process(self) -> Optional[dict]:
+        """Resolve the process targeted by Quarantine/Delete actions.
+
+        Priority:
+        1. Selected row in the suspicious processes table (Home page).
+        2. Most recent alert-triggering process.
+        3. Highest-score process currently in cache.
+
+        Returns:
+            Process-state dict or None when no process is available.
+        """
+        selected_items = self.home_table.selectedItems() if hasattr(self, "home_table") else []
+        if selected_items:
+            row = selected_items[0].row()
+            for key, mapped_row in self.suspicious_process_rows.items():
+                if mapped_row == row:
+                    return self.process_state_cache.get(key)
+
+        if self._last_alert_process_key is not None:
+            target = self.process_state_cache.get(self._last_alert_process_key)
+            if target is not None:
+                return target
+
+        if not self.process_state_cache:
+            return None
+
+        def _score(item: dict) -> int:
+            try:
+                return int(item.get("score", "0") or 0)
+            except Exception:
+                return 0
+
+        return max(self.process_state_cache.values(), key=_score)
+
+    def _terminate_process_if_running(self, pid_value: Optional[str]) -> str:
+        """Attempt graceful then forced termination for a PID.
+
+        Returns:
+            Human-readable termination status.
+        """
+        if not pid_value or not str(pid_value).isdigit():
+            return "PID unavailable; termination skipped"
+        if psutil is None:
+            return "psutil unavailable; termination skipped"
+
+        pid = int(str(pid_value))
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                return f"PID {pid} is not running"
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+                return f"PID {pid} terminated"
+            except psutil.TimeoutExpired:
+                proc.kill()
+                return f"PID {pid} killed"
+        except psutil.NoSuchProcess:
+            return f"PID {pid} not found"
+        except Exception as exc:
+            return f"PID {pid} termination failed: {exc}"
+
+    def _log_response_action(
+        self,
+        action: str,
+        process_data: dict,
+        message: str,
+        *,
+        status: str,
+        source_path: str,
+        result_path: str = "",
+        termination_status: str = "",
+    ) -> None:
+        """Persist and surface a user-triggered response action."""
+        pid_value = process_data.get("pid")
+        pid = int(pid_value) if str(pid_value or "").isdigit() else None
+        action_row = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp_epoch": time.time(),
+            "action_type": action,
+            "action_label": "Quarantine" if action == "QUARANTINE_ACTION" else "Delete",
+            "status": status,
+            "process": process_data.get("process") or "",
+            "pid": str(pid_value or ""),
+            "executable": process_data.get("executable") or "",
+            "source_path": source_path,
+            "result_path": result_path,
+            "termination_status": termination_status,
+            "message": message,
+        }
+        self.response_action_rows.append(action_row)
+        if self._selected_home_process_key is not None:
+            self._on_home_selection_changed()
+
+        if self._alerts_db is None:
+            return
+        try:
+            self._alerts_db.log_alert(
+                alert_type=action,
+                process_name=process_data.get("process") or None,
+                pid=pid,
+                executable=process_data.get("executable") or None,
+                process_score=int(process_data.get("score") or 0) if str(process_data.get("score") or "").isdigit() else None,
+                file_path=source_path or None,
+                notes=json.dumps({
+                    "status": status,
+                    "source_path": source_path,
+                    "result_path": result_path,
+                    "termination_status": termination_status,
+                    "message": message,
+                }),
+            )
+        except Exception:
+            logger.exception("Failed to persist response action: %s", action)
+
+    def _on_quarantine_alert_process(self) -> None:
+        """Terminate suspected process and move executable into quarantine."""
+        target = self._get_response_target_process()
+        if target is None:
+            self.show_error("No suspicious process available to quarantine.")
+            return
+
+        executable = str(target.get("executable") or "").strip()
+        if not executable:
+            self._log_response_action(
+                "QUARANTINE_ACTION",
+                target,
+                "Selected process had no executable path; quarantine aborted.",
+                status="FAILED",
+                source_path="",
+            )
+            self.show_error("Selected process has no executable path; cannot quarantine.")
+            return
+
+        exe_path = Path(executable).expanduser()
+        if not exe_path.exists() or not exe_path.is_file():
+            self._log_response_action(
+                "QUARANTINE_ACTION",
+                target,
+                f"Executable not found for quarantine: {exe_path}",
+                status="FAILED",
+                source_path=str(exe_path),
+            )
+            self.show_error(f"Executable not found for quarantine: {exe_path}")
+            return
+
+        terminate_status = self._terminate_process_if_running(target.get("pid"))
+
+        quarantine_dir = get_data_dir() / "quarantine"
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        destination = quarantine_dir / f"{timestamp}_{exe_path.name}"
+
+        try:
+            moved_path = Path(shutil.move(str(exe_path), str(destination)))
+        except Exception as exc:
+            self._log_response_action(
+                "QUARANTINE_ACTION",
+                target,
+                f"Failed to quarantine executable: {exc}",
+                status="FAILED",
+                source_path=str(exe_path),
+                termination_status=terminate_status,
+            )
+            self.show_error(f"Failed to quarantine executable: {exc}")
+            return
+
+        msg = (
+            f"Quarantined {target.get('process') or exe_path.name}. "
+            f"{terminate_status}.\nMoved to: {moved_path}"
+        )
+        self._show_alert_banner(msg)
+        self._log_response_action(
+            "QUARANTINE_ACTION",
+            target,
+            msg,
+            status="SUCCEEDED",
+            source_path=str(exe_path),
+            result_path=str(moved_path),
+            termination_status=terminate_status,
+        )
+        QMessageBox.information(self, "Quarantine Complete", msg)
+
+    def _on_delete_alert_process(self) -> None:
+        """Terminate suspected process and delete executable file."""
+        target = self._get_response_target_process()
+        if target is None:
+            self.show_error("No suspicious process available to delete.")
+            return
+
+        executable = str(target.get("executable") or "").strip()
+        if not executable:
+            self._log_response_action(
+                "DELETE_ACTION",
+                target,
+                "Selected process had no executable path; delete aborted.",
+                status="FAILED",
+                source_path="",
+            )
+            self.show_error("Selected process has no executable path; cannot delete.")
+            return
+
+        exe_path = Path(executable).expanduser()
+        if not exe_path.exists() or not exe_path.is_file():
+            self._log_response_action(
+                "DELETE_ACTION",
+                target,
+                f"Executable not found for deletion: {exe_path}",
+                status="FAILED",
+                source_path=str(exe_path),
+            )
+            self.show_error(f"Executable not found for deletion: {exe_path}")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete suspected executable?\n{exe_path}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        terminate_status = self._terminate_process_if_running(target.get("pid"))
+
+        try:
+            exe_path.unlink()
+        except Exception as exc:
+            self._log_response_action(
+                "DELETE_ACTION",
+                target,
+                f"Failed to delete executable: {exc}",
+                status="FAILED",
+                source_path=str(exe_path),
+                termination_status=terminate_status,
+            )
+            self.show_error(f"Failed to delete executable: {exc}")
+            return
+
+        msg = (
+            f"Deleted executable for {target.get('process') or exe_path.name}. "
+            f"{terminate_status}.\nRemoved: {exe_path}"
+        )
+        self._show_alert_banner(msg)
+        self._log_response_action(
+            "DELETE_ACTION",
+            target,
+            msg,
+            status="SUCCEEDED",
+            source_path=str(exe_path),
+            result_path=str(exe_path),
+            termination_status=terminate_status,
+        )
+        QMessageBox.information(self, "Delete Complete", msg)
+
     # ------------------------------------------------------------------
     # Entropy Monitor page refresh
     # ------------------------------------------------------------------
@@ -2694,8 +3516,19 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
-    window = RdrsGui()
-    window.show()
+
+    from startup_dashboard import StartupDashboard
+    from initialization_manager import InitializationManager
+
+    startup = StartupDashboard()
+    init_manager = InitializationManager(gui_factory=RdrsGui)
+
+    def _on_desktop_mode_selected(entropy_dir: str, file_monitor_dir: str) -> None:
+        init_manager.start(entropy_dir=entropy_dir, file_monitor_dir=file_monitor_dir)
+
+    startup.desktop_mode_selected.connect(_on_desktop_mode_selected)
+    startup.show()
+
     sys.exit(app.exec_())
 
 

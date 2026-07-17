@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MonitoringConfig:
     """Configuration for filesystem monitoring."""
+
+    # Default directory used by the desktop file monitor path selector.
+    file_monitor_directory: str = str(Path.home())
+    """Directory used by the File Monitoring engine in Desktop mode."""
     
     # Event processing
     max_event_history_per_process: int = 1000
@@ -373,6 +377,8 @@ def _apply_yaml_to_config(cfg: AppConfig, data: Dict[str, Any]) -> None:
     """
     # -- monitoring section --------------------------------------------------
     mon = data.get("monitoring") or {}
+    if "file_monitor_directory" in mon:
+        cfg.monitoring.file_monitor_directory = str(mon["file_monitor_directory"])
 
     # -- entropy section -----------------------------------------------------
     ent = data.get("entropy") or {}
@@ -456,8 +462,16 @@ def reload_config() -> None:
     yaml_path = _find_config_yaml()
     if yaml_path is not None:
         data = _load_yaml_config(yaml_path)
-        _apply_yaml_to_config(_config, data)
-        logger.debug("Loaded config.yaml from %s", yaml_path)
+        try:
+            _apply_yaml_to_config(_config, data)
+            logger.debug("Loaded config.yaml from %s", yaml_path)
+        except Exception as exc:
+            # Never crash startup due to invalid config values. Keep defaults.
+            logger.warning(
+                "Invalid values found in config.yaml (%s): %s — using safe defaults for invalid entries.",
+                yaml_path,
+                exc,
+            )
     else:
         logger.debug("config.yaml not found — using built-in defaults.")
 
@@ -624,6 +638,108 @@ def _patch_scalar_in_section(
         section_body = f"  {key}: {new_value}\n" + section_body.lstrip("\n")
 
     return text[:start] + section_body + text[end:]
+
+
+def _patch_list_in_section(
+    text: str,
+    section_name: str,
+    key: str,
+    items: List[str],
+) -> str:
+    """Update (or insert) a simple YAML list key within a top-level section.
+
+    Args:
+        text: Full config.yaml contents.
+        section_name: Top-level section name (e.g. "monitoring").
+        key: List key to update (e.g. "directories").
+        items: List item values to write.
+
+    Returns:
+        Updated text (unchanged if section not found).
+    """
+    span = _find_top_level_section_span(text, section_name)
+    if span is None:
+        return text
+    start, end = span
+    section_body = text[start:end]
+
+    lines = section_body.splitlines(keepends=True)
+    key_re = re.compile(rf'^(\s*){re.escape(key)}:[ \t]*$')
+
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.rstrip("\n")
+        match = key_re.match(line)
+        if not match:
+            continue
+
+        key_indent = match.group(1)
+        list_indent = key_indent + "  "
+
+        j = idx + 1
+        while j < len(lines):
+            current_line = lines[j]
+            stripped = current_line.strip()
+            leading_spaces = len(current_line) - len(current_line.lstrip(" "))
+
+            if stripped.startswith("-") and leading_spaces >= len(list_indent):
+                j += 1
+                continue
+            break
+
+        new_block = [f"{list_indent}- {item}\n" for item in items]
+        lines = lines[: idx + 1] + new_block + lines[j:]
+        section_body = "".join(lines)
+        return text[:start] + section_body + text[end:]
+
+    insertion = [f"  {key}:\n"] + [f"    - {item}\n" for item in items]
+    section_body = "".join(insertion) + section_body.lstrip("\n")
+    return text[:start] + section_body + text[end:]
+
+
+def save_startup_directories(entropy_directory: str, file_monitor_directory: str) -> bool:
+    """Persist startup-selected directories to live config and config.yaml.
+
+    Args:
+        entropy_directory: Directory selected for entropy monitoring cache/rebuild.
+        file_monitor_directory: Directory selected for desktop file monitor path.
+
+    Returns:
+        True when persisted to config.yaml, False on write/read failures.
+    """
+    entropy_path = str(Path(entropy_directory).expanduser())
+    file_monitor_path = str(Path(file_monitor_directory).expanduser())
+
+    _config.entropy.directories = [entropy_path]
+    _config.monitoring.file_monitor_directory = file_monitor_path
+
+    yaml_path = _find_config_yaml()
+    if yaml_path is None:
+        logger.warning("config.yaml not found — startup directory changes applied in-memory only.")
+        return False
+
+    try:
+        text = yaml_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to read config.yaml while saving startup directories: %s", exc)
+        return False
+
+    text = _patch_list_in_section(text, "monitoring", "directories", [f'"{entropy_path}"'])
+    text = _patch_scalar_in_section(
+        text,
+        "monitoring",
+        "file_monitor_directory",
+        f'"{file_monitor_path}"',
+        r'.*',
+    )
+
+    try:
+        yaml_path.write_text(text, encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to write config.yaml with startup directories: %s", exc)
+        return False
+
+    logger.info("Persisted startup directories to %s", yaml_path)
+    return True
 
 
 def save_entropy_rule_settings(score: Optional[int] = None, enabled: Optional[bool] = None) -> bool:

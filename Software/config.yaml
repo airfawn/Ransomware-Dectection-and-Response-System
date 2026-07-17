@@ -7,7 +7,11 @@ monitoring:
   # These are also passed to the file monitor as the canonical monitored paths.
   # At minimum, include the user's home directory or any sensitive data folders.
   directories:
-    - "~"
+    - "/Users/airfawn737/Desktop/internmo"
+
+  # Desktop file monitor root selected from the Startup Dashboard.
+  # This can be different from the entropy-monitoring directory.
+  file_monitor_directory: "/Users/airfawn737/Desktop/internmo"
 
   # File extensions that the entropy module will scan.
   # Extensions must be lowercase, without a leading dot.

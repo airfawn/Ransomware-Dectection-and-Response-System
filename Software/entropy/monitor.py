@@ -143,6 +143,7 @@ class EntropyMonitor:
         threshold: float = 1.4,
         on_entropy_alert: Optional[Callable[[EntropyIncreaseDetected], None]] = None,
         retention_days: int = 30,
+        persist_events_to_logs: bool = False,
     ) -> None:
         self._metadata_db = metadata_db
         self._logs_db = logs_db
@@ -153,6 +154,7 @@ class EntropyMonitor:
         self._threshold = threshold
         self._on_entropy_alert = on_entropy_alert
         self._retention_days = retention_days
+        self._persist_events_to_logs = persist_events_to_logs
 
         self._queue: queue.Queue[Optional[_FileEvent]] = queue.Queue(maxsize=2000)
         self._worker_thread: Optional[threading.Thread] = None
@@ -414,7 +416,8 @@ class EntropyMonitor:
                 )
             except Exception as exc:
                 logger.warning("Failed to mark deleted: %s — %s", file_path, exc)
-            self._log_event(evt)
+            if self._persist_events_to_logs:
+                self._log_event(evt)
             return
 
         # -----------------------------------------------------------------
@@ -514,7 +517,8 @@ class EntropyMonitor:
             if delta >= self._threshold:
                 self._trigger_alert(evt, previous_entropy, current_entropy, delta)
 
-        self._log_event(evt)
+        if self._persist_events_to_logs:
+            self._log_event(evt)
 
     def _log_event(self, evt: _FileEvent) -> None:
         """Persist a filesystem event to logs_db.
