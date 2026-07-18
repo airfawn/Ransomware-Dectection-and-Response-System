@@ -160,6 +160,8 @@ class EntropyMonitor:
         self._worker_thread: Optional[threading.Thread] = None
         self._baseline_thread: Optional[threading.Thread] = None
         self._running = False
+        self._inflight_paths: Set[str] = set()
+        self._inflight_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -362,6 +364,7 @@ class EntropyMonitor:
         """
         file_path = evt.file_path
         path = Path(file_path)
+        resolved_path = str(path.resolve()) if path.exists() else str(path)
         logger.info(
             "[ENTROPY_TRACE][ENTROPY.worker] processing event=%s file=%s suffix=%s",
             evt.event_type,
@@ -435,37 +438,38 @@ class EntropyMonitor:
         file_size = stat.st_size
         last_modified = stat.st_mtime
 
-        # -----------------------------------------------------------------
-        # 4. Fetch existing record to get previous entropy
-        # -----------------------------------------------------------------
-        existing = self._metadata_db.get_file(file_path)
-        existing_cache = self._metadata_db.get_entropy_record(file_path)
-        previous_entropy: Optional[float] = None
-        if existing:
-            previous_entropy = existing["current_entropy"]
-        elif existing_cache is not None:
-            previous_entropy = existing_cache["entropy"]
-        logger.info(
-            "[ENTROPY_TRACE][ENTROPY.worker] metadata_lookup existing=%s prev_entropy=%s file=%s",
-            existing is not None,
-            previous_entropy,
-            file_path,
-        )
+        with self._inflight_lock:
+            if resolved_path in self._inflight_paths:
+                logger.info("[ENTROPY_TRACE][ENTROPY.worker] duplicate_scan_ignored file=%s", resolved_path)
+                return
+            self._inflight_paths.add(resolved_path)
 
-        # -----------------------------------------------------------------
-        # 5. Calculate current entropy
-        # -----------------------------------------------------------------
-        current_entropy: Optional[float]
-        if (
-            existing_cache is not None
-            and existing_cache["exists"] == 1
-            and existing_cache["file_size"] == file_size
-            and existing_cache["modified_time"] == last_modified
-            and existing_cache["entropy"] is not None
-        ):
-            current_entropy = existing_cache["entropy"]
-        else:
+        try:
+            # -----------------------------------------------------------------
+            # 4. Fetch existing record to get previous entropy
+            # -----------------------------------------------------------------
+            existing = self._metadata_db.get_file(resolved_path)
+            existing_cache = self._metadata_db.get_entropy_record(resolved_path)
+            previous_entropy: Optional[float] = None
+            if existing:
+                previous_entropy = existing["current_entropy"]
+            elif existing_cache is not None:
+                previous_entropy = existing_cache["entropy"]
+            logger.info(
+                "[ENTROPY_TRACE][ENTROPY.worker] metadata_lookup existing=%s prev_entropy=%s file=%s",
+                existing is not None,
+                previous_entropy,
+                file_path,
+            )
+
+            # -----------------------------------------------------------------
+            # 5. Calculate current entropy from the filesystem at scan time.
+            # -----------------------------------------------------------------
             current_entropy = calculate_entropy(file_path, self._sample_size)
+        finally:
+            with self._inflight_lock:
+                self._inflight_paths.discard(resolved_path)
+
         if current_entropy is None:
             # Unreadable file — skip entropy update.
             logger.warning(
@@ -484,14 +488,14 @@ class EntropyMonitor:
         # 6. Upsert metadata database
         # -----------------------------------------------------------------
         self._metadata_db.upsert_entropy_cache(
-            path=file_path,
+            path=resolved_path,
             entropy=current_entropy,
             file_size=file_size,
             modified_time=last_modified,
             exists=True,
         )
         self._metadata_db.upsert_file(
-            file_path=file_path,
+            file_path=resolved_path,
             file_name=path.name,
             current_entropy=current_entropy,
             previous_entropy=previous_entropy,
@@ -514,6 +518,13 @@ class EntropyMonitor:
             and current_entropy is not None
         ):
             delta = current_entropy - previous_entropy
+            logger.info(
+                "[ENTROPY_TRACE][ENTROPY.recalculated] file=%s prev=%.5f current=%.5f delta=%.5f",
+                resolved_path,
+                previous_entropy,
+                current_entropy,
+                delta,
+            )
             if delta >= self._threshold:
                 self._trigger_alert(evt, previous_entropy, current_entropy, delta)
 
@@ -613,6 +624,13 @@ class EntropyMonitor:
             return self._metadata_db.get_all_existing()
         except Exception:
             return []
+
+    def queue_rescan_for_paths(self, paths: Sequence[Path]) -> None:
+        """Queue a filesystem-based entropy rescan for the provided files."""
+        for path in paths:
+            if not path.exists() or not path.is_file():
+                continue
+            self.on_file_event("FILE MODIFIED", str(path))
 
     def get_files_in_directory(self, directory: str) -> list:
         """Return monitored files under a given directory prefix.

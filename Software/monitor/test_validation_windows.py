@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from database.alerts_db import AlertsDatabase
 from database.logs_db import LogsDatabase
 from database.metadata_db import MetadataDatabase
+from entropy.loader import build_entropy_cache
 from entropy.monitor import EntropyMonitor
 from monitor.filesystem_monitor import FileSystemMonitorHandler, ProcessMetadata, ProcessResolver
 
@@ -136,6 +138,103 @@ class WindowsPipelineValidationTest(unittest.TestCase):
             metadata_db.close()
             logs_db.close()
             alerts_db.close()
+
+    def test_build_entropy_cache_rebuilds_from_filesystem_and_removes_deleted_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep_file = root / "keep.txt"
+            keep_file.write_text("keep me", encoding="utf-8")
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            try:
+                summary = build_entropy_cache(
+                    metadata_db=metadata_db,
+                    roots=[root],
+                    allowed_extensions={"txt"},
+                    sample_size_bytes=1024,
+                )
+                self.assertEqual(summary.total_files, 1)
+                self.assertIsNotNone(metadata_db.get_file(str(keep_file)))
+
+                keep_file.unlink()
+                new_file = root / "new.txt"
+                new_file.write_text("brand new", encoding="utf-8")
+
+                summary = build_entropy_cache(
+                    metadata_db=metadata_db,
+                    roots=[root],
+                    allowed_extensions={"txt"},
+                    sample_size_bytes=1024,
+                )
+
+                self.assertIsNone(metadata_db.get_file(str(keep_file)))
+                self.assertIsNotNone(metadata_db.get_file(str(new_file)))
+                self.assertEqual(summary.total_files, 1)
+            finally:
+                metadata_db.close()
+
+    def test_modified_file_events_force_entropy_recalculation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_file = root / "sample.txt"
+            data_file.write_text("hello world\n", encoding="utf-8")
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            logs_db = LogsDatabase(root / "logs.db")
+            alerts_db = AlertsDatabase(root / "alerts.db")
+            monitor = EntropyMonitor(
+                metadata_db=metadata_db,
+                logs_db=logs_db,
+                alerts_db=alerts_db,
+                allowed_extensions={"txt"},
+                monitored_roots=[root],
+                threshold=1.0,
+            )
+            metadata_db.upsert_entropy_cache(path=str(data_file), entropy=1.0, file_size=data_file.stat().st_size, modified_time=data_file.stat().st_mtime, exists=True)
+            metadata_db.upsert_file(file_path=str(data_file), file_name=data_file.name, current_entropy=1.0, previous_entropy=None, file_size=data_file.stat().st_size, last_modified_ts=data_file.stat().st_mtime)
+
+            try:
+                with patch("entropy.monitor.calculate_entropy", return_value=4.25) as entropy_mock:
+                    monitor._process_event(
+                        type("Evt", (), {"event_type": "FILE MODIFIED", "file_path": str(data_file), "previous_path": None, "process_name": None, "pid": None, "executable": None, "parent": None})
+                    )
+                self.assertEqual(entropy_mock.call_count, 1)
+            finally:
+                monitor.stop()
+                metadata_db.close()
+                logs_db.close()
+                alerts_db.close()
+
+    def test_burst_queue_coalesces_duplicate_modification_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_file = root / "sample.txt"
+            data_file.write_text("hello world\n", encoding="utf-8")
+
+            class DummyTracker:
+                def __init__(self):
+                    self.events = []
+
+                def record_event(self, event_type, src_path, process_metadata, previous_path=None):
+                    self.events.append((event_type, src_path, previous_path))
+
+            tracker = DummyTracker()
+            handler = FileSystemMonitorHandler(_DummyLogger(), tracker)
+            handler._process_resolver.resolve = lambda path, **kwargs: ProcessMetadata(
+                pid=111,
+                name="python.exe",
+                executable="C:/python/python.exe",
+                parent_name=None,
+                start_time=None,
+                start_time_epoch=None,
+            )
+
+            handler._report_event("FILE MODIFIED", str(data_file))
+            handler._report_event("FILE MODIFIED", str(data_file))
+
+            self.assertEqual(len(handler._queued_event_keys), 1)
+            time.sleep(0.15)
+            self.assertEqual(len(tracker.events), 1)
 
 
 if __name__ == "__main__":

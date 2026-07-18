@@ -274,6 +274,16 @@ class MetadataDatabase(BaseDatabase):
             (now, file_path),
         )
 
+    def delete_file(self, file_path: str) -> None:
+        """Remove a file metadata row entirely when it no longer exists."""
+        file_path = self._normalize_path(file_path)
+        self.execute("DELETE FROM file_metadata WHERE file_path = ?", (file_path,))
+
+    def delete_entropy_cache(self, path: str) -> None:
+        """Remove an entropy cache row entirely when the file no longer exists."""
+        path = self._normalize_path(path)
+        self.execute("DELETE FROM entropy_cache WHERE path = ?", (path,))
+
     def cleanup_old_deleted(self, retention_days: int) -> int:
         """Remove deleted file records older than ``retention_days``.
 

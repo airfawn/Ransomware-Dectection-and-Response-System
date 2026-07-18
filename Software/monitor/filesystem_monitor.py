@@ -20,6 +20,7 @@ Thread Safety:
 
 import logging
 import os
+import queue
 import threading
 import time
 from collections import deque
@@ -682,6 +683,15 @@ class ProcessBehaviorTracker:
         self._last_cleanup_time = datetime.now().timestamp()
         self._cleanup_enabled = True
 
+    def get_process_state(self, process_metadata: ProcessMetadata) -> Optional[ProcessState]:
+        """Return the current ProcessState for a process identity if it exists."""
+        with self._lock:
+            identity = ProcessIdentity(
+                pid=process_metadata.pid,
+                executable=process_metadata.executable or process_metadata.name,
+            )
+            return self.records.get(identity)
+
     def record_event(
         self,
         event_type: str,
@@ -1146,6 +1156,45 @@ class ProcessBehaviorTracker:
         self.logger.info("\n" + "\n".join(lines))
 
 
+class _QueuedFileEvent:
+    """Internal event payload for the burst processor."""
+
+    __slots__ = ("event_type", "src_path", "previous_path", "process_metadata", "timestamp", "priority", "event_key")
+
+    def __init__(
+        self,
+        *,
+        event_type: str,
+        src_path: str,
+        previous_path: Optional[str],
+        process_metadata: Optional[ProcessMetadata] = None,
+        timestamp: float,
+    ) -> None:
+        self.event_type = event_type
+        self.src_path = src_path
+        self.previous_path = previous_path
+        self.process_metadata = process_metadata
+        self.timestamp = timestamp
+        self.priority = self._priority_for_event(event_type)
+        self.event_key = self._build_event_key(event_type, src_path)
+
+    @staticmethod
+    def _priority_for_event(event_type: str) -> int:
+        event_type_upper = (event_type or "").upper()
+        if event_type_upper in {"FILE MODIFIED", "FILE MOVED"}:
+            return 0
+        if event_type_upper in {"FILE CREATED", "FILE DELETED"}:
+            return 1
+        return 2
+
+    @staticmethod
+    def _build_event_key(event_type: str, src_path: str) -> Tuple[str, str]:
+        return (
+            (event_type or "").upper(),
+            str(Path(src_path).resolve() if Path(src_path).exists() else Path(src_path).absolute()),
+        )
+
+
 class FileSystemMonitorHandler(FileSystemEventHandler):
     """Watchdog event handler specialized for file creation, deletion, and modification.
     
@@ -1187,6 +1236,24 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         self.behavior_tracker = behavior_tracker
         self._process_resolver = ProcessResolver()
         self._event_callback: Optional[Callable] = event_callback
+        self._event_queue: "queue.Queue[_QueuedFileEvent]" = queue.Queue(maxsize=5000)
+        self._event_lock = threading.Lock()
+        self._queued_event_keys: Set[Tuple[str, str]] = set()
+        self._processing_event_keys: Set[Tuple[str, str]] = set()
+        self._recent_modification_timestamps: Deque[float] = deque(maxlen=500)
+        self._burst_window_seconds = 1.5
+        self._burst_threshold = 100
+        self._packet_size = 20
+        self._burst_worker_running = True
+        self._burst_packet_count = 0
+        self._burst_event_count = 0
+        self._skipped_low_priority_events = 0
+        self._burst_worker_thread = threading.Thread(
+            target=self._burst_worker_loop,
+            name="rdrs-burst-worker",
+            daemon=True,
+        )
+        self._burst_worker_thread.start()
 
     def on_created(self, event: FileCreatedEvent) -> None:
         """Handle file creation events.
@@ -1229,108 +1296,240 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         self._report_event("FILE MOVED", event.dest_path, previous_path=event.src_path)
 
     def _report_event(self, event_type: str, src_path: str, previous_path: Optional[str] = None) -> None:
-        """Format and log an event report.
-        
-        Args:
-            event_type: Type of event.
-            src_path: Path to the affected file.
-        """
+        """Queue a filesystem event for burst-safe background processing."""
         try:
-            path = Path(src_path)
-            event_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Resolve process metadata
-            process_metadata = self._process_resolver.resolve(
-                path,
-                previous_path=Path(previous_path) if previous_path else None,
+            self._enqueue_event(
                 event_type=event_type,
+                src_path=src_path,
+                previous_path=previous_path,
+                process_metadata=None,
+                timestamp=time.time(),
+            )
+        except Exception as exc:
+            self.logger.error(f"Failed to queue filesystem event for {src_path}: {exc}", exc_info=True)
+
+    def _enqueue_event(
+        self,
+        *,
+        event_type: str,
+        src_path: str,
+        previous_path: Optional[str],
+        process_metadata: Optional[ProcessMetadata],
+        timestamp: float,
+    ) -> bool:
+        """Queue an event, collapsing duplicates and suppressing in-flight work."""
+        queued_event = _QueuedFileEvent(
+            event_type=event_type,
+            src_path=src_path,
+            previous_path=previous_path,
+            process_metadata=process_metadata,
+            timestamp=timestamp,
+        )
+        with self._event_lock:
+            if queued_event.event_key in self._queued_event_keys or queued_event.event_key in self._processing_event_keys:
+                return False
+            if queued_event.event_type.upper() == "FILE MODIFIED":
+                self._recent_modification_timestamps.append(timestamp)
+            self._queued_event_keys.add(queued_event.event_key)
+            try:
+                self._event_queue.put_nowait(queued_event)
+            except queue.Full:
+                self._queued_event_keys.discard(queued_event.event_key)
+                return False
+        return True
+
+    def _burst_worker_loop(self) -> None:
+        """Process queued filesystem events in small packets while keeping the UI responsive."""
+        while self._burst_worker_running or not self._event_queue.empty():
+            try:
+                if self._event_queue.empty():
+                    time.sleep(0.05)
+                    continue
+
+                burst_active = self._is_burst_window_active()
+                packet_size = self._packet_size if burst_active else 1
+                packet = self._drain_packet(packet_size)
+                if not packet:
+                    continue
+
+                self._burst_packet_count += 1
+                self._burst_event_count += len(packet)
+                for queued_event in packet:
+                    self._process_event(queued_event)
+
+                if burst_active:
+                    time.sleep(0.02)
+            except Exception as exc:
+                self.logger.exception("Burst worker loop failed: %s", exc)
+                time.sleep(0.1)
+
+    def _is_burst_window_active(self) -> bool:
+        """Return True when file-modification activity crosses the burst threshold."""
+        cutoff = time.time() - self._burst_window_seconds
+        with self._event_lock:
+            while self._recent_modification_timestamps and self._recent_modification_timestamps[0] < cutoff:
+                self._recent_modification_timestamps.popleft()
+            return len(self._recent_modification_timestamps) >= self._burst_threshold
+
+    def _drain_packet(self, packet_size: int) -> List[_QueuedFileEvent]:
+        """Drain up to packet_size queued events, preferring higher-priority work first."""
+        packet: List[_QueuedFileEvent] = []
+        while len(packet) < packet_size:
+            try:
+                item = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                continue
+            packet.append(item)
+        if len(packet) > 1:
+            packet.sort(key=lambda item: (item.priority, item.timestamp))
+        return packet
+
+    def _should_skip_event(self, queued_event: _QueuedFileEvent) -> bool:
+        """Return True when a low-priority event can be skipped after a process is already suspicious."""
+        event_type_upper = (queued_event.event_type or "").upper()
+        if event_type_upper in {"FILE MODIFIED", "FILE MOVED"}:
+            return False
+
+        if queued_event.process_metadata is None:
+            queued_event.process_metadata = self._process_resolver.resolve(
+                Path(queued_event.src_path),
+                previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
+                event_type=queued_event.event_type,
             )
 
-            # Update behavioral tracker
-            self.behavior_tracker.record_event(event_type, src_path, process_metadata, previous_path=previous_path)
+        process_state = self.behavior_tracker.get_process_state(queued_event.process_metadata)
+        if process_state is None:
+            return False
+        return process_state.classification in {"Alert", "Suspicious"}
 
-            # Log structured event
+    def get_burst_status(self) -> Dict[str, Any]:
+        """Return lightweight burst metrics for monitoring and UI status panels."""
+        with self._event_lock:
+            queue_size = self._event_queue.qsize()
+            pending_count = len(self._queued_event_keys)
+            processing_count = len(self._processing_event_keys)
+            return {
+                "queue_size": queue_size,
+                "pending_count": pending_count,
+                "processing_count": processing_count,
+                "packet_count": self._burst_packet_count,
+                "processed_event_count": self._burst_event_count,
+                "skipped_low_priority_events": self._skipped_low_priority_events,
+                "burst_active": self._is_burst_window_active(),
+            }
+
+    def stop(self) -> None:
+        """Stop the burst worker thread cleanly."""
+        self._burst_worker_running = False
+        try:
+            self._event_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if getattr(self, "_burst_worker_thread", None) is not None and self._burst_worker_thread.is_alive():
+            self._burst_worker_thread.join(timeout=2.0)
+
+    def _process_event(self, queued_event: _QueuedFileEvent) -> None:
+        """Process one queued filesystem event and notify downstream modules."""
+        with self._event_lock:
+            self._processing_event_keys.add(queued_event.event_key)
+            self._queued_event_keys.discard(queued_event.event_key)
+
+        try:
+            if queued_event.process_metadata is None:
+                queued_event.process_metadata = self._process_resolver.resolve(
+                    Path(queued_event.src_path),
+                    previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
+                    event_type=queued_event.event_type,
+                )
+
+            if self._should_skip_event(queued_event):
+                with self._event_lock:
+                    self._skipped_low_priority_events += 1
+                process_state = self.behavior_tracker.get_process_state(queued_event.process_metadata)
+                self.logger.info(
+                    "[BURST_TRACE][FSM] skipping_low_priority event=%s file=%s classification=%s",
+                    queued_event.event_type,
+                    queued_event.src_path,
+                    process_state.classification if process_state else "unknown",
+                )
+                return
+            path = Path(queued_event.src_path)
+            event_time = datetime.fromtimestamp(queued_event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+            self.behavior_tracker.record_event(
+                queued_event.event_type,
+                queued_event.src_path,
+                queued_event.process_metadata,
+                previous_path=queued_event.previous_path,
+            )
+
             output = ["=" * 38]
-            output.append(f"EVENT: {event_type}")
+            output.append(f"EVENT: {queued_event.event_type}")
             output.append("")
             output.append("Time:")
             output.append(event_time)
             output.append("")
             output.append("File:")
-            
             try:
                 resolved_path = str(path.resolve() if path.exists() else path.absolute())
             except Exception:
                 resolved_path = str(path.absolute())
-            
             output.append(resolved_path)
             output.append("")
             output.append("File Name:")
             output.append(path.name)
-            if previous_path:
+            if queued_event.previous_path:
                 output.append("")
                 output.append("Previous Path:")
-                output.append(previous_path)
+                output.append(queued_event.previous_path)
             output.append("")
             output.append("Process:")
-            output.append(process_metadata.name or "Unknown")
+            output.append(queued_event.process_metadata.name or "Unknown")
             output.append("")
             output.append("PID:")
-            output.append(str(process_metadata.pid) if process_metadata.pid else "Unknown")
+            output.append(str(queued_event.process_metadata.pid) if queued_event.process_metadata.pid else "Unknown")
             output.append("")
             output.append("Executable:")
-            output.append(process_metadata.executable or "Unknown")
+            output.append(queued_event.process_metadata.executable or "Unknown")
             output.append("")
             output.append("Parent Process:")
-            output.append(process_metadata.parent_name or "Unknown")
+            output.append(queued_event.process_metadata.parent_name or "Unknown")
             output.append("=" * 38)
+            self.logger.info("\n".join(output))
 
-            self.logger.info("\n" + "\n".join(output))
+            self._process_resolver.remember(path, queued_event.process_metadata)
+            if queued_event.previous_path:
+                self._process_resolver.remember(Path(queued_event.previous_path), queued_event.process_metadata)
 
-            self._process_resolver.remember(path, process_metadata)
-            if previous_path:
-                self._process_resolver.remember(Path(previous_path), process_metadata)
-
-            # --- Notify external modules (e.g. EntropyMonitor) ----------
-            # The callback receives lightweight primitives only; it must not
-            # block.  Errors in the callback must not crash the monitor.
             if self._event_callback is not None:
                 try:
-                    self.logger.info(
-                        "[ENTROPY_TRACE][FSM->CALLBACK] event=%s file=%s pid=%s proc=%s",
-                        event_type,
-                        str(resolved_path),
-                        process_metadata.pid,
-                        process_metadata.name,
-                    )
                     self._event_callback(
-                        event_type,
+                        queued_event.event_type,
                         str(resolved_path),
-                        process_metadata.name,
-                        process_metadata.pid,
-                        process_metadata.executable,
-                        process_metadata.parent_name,
-                        previous_path,
-                    )
-                    self.logger.info(
-                        "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_ok event=%s file=%s",
-                        event_type,
-                        str(resolved_path),
+                        queued_event.process_metadata.name,
+                        queued_event.process_metadata.pid,
+                        queued_event.process_metadata.executable,
+                        queued_event.process_metadata.parent_name,
+                        queued_event.previous_path,
                     )
                 except Exception as cb_exc:
                     self.logger.error(
                         "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_error file=%s err=%s",
-                        src_path,
+                        queued_event.src_path,
                         cb_exc,
                     )
             else:
                 self.logger.warning(
                     "[ENTROPY_TRACE][FSM->CALLBACK] event_callback is None; event dropped file=%s",
-                    src_path,
+                    queued_event.src_path,
                 )
-
         except Exception as exc:
-            self.logger.error(f"Failed to report filesystem event for {src_path}: {exc}", exc_info=True)
+            self.logger.error(f"Failed to process queued filesystem event for {queued_event.src_path}: {exc}", exc_info=True)
+        finally:
+            with self._event_lock:
+                self._processing_event_keys.discard(queued_event.event_key)
 
 
 class FileSystemMonitor:
@@ -1389,6 +1588,7 @@ class FileSystemMonitor:
     def stop(self) -> None:
         """Stop the observer cleanly."""
         try:
+            self.handler.stop()
             self.observer.stop()
             self.observer.join(timeout=5)
         except Exception as exc:

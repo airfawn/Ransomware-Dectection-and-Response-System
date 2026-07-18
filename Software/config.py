@@ -378,8 +378,8 @@ def _build_default_yaml_text() -> str:
     except ImportError:
         return (
             "monitoring:\n"
-            f'  directories:\n    - "{_config.entropy.directories[0]}"\n'
-            f'  file_monitor_directory: "{_config.monitoring.file_monitor_directory}"\n'
+            f"  directories:\n    - '{_config.entropy.directories[0]}'\n"
+            f"  file_monitor_directory: '{_config.monitoring.file_monitor_directory}'\n"
         )
 
 
@@ -790,12 +790,12 @@ def save_startup_directories(entropy_directory: str, file_monitor_directory: str
         return False
     yaml_path, text = persisted
 
-    text = _patch_list_in_section(text, "monitoring", "directories", [f'"{entropy_path}"'])
+    text = _patch_list_in_section(text, "monitoring", "directories", [f"'{entropy_path}'"])
     text = _patch_scalar_in_section(
         text,
         "monitoring",
         "file_monitor_directory",
-        f'"{file_monitor_path}"',
+        f"'{file_monitor_path}'",
         r'.*',
     )
 
