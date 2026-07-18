@@ -68,10 +68,17 @@ class WindowsPipelineValidationTest(unittest.TestCase):
         handler.on_deleted(_DummyEvent(r"C:\temp\created.txt"))
         handler.on_moved(_DummyEvent(r"C:\temp\old.txt", dest_path=r"C:\temp\new.txt"))
 
-        self.assertEqual([item[0] for item in captured], ["FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED"])
-        self.assertEqual(captured[-1][-1], r"C:\temp\old.txt")
+        deadline = time.time() + 2.0
+        while len(captured) < 4 and time.time() < deadline:
+            time.sleep(0.02)
+
+        self.assertCountEqual([item[0] for item in captured], ["FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED"])
+        moved_captured = [item for item in captured if item[0] == "FILE MOVED"]
+        self.assertEqual(len(moved_captured), 1)
+        self.assertEqual(moved_captured[0][-1], r"C:\temp\old.txt")
         self.assertEqual(len(tracker.events), 4)
-        self.assertEqual(tracker.events[-1][-1], r"C:\temp\old.txt")
+        self.assertTrue(any(event[0] == "FILE MOVED" and event[-1] == r"C:\temp\old.txt" for event in tracker.events))
+        handler.stop()
 
     def test_process_resolver_reuses_directory_and_previous_path_cache(self):
         resolver = ProcessResolver()
@@ -235,6 +242,7 @@ class WindowsPipelineValidationTest(unittest.TestCase):
             self.assertEqual(len(handler._queued_event_keys), 1)
             time.sleep(0.15)
             self.assertEqual(len(tracker.events), 1)
+            handler.stop()
 
 
 if __name__ == "__main__":

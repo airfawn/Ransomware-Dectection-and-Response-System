@@ -23,6 +23,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1159,7 +1160,16 @@ class ProcessBehaviorTracker:
 class _QueuedFileEvent:
     """Internal event payload for the burst processor."""
 
-    __slots__ = ("event_type", "src_path", "previous_path", "process_metadata", "timestamp", "priority", "event_key")
+    __slots__ = (
+        "event_type",
+        "src_path",
+        "previous_path",
+        "process_metadata",
+        "timestamp",
+        "priority",
+        "event_key",
+        "payload",
+    )
 
     def __init__(
         self,
@@ -1169,21 +1179,25 @@ class _QueuedFileEvent:
         previous_path: Optional[str],
         process_metadata: Optional[ProcessMetadata] = None,
         timestamp: float,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.event_type = event_type
         self.src_path = src_path
         self.previous_path = previous_path
         self.process_metadata = process_metadata
         self.timestamp = timestamp
+        self.payload = payload or {}
         self.priority = self._priority_for_event(event_type)
         self.event_key = self._build_event_key(event_type, src_path)
 
     @staticmethod
     def _priority_for_event(event_type: str) -> int:
         event_type_upper = (event_type or "").upper()
-        if event_type_upper in {"FILE MODIFIED", "FILE MOVED"}:
+        if event_type_upper in {"HIGH_SCORE_RESCAN", "ENTROPY_RESCAN"}:
             return 0
-        if event_type_upper in {"FILE CREATED", "FILE DELETED"}:
+        if event_type_upper in {"FILE CREATED", "FILE DELETED", "FILE MOVED"}:
+            return 0
+        if event_type_upper in {"FILE MODIFIED"}:
             return 1
         return 2
 
@@ -1208,6 +1222,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         logger: logging.Logger,
         behavior_tracker: ProcessBehaviorTracker,
         event_callback: Optional[Callable] = None,
+        high_score_callback: Optional[Callable[[List[str], Dict[str, Any]], None]] = None,
     ):
         """Initialize the handler.
         
@@ -1236,18 +1251,54 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         self.behavior_tracker = behavior_tracker
         self._process_resolver = ProcessResolver()
         self._event_callback: Optional[Callable] = event_callback
-        self._event_queue: "queue.Queue[_QueuedFileEvent]" = queue.Queue(maxsize=5000)
+        self._high_score_callback = high_score_callback
+
+        if _CONFIG_AVAILABLE:
+            cfg = get_config().monitoring
+            queue_maxsize = max(500, int(cfg.filesystem_queue_maxsize))
+            self._burst_window_seconds = float(cfg.burst_window_seconds)
+            self._packet_normal_max = int(cfg.packet_normal_max)
+            self._packet_medium_max = int(cfg.packet_medium_max)
+            self._packet_large_max = int(cfg.packet_large_max)
+            self._packet_medium_size = int(cfg.packet_medium_size)
+            self._packet_large_size = int(cfg.packet_large_size)
+            self._packet_extreme_size = int(cfg.packet_extreme_size)
+            self._filesystem_worker_count = max(1, int(cfg.filesystem_worker_count))
+            self._high_score_threshold = int(cfg.high_score_rescan_threshold)
+            self._high_score_cooldown_seconds = float(cfg.high_score_rescan_cooldown_seconds)
+        else:
+            queue_maxsize = 8000
+            self._burst_window_seconds = 2.0
+            self._packet_normal_max = 50
+            self._packet_medium_max = 200
+            self._packet_large_max = 1000
+            self._packet_medium_size = 20
+            self._packet_large_size = 50
+            self._packet_extreme_size = 100
+            self._filesystem_worker_count = 4
+            self._high_score_threshold = 30
+            self._high_score_cooldown_seconds = 5.0
+
+        self._event_queue: "queue.PriorityQueue[Tuple[int, float, int, _QueuedFileEvent]]" = queue.PriorityQueue(
+            maxsize=queue_maxsize
+        )
         self._event_lock = threading.Lock()
+        self._sequence = 0
         self._queued_event_keys: Set[Tuple[str, str]] = set()
         self._processing_event_keys: Set[Tuple[str, str]] = set()
-        self._recent_modification_timestamps: Deque[float] = deque(maxlen=500)
-        self._burst_window_seconds = 1.5
-        self._burst_threshold = 100
-        self._packet_size = 20
+        self._modified_event_index: Dict[str, _QueuedFileEvent] = {}
+        self._recent_modification_timestamps: Deque[float] = deque(maxlen=5000)
+        self._high_score_rescan_state: Dict[Tuple[Optional[int], str], Tuple[int, float]] = {}
+
         self._burst_worker_running = True
         self._burst_packet_count = 0
         self._burst_event_count = 0
-        self._skipped_low_priority_events = 0
+        self._merged_duplicate_events = 0
+        self._deferred_low_priority_events = 0
+        self._worker_pool = ThreadPoolExecutor(
+            max_workers=self._filesystem_worker_count,
+            thread_name_prefix="rdrs-fs-worker",
+        )
         self._burst_worker_thread = threading.Thread(
             target=self._burst_worker_loop,
             name="rdrs-burst-worker",
@@ -1316,67 +1367,140 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         previous_path: Optional[str],
         process_metadata: Optional[ProcessMetadata],
         timestamp: float,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Queue an event, collapsing duplicates and suppressing in-flight work."""
+        """Queue an event without blocking the observer thread.
+
+        Queue-full handling preserves forensic correctness by prioritizing
+        create/delete/move events and collapsing duplicate modify events.
+        """
         queued_event = _QueuedFileEvent(
             event_type=event_type,
             src_path=src_path,
             previous_path=previous_path,
             process_metadata=process_metadata,
             timestamp=timestamp,
+            payload=payload,
         )
+        event_type_upper = queued_event.event_type.upper()
+        is_modification = event_type_upper == "FILE MODIFIED"
+        is_forensic_critical = event_type_upper in {"FILE CREATED", "FILE DELETED", "FILE MOVED"}
+        normalized_path = os.path.normcase(str(Path(src_path)))
+
         with self._event_lock:
-            if queued_event.event_key in self._queued_event_keys or queued_event.event_key in self._processing_event_keys:
+            if is_modification and normalized_path in self._modified_event_index:
+                existing = self._modified_event_index[normalized_path]
+                if queued_event.timestamp > existing.timestamp:
+                    existing.timestamp = queued_event.timestamp
+                    existing.process_metadata = queued_event.process_metadata or existing.process_metadata
+                    existing.payload.update(queued_event.payload)
+                self._merged_duplicate_events += 1
                 return False
-            if queued_event.event_type.upper() == "FILE MODIFIED":
+
+            if is_modification:
                 self._recent_modification_timestamps.append(timestamp)
+
             self._queued_event_keys.add(queued_event.event_key)
+            self._sequence += 1
+            queue_item = (queued_event.priority, queued_event.timestamp, self._sequence, queued_event)
             try:
-                self._event_queue.put_nowait(queued_event)
+                self._event_queue.put_nowait(queue_item)
+                if is_modification:
+                    self._modified_event_index[normalized_path] = queued_event
             except queue.Full:
+                if is_modification:
+                    self._queued_event_keys.discard(queued_event.event_key)
+                    self._deferred_low_priority_events += 1
+                    return False
+
+                if is_forensic_critical:
+                    self._force_enqueue_critical(queued_event)
+                    return True
+
                 self._queued_event_keys.discard(queued_event.event_key)
+                self._deferred_low_priority_events += 1
                 return False
         return True
 
+    def _force_enqueue_critical(self, queued_event: _QueuedFileEvent) -> None:
+        """Best-effort insertion for critical forensic events when queue is full."""
+        drained: List[Tuple[int, float, int, _QueuedFileEvent]] = []
+        dropped_one_low_priority = False
+        while True:
+            try:
+                item = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+            _, _, _, existing = item
+            existing_type = existing.event_type.upper()
+            if not dropped_one_low_priority and existing_type == "FILE MODIFIED":
+                dropped_one_low_priority = True
+                self._queued_event_keys.discard(existing.event_key)
+                self._modified_event_index.pop(os.path.normcase(str(Path(existing.src_path))), None)
+                continue
+            drained.append(item)
+
+        self._sequence += 1
+        try:
+            self._event_queue.put_nowait((queued_event.priority, queued_event.timestamp, self._sequence, queued_event))
+        except queue.Full:
+            self._queued_event_keys.discard(queued_event.event_key)
+
+        for item in drained:
+            try:
+                self._event_queue.put_nowait(item)
+            except queue.Full:
+                _, _, _, existing = item
+                self._queued_event_keys.discard(existing.event_key)
+                if existing.event_type.upper() == "FILE MODIFIED":
+                    self._modified_event_index.pop(os.path.normcase(str(Path(existing.src_path))), None)
+
     def _burst_worker_loop(self) -> None:
-        """Process queued filesystem events in small packets while keeping the UI responsive."""
+        """Process queued filesystem events with adaptive packet sizes."""
         while self._burst_worker_running or not self._event_queue.empty():
             try:
-                if self._event_queue.empty():
-                    time.sleep(0.05)
-                    continue
-
-                burst_active = self._is_burst_window_active()
-                packet_size = self._packet_size if burst_active else 1
+                packet_size = self._adaptive_packet_size()
                 packet = self._drain_packet(packet_size)
                 if not packet:
+                    time.sleep(0.02)
                     continue
 
                 self._burst_packet_count += 1
                 self._burst_event_count += len(packet)
-                for queued_event in packet:
-                    self._process_event(queued_event)
+                futures = [self._worker_pool.submit(self._process_event, queued_event) for queued_event in packet]
+                wait(futures)
 
-                if burst_active:
+                if packet_size > 1:
                     time.sleep(0.02)
             except Exception as exc:
                 self.logger.exception("Burst worker loop failed: %s", exc)
                 time.sleep(0.1)
 
-    def _is_burst_window_active(self) -> bool:
-        """Return True when file-modification activity crosses the burst threshold."""
+    def _modification_volume(self) -> int:
+        """Return modification volume within the active burst window."""
         cutoff = time.time() - self._burst_window_seconds
         with self._event_lock:
             while self._recent_modification_timestamps and self._recent_modification_timestamps[0] < cutoff:
                 self._recent_modification_timestamps.popleft()
-            return len(self._recent_modification_timestamps) >= self._burst_threshold
+            return len(self._recent_modification_timestamps)
+
+    def _adaptive_packet_size(self) -> int:
+        """Select packet size based on modification-volume tiers."""
+        volume = self._modification_volume()
+        if volume < self._packet_normal_max:
+            return 1
+        if volume < self._packet_medium_max:
+            return self._packet_medium_size
+        if volume < self._packet_large_max:
+            return self._packet_large_size
+        return self._packet_extreme_size
 
     def _drain_packet(self, packet_size: int) -> List[_QueuedFileEvent]:
-        """Drain up to packet_size queued events, preferring higher-priority work first."""
+        """Drain up to packet_size queued events, preserving priority order."""
         packet: List[_QueuedFileEvent] = []
         while len(packet) < packet_size:
             try:
-                item = self._event_queue.get_nowait()
+                _, _, _, item = self._event_queue.get_nowait()
             except queue.Empty:
                 break
             if item is None:
@@ -1386,26 +1510,9 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             packet.sort(key=lambda item: (item.priority, item.timestamp))
         return packet
 
-    def _should_skip_event(self, queued_event: _QueuedFileEvent) -> bool:
-        """Return True when a low-priority event can be skipped after a process is already suspicious."""
-        event_type_upper = (queued_event.event_type or "").upper()
-        if event_type_upper in {"FILE MODIFIED", "FILE MOVED"}:
-            return False
-
-        if queued_event.process_metadata is None:
-            queued_event.process_metadata = self._process_resolver.resolve(
-                Path(queued_event.src_path),
-                previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
-                event_type=queued_event.event_type,
-            )
-
-        process_state = self.behavior_tracker.get_process_state(queued_event.process_metadata)
-        if process_state is None:
-            return False
-        return process_state.classification in {"Alert", "Suspicious"}
-
     def get_burst_status(self) -> Dict[str, Any]:
         """Return lightweight burst metrics for monitoring and UI status panels."""
+        volume = self._modification_volume()
         with self._event_lock:
             queue_size = self._event_queue.qsize()
             pending_count = len(self._queued_event_keys)
@@ -1416,88 +1523,75 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                 "processing_count": processing_count,
                 "packet_count": self._burst_packet_count,
                 "processed_event_count": self._burst_event_count,
-                "skipped_low_priority_events": self._skipped_low_priority_events,
-                "burst_active": self._is_burst_window_active(),
+                "merged_duplicate_events": self._merged_duplicate_events,
+                "deferred_low_priority_events": self._deferred_low_priority_events,
+                "burst_active": volume >= self._packet_normal_max,
+                "modification_volume": volume,
+                "adaptive_packet_size": self._adaptive_packet_size(),
             }
 
     def stop(self) -> None:
         """Stop the burst worker thread cleanly."""
         self._burst_worker_running = False
-        try:
-            self._event_queue.put_nowait(None)
-        except queue.Full:
-            pass
         if getattr(self, "_burst_worker_thread", None) is not None and self._burst_worker_thread.is_alive():
             self._burst_worker_thread.join(timeout=2.0)
+        self._worker_pool.shutdown(wait=True)
+
+    def enqueue_high_priority_rescan(self, file_paths: List[str], reason: str = "manual") -> None:
+        """Queue a highest-priority rescan task without blocking monitor ingestion."""
+        if not file_paths:
+            return
+        self._enqueue_event(
+            event_type="HIGH_SCORE_RESCAN",
+            src_path=file_paths[0],
+            previous_path=None,
+            process_metadata=None,
+            timestamp=time.time(),
+            payload={"paths": file_paths, "reason": reason},
+        )
 
     def _process_event(self, queued_event: _QueuedFileEvent) -> None:
         """Process one queued filesystem event and notify downstream modules."""
         with self._event_lock:
             self._processing_event_keys.add(queued_event.event_key)
             self._queued_event_keys.discard(queued_event.event_key)
+            if queued_event.event_type.upper() == "FILE MODIFIED":
+                self._modified_event_index.pop(os.path.normcase(str(Path(queued_event.src_path))), None)
 
         try:
+            if queued_event.event_type.upper() in {"HIGH_SCORE_RESCAN", "ENTROPY_RESCAN"}:
+                self._dispatch_high_priority_rescan(queued_event)
+                return
+
             if queued_event.process_metadata is None:
                 queued_event.process_metadata = self._process_resolver.resolve(
                     Path(queued_event.src_path),
                     previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
                     event_type=queued_event.event_type,
                 )
-
-            if self._should_skip_event(queued_event):
-                with self._event_lock:
-                    self._skipped_low_priority_events += 1
-                process_state = self.behavior_tracker.get_process_state(queued_event.process_metadata)
-                self.logger.info(
-                    "[BURST_TRACE][FSM] skipping_low_priority event=%s file=%s classification=%s",
-                    queued_event.event_type,
-                    queued_event.src_path,
-                    process_state.classification if process_state else "unknown",
-                )
-                return
             path = Path(queued_event.src_path)
             event_time = datetime.fromtimestamp(queued_event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
-            self.behavior_tracker.record_event(
+            process_state = self.behavior_tracker.record_event(
                 queued_event.event_type,
                 queued_event.src_path,
                 queued_event.process_metadata,
                 previous_path=queued_event.previous_path,
             )
 
-            output = ["=" * 38]
-            output.append(f"EVENT: {queued_event.event_type}")
-            output.append("")
-            output.append("Time:")
-            output.append(event_time)
-            output.append("")
-            output.append("File:")
             try:
                 resolved_path = str(path.resolve() if path.exists() else path.absolute())
             except Exception:
                 resolved_path = str(path.absolute())
-            output.append(resolved_path)
-            output.append("")
-            output.append("File Name:")
-            output.append(path.name)
-            if queued_event.previous_path:
-                output.append("")
-                output.append("Previous Path:")
-                output.append(queued_event.previous_path)
-            output.append("")
-            output.append("Process:")
-            output.append(queued_event.process_metadata.name or "Unknown")
-            output.append("")
-            output.append("PID:")
-            output.append(str(queued_event.process_metadata.pid) if queued_event.process_metadata.pid else "Unknown")
-            output.append("")
-            output.append("Executable:")
-            output.append(queued_event.process_metadata.executable or "Unknown")
-            output.append("")
-            output.append("Parent Process:")
-            output.append(queued_event.process_metadata.parent_name or "Unknown")
-            output.append("=" * 38)
-            self.logger.info("\n".join(output))
+
+            self.logger.debug(
+                "event=%s time=%s file=%s pid=%s process=%s",
+                queued_event.event_type,
+                event_time,
+                resolved_path,
+                queued_event.process_metadata.pid,
+                queued_event.process_metadata.name,
+            )
 
             self._process_resolver.remember(path, queued_event.process_metadata)
             if queued_event.previous_path:
@@ -1525,11 +1619,62 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                     "[ENTROPY_TRACE][FSM->CALLBACK] event_callback is None; event dropped file=%s",
                     queued_event.src_path,
                 )
+
+            self._maybe_trigger_high_score_rescan(process_state)
         except Exception as exc:
             self.logger.error(f"Failed to process queued filesystem event for {queued_event.src_path}: {exc}", exc_info=True)
         finally:
             with self._event_lock:
                 self._processing_event_keys.discard(queued_event.event_key)
+
+    def _maybe_trigger_high_score_rescan(self, process_state: ProcessState) -> None:
+        """Trigger filesystem-truth entropy rescans for high-score suspicious activity."""
+        if self._high_score_callback is None:
+            return
+        if process_state.score <= self._high_score_threshold:
+            return
+
+        process_key = (process_state.pid, process_state.executable or process_state.process_name or "")
+        unique_files = sorted(process_state.unique_files_touched)
+        now = time.time()
+        previous = self._high_score_rescan_state.get(process_key)
+        if previous is not None:
+            previous_count, previous_ts = previous
+            if len(unique_files) <= previous_count and (now - previous_ts) < self._high_score_cooldown_seconds:
+                return
+
+        self._high_score_rescan_state[process_key] = (len(unique_files), now)
+        packet_size = self._adaptive_packet_size()
+        context = {
+            "pid": process_state.pid,
+            "process": process_state.process_name,
+            "executable": process_state.executable,
+            "score": process_state.score,
+            "reason": "high_score_entropy_rescan",
+        }
+        for index in range(0, len(unique_files), packet_size):
+            packet = unique_files[index : index + packet_size]
+            self._enqueue_event(
+                event_type="HIGH_SCORE_RESCAN",
+                src_path=packet[0],
+                previous_path=None,
+                process_metadata=None,
+                timestamp=time.time(),
+                payload={"paths": packet, "context": context},
+            )
+
+    def _dispatch_high_priority_rescan(self, queued_event: _QueuedFileEvent) -> None:
+        """Dispatch highest-priority entropy rescans to downstream callback."""
+        if self._high_score_callback is None:
+            return
+        payload_paths = queued_event.payload.get("paths") if queued_event.payload else None
+        if not payload_paths:
+            payload_paths = [queued_event.src_path]
+        context = queued_event.payload.get("context", {}) if queued_event.payload else {}
+        try:
+            self._high_score_callback(list(payload_paths), context)
+        except Exception as exc:
+            self.logger.error("Failed high-priority rescan callback: %s", exc, exc_info=True)
 
 
 class FileSystemMonitor:
@@ -1548,6 +1693,7 @@ class FileSystemMonitor:
         recursive: bool,
         logger: logging.Logger,
         event_callback: Optional[Callable] = None,
+        high_score_callback: Optional[Callable[[List[str], Dict[str, Any]], None]] = None,
     ):
         """Initialize the filesystem monitor.
         
@@ -1570,6 +1716,7 @@ class FileSystemMonitor:
             logger=self.logger,
             behavior_tracker=self.behavior_tracker,
             event_callback=event_callback,
+            high_score_callback=high_score_callback,
         )
 
     def start(self) -> None:

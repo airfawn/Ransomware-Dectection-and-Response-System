@@ -21,6 +21,7 @@ import threading
 import queue
 import shutil
 import json
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
@@ -153,6 +154,9 @@ class RawOutputWindow(QMainWindow):
         self.output_area.setReadOnly(True)
         self.output_area.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.output_area.setFont(QFont("Courier", 9))
+        self.output_area.setStyleSheet(
+            "QPlainTextEdit { background: #11151f; color: #f0f0f0; selection-background-color: #2f3f58; selection-color: #ffffff; }"
+        )
 
         self.setCentralWidget(self.output_area)
 
@@ -184,6 +188,9 @@ class EventDetailsDialog(QDialog):
         text_edit.setReadOnly(True)
         text_edit.setFont(QFont("Courier", 11))
         text_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        text_edit.setStyleSheet(
+            "QPlainTextEdit { background: #11151f; color: #f0f0f0; selection-background-color: #2f3f58; selection-color: #ffffff; }"
+        )
         self._entry = dict(entry)
 
         raw_event = entry.get("raw_event", "")
@@ -736,13 +743,20 @@ class RdrsGui(QWidget):
         self.runtime_timer.setInterval(1000)
         self.runtime_timer.timeout.connect(self._update_runtime_display)
         self._ui_refresh_timer = QTimer(self)
-        self._ui_refresh_timer.setInterval(200)
+        if _CONFIG_AVAILABLE:
+            refresh_ms = int(get_config().monitoring.gui_refresh_interval_ms)
+            refresh_ms = max(200, min(500, refresh_ms))
+        else:
+            refresh_ms = 300
+        self._ui_refresh_timer.setInterval(refresh_ms)
         self._ui_refresh_timer.timeout.connect(self._flush_pending_gui_updates)
         self._pending_log_refresh = False
         self._pending_counter_refresh = False
         self._pending_process_state_refresh = False
         self._pending_suspicious_refresh = False
         self._pending_metrics_refresh = False
+        self._pending_total_events_refresh = False
+        self._filesystem_event_gui_queue: "queue.Queue[dict]" = queue.Queue(maxsize=10000)
         self._ui_refresh_timer.start()
         self.output_bridge = OutputBridge()
         self.output_bridge.new_raw_line.connect(self._handle_monitor_line)
@@ -765,6 +779,7 @@ class RdrsGui(QWidget):
         self._log_db_event_queue: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
         self._log_db_writer_running = False
         self._log_db_writer_thread: Optional[threading.Thread] = None
+        self._log_db_writer_pool: Optional[ThreadPoolExecutor] = None
 
         # --- Alert banner state -------------------------------------------
         self._alert_banner_visible: bool = False
@@ -828,6 +843,12 @@ class RdrsGui(QWidget):
         self.home_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.home_button)
 
+        self.incident_button = QPushButton("▶ Incident Details")
+        self.incident_button.clicked.connect(lambda: self.select_page(5))
+        self.incident_button.setEnabled(False)
+        self.incident_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
+        sidebar_layout.addWidget(self.incident_button)
+
         self.monitoring_button = QPushButton("▶ File Monitoring")
         self.monitoring_button.clicked.connect(lambda: self.select_page(1))
         self.monitoring_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
@@ -884,9 +905,14 @@ class RdrsGui(QWidget):
         home_layout.setSpacing(14)
         self.home_page.setLayout(home_layout)
 
-        home_title = QLabel("Suspicious Behaviour")
+        home_title = QLabel("Suspicious Processes")
         home_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
         home_layout.addWidget(home_title)
+
+        home_subtitle = QLabel("Review high-risk processes and open Incident Details for full forensic context.")
+        home_subtitle.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        home_subtitle.setWordWrap(True)
+        home_layout.addWidget(home_subtitle)
 
         dashboard_stats = QHBoxLayout()
         dashboard_stats.setSpacing(12)
@@ -944,7 +970,7 @@ class RdrsGui(QWidget):
 
         btn_ignore = QPushButton("Ignore")
         btn_ignore.setStyleSheet(_btn_style)
-        btn_ignore.clicked.connect(self._dismiss_alert_banner)
+        btn_ignore.clicked.connect(self._on_ignore_alert_process)
         alert_banner_layout.addWidget(btn_ignore)
 
         btn_quarantine = QPushButton("Quarantine")
@@ -976,13 +1002,14 @@ class RdrsGui(QWidget):
         self.alert_banner.setVisible(False)
         home_layout.addWidget(self.alert_banner)
 
-        self.home_table = QTableWidget(0, 5)
+        self.home_table = QTableWidget(0, 6)
         self.home_table.setHorizontalHeaderLabels([
             "Process Name",
             "PID",
             "Suspicion Score",
             "Severity",
             "Detection Time",
+            "Current Status",
         ])
         self.home_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.home_table.horizontalHeader().setStretchLastSection(False)
@@ -1017,7 +1044,7 @@ class RdrsGui(QWidget):
         self.home_action_buttons.addWidget(self.home_export_button)
 
         self.home_selection_hint = QLabel(
-            "Select a suspicious process above and click View Incident Details to inspect the detection in depth."
+            "Select a suspicious process and open Incident Details to review timeline, affected files, and response actions."
         )
         self.home_selection_hint.setWordWrap(True)
         self.home_selection_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
@@ -1417,6 +1444,181 @@ class RdrsGui(QWidget):
 
         self.page_stack.addWidget(self.rules_page)
 
+        self.incident_page = QWidget()
+        incident_layout = QVBoxLayout()
+        incident_layout.setContentsMargins(24, 24, 24, 24)
+        incident_layout.setSpacing(12)
+        self.incident_page.setLayout(incident_layout)
+
+        incident_header_row = QHBoxLayout()
+        incident_header_row.setSpacing(10)
+
+        self.incident_back_button = QPushButton("← Back To Home")
+        self.incident_back_button.setStyleSheet(
+            "background: #2f3a59; color: #ffffff; font-weight: bold; padding: 8px 12px; border-radius: 6px;"
+        )
+        self.incident_back_button.clicked.connect(lambda: self.select_page(0))
+        incident_header_row.addWidget(self.incident_back_button)
+
+        incident_title = QLabel("Incident Details")
+        incident_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
+        incident_header_row.addWidget(incident_title)
+        incident_header_row.addStretch()
+
+        self.incident_quarantine_button = QPushButton("Quarantine Process")
+        self.incident_quarantine_button.setStyleSheet(
+            "QPushButton { background: #b36b00; color: white; font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
+            "QPushButton:hover { background: #cc7a00; }"
+        )
+        self.incident_quarantine_button.clicked.connect(self._on_quarantine_alert_process)
+        incident_header_row.addWidget(self.incident_quarantine_button)
+
+        self.incident_ignore_button = QPushButton("Ignore Detection")
+        self.incident_ignore_button.setStyleSheet(
+            "QPushButton { background: #5a1a1a; color: white; font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
+            "QPushButton:hover { background: #6f2222; }"
+        )
+        self.incident_ignore_button.clicked.connect(self._on_ignore_alert_process)
+        incident_header_row.addWidget(self.incident_ignore_button)
+
+        self.incident_terminate_button = QPushButton("Remove / Terminate Process")
+        self.incident_terminate_button.setStyleSheet(
+            "QPushButton { background: #a00000; color: white; font-weight: bold; padding: 8px 12px; border-radius: 6px; }"
+            "QPushButton:hover { background: #c00000; }"
+        )
+        self.incident_terminate_button.clicked.connect(self._on_delete_alert_process)
+        incident_header_row.addWidget(self.incident_terminate_button)
+
+        incident_layout.addLayout(incident_header_row)
+
+        self.incident_context_hint = QLabel("Select a suspicious process from Home to view this page.")
+        self.incident_context_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        self.incident_context_hint.setWordWrap(True)
+        incident_layout.addWidget(self.incident_context_hint)
+
+        summary_frame = QFrame()
+        summary_frame.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }")
+        summary_layout = QVBoxLayout()
+        summary_layout.setContentsMargins(12, 12, 12, 12)
+        summary_layout.setSpacing(6)
+        summary_frame.setLayout(summary_layout)
+
+        summary_title = QLabel("Incident Summary")
+        summary_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        summary_layout.addWidget(summary_title)
+
+        self.incident_summary_labels = {}
+        for title, key in [
+            ("Process Name", "process"),
+            ("PID", "pid"),
+            ("Detection Time", "detection_time"),
+            ("Severity", "severity"),
+            ("Final Suspicion Score", "score"),
+            ("Current Status", "status"),
+        ]:
+            label = QLabel(f"{title}: —")
+            label.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
+            label.setWordWrap(True)
+            self.incident_summary_labels[key] = label
+            summary_layout.addWidget(label)
+
+        incident_layout.addWidget(summary_frame)
+
+        detail_split = QSplitter(Qt.Horizontal)
+        detail_split.setChildrenCollapsible(False)
+        detail_split.setHandleWidth(8)
+
+        timeline_container = QFrame()
+        timeline_container.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }")
+        timeline_layout = QVBoxLayout()
+        timeline_layout.setContentsMargins(12, 12, 12, 12)
+        timeline_layout.setSpacing(8)
+        timeline_container.setLayout(timeline_layout)
+        timeline_title = QLabel("Detection Timeline")
+        timeline_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        timeline_layout.addWidget(timeline_title)
+
+        self.incident_timeline_table = QTableWidget(0, 5)
+        self.incident_timeline_table.setHorizontalHeaderLabels([
+            "Time",
+            "Event",
+            "File",
+            "Rule",
+            "Details",
+        ])
+        self.incident_timeline_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.incident_timeline_table.horizontalHeader().setStretchLastSection(False)
+        self.incident_timeline_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.incident_timeline_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.incident_timeline_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.incident_timeline_table.setAlternatingRowColors(True)
+        timeline_layout.addWidget(self.incident_timeline_table)
+        detail_split.addWidget(timeline_container)
+
+        right_panel = QFrame()
+        right_panel.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }")
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(10)
+        right_panel.setLayout(right_layout)
+
+        affected_title = QLabel("Affected Files")
+        affected_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        right_layout.addWidget(affected_title)
+
+        self.incident_files_table = QTableWidget(0, 4)
+        self.incident_files_table.setHorizontalHeaderLabels([
+            "File Path",
+            "Extension Change",
+            "Entropy Change",
+            "Last Event",
+        ])
+        self.incident_files_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.incident_files_table.horizontalHeader().setStretchLastSection(False)
+        self.incident_files_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.incident_files_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.incident_files_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.incident_files_table.setAlternatingRowColors(True)
+        right_layout.addWidget(self.incident_files_table)
+
+        behavior_title = QLabel("Behavior Breakdown")
+        behavior_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        right_layout.addWidget(behavior_title)
+
+        self.incident_behavior_table = QTableWidget(0, 3)
+        self.incident_behavior_table.setHorizontalHeaderLabels([
+            "Rule",
+            "Score",
+            "Reasoning",
+        ])
+        self.incident_behavior_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.incident_behavior_table.horizontalHeader().setStretchLastSection(False)
+        self.incident_behavior_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.incident_behavior_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.incident_behavior_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.incident_behavior_table.setAlternatingRowColors(True)
+        right_layout.addWidget(self.incident_behavior_table)
+
+        self.incident_total_score_label = QLabel("Total Score: 0")
+        self.incident_total_score_label.setStyleSheet("color: #ffffff; font-size: 11pt; font-weight: bold;")
+        right_layout.addWidget(self.incident_total_score_label)
+
+        executive_title = QLabel("Executive Summary")
+        executive_title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #ffffff;")
+        right_layout.addWidget(executive_title)
+
+        self.incident_executive_summary = QLabel("No incident selected.")
+        self.incident_executive_summary.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
+        self.incident_executive_summary.setWordWrap(True)
+        right_layout.addWidget(self.incident_executive_summary)
+        right_layout.addStretch()
+
+        detail_split.addWidget(right_panel)
+        detail_split.setSizes([900, 720])
+        incident_layout.addWidget(detail_split, 1)
+
+        self.page_stack.addWidget(self.incident_page)
+
         bottom_bar = QWidget()
         bottom_layout = QHBoxLayout()
         bottom_layout.setContentsMargins(18, 12, 18, 12)
@@ -1479,6 +1681,9 @@ class RdrsGui(QWidget):
             self.inactive_process_table,
             self.entropy_table,
             self.rules_table,
+            self.incident_timeline_table,
+            self.incident_files_table,
+            self.incident_behavior_table,
         ]
         for table in tables:
             table.setFont(QFont("Segoe UI", 11))
@@ -1511,6 +1716,7 @@ class RdrsGui(QWidget):
         self.home_table.setColumnWidth(2, 140)
         self.home_table.setColumnWidth(3, 120)
         self.home_table.setColumnWidth(4, 220)
+        self.home_table.setColumnWidth(5, 170)
         if hasattr(self, "home_response_table"):
             self.home_response_table.setColumnWidth(0, 170)
             self.home_response_table.setColumnWidth(1, 120)
@@ -1542,6 +1748,21 @@ class RdrsGui(QWidget):
         self.rules_table.setColumnWidth(2, 90)
         self.rules_table.setColumnWidth(3, 100)
 
+        self.incident_timeline_table.setColumnWidth(0, 170)
+        self.incident_timeline_table.setColumnWidth(1, 180)
+        self.incident_timeline_table.setColumnWidth(2, 330)
+        self.incident_timeline_table.setColumnWidth(3, 190)
+        self.incident_timeline_table.setColumnWidth(4, 450)
+
+        self.incident_files_table.setColumnWidth(0, 420)
+        self.incident_files_table.setColumnWidth(1, 170)
+        self.incident_files_table.setColumnWidth(2, 150)
+        self.incident_files_table.setColumnWidth(3, 220)
+
+        self.incident_behavior_table.setColumnWidth(0, 220)
+        self.incident_behavior_table.setColumnWidth(1, 90)
+        self.incident_behavior_table.setColumnWidth(2, 450)
+
     def _resize_entropy_columns(self) -> None:
         """Keep File Name at ~45% while sizing other columns to content."""
         available = max(400, self.entropy_table.viewport().width())
@@ -1571,12 +1792,14 @@ class RdrsGui(QWidget):
         )
 
         self.home_button.setStyleSheet(_inactive)
+        self.incident_button.setStyleSheet(_inactive)
         self.monitoring_button.setStyleSheet(_inactive)
         self.processes_button.setStyleSheet(_inactive)
         self.entropy_button.setStyleSheet(_inactive)
         self.rules_button.setStyleSheet(_inactive)
 
         self.home_button.setText("▶ Home")
+        self.incident_button.setText("▶ Incident Details")
         self.monitoring_button.setText("▶ File Monitoring")
         self.processes_button.setText("▶ Processes")
         self.entropy_button.setText("▶ Entropy Monitor")
@@ -1585,6 +1808,9 @@ class RdrsGui(QWidget):
         if index == 0:
             self.home_button.setText("▼ Home")
             self.home_button.setStyleSheet(_active)
+        elif index == 5:
+            self.incident_button.setText("▼ Incident Details")
+            self.incident_button.setStyleSheet(_active)
         elif index == 1:
             self.monitoring_button.setText("▼ File Monitoring")
             self.monitoring_button.setStyleSheet(_active)
@@ -1880,6 +2106,7 @@ class RdrsGui(QWidget):
             emit_started=self.output_bridge.process_started.emit,
             emit_stopped=self._on_monitor_stopped,
             event_callback=self._on_filesystem_event,
+            high_score_callback=self._on_high_score_rescan_requested,
         )
 
         if not self.monitor_session.start():
@@ -1907,6 +2134,7 @@ class RdrsGui(QWidget):
         This callback runs on watchdog's observer thread. It must stay light:
         - persist event to logs.db (best effort)
         - forward event to EntropyMonitor (if active)
+        - enqueue a lightweight GUI event for batched rendering
         """
         logger.info(
             "[ENTROPY_TRACE][GUI_CALLBACK] recv event=%s file=%s pid=%s proc=%s entropy_monitor=%s",
@@ -1966,6 +2194,27 @@ class RdrsGui(QWidget):
                 event_type,
                 file_path,
             )
+
+        try:
+            self._filesystem_event_gui_queue.put_nowait(
+                {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "level": "INFO",
+                    "event_type": event_type,
+                    "file": file_path,
+                    "file_name": Path(file_path).name,
+                    "process": process_name or "",
+                    "pid": str(pid) if pid is not None else "",
+                    "executable": executable or "",
+                    "parent_process": parent or "",
+                    "message": (
+                        f"Renamed from {previous_path}" if previous_path and "MOVE" in event_type.upper() else ""
+                    ),
+                    "raw_event": "",
+                }
+            )
+        except queue.Full:
+            logger.warning("GUI event queue full; dropped event=%s file=%s", event_type, file_path)
 
     def _on_set_entropy_directory_clicked(self) -> None:
         """Rebuild entropy database asynchronously when entropy root changes."""
@@ -2154,6 +2403,13 @@ class RdrsGui(QWidget):
         if self._log_db_writer_thread is not None and self._log_db_writer_thread.is_alive():
             return
         self._log_db_writer_running = True
+        pool_size = 2
+        if _CONFIG_AVAILABLE:
+            pool_size = max(1, int(get_config().database.log_writer_pool_size))
+        self._log_db_writer_pool = ThreadPoolExecutor(
+            max_workers=pool_size,
+            thread_name_prefix="rdrs-log-db",
+        )
         self._log_db_writer_thread = threading.Thread(
             target=self._log_db_writer_loop,
             name="rdrs-log-db-writer",
@@ -2167,12 +2423,16 @@ class RdrsGui(QWidget):
             self._log_db_event_queue.put(None)
             self._log_db_writer_thread.join(timeout=2.0)
             self._log_db_writer_thread = None
+        if self._log_db_writer_pool is not None:
+            self._log_db_writer_pool.shutdown(wait=True)
+            self._log_db_writer_pool = None
 
     def _log_db_writer_loop(self) -> None:
         if self._logs_db is None:
             return
 
         batch = []
+        in_flight = []
         while self._log_db_writer_running or not self._log_db_event_queue.empty():
             try:
                 item = self._log_db_event_queue.get(timeout=0.25)
@@ -2181,7 +2441,10 @@ class RdrsGui(QWidget):
 
             if item is None:
                 if batch:
-                    self._flush_log_db_batch(batch)
+                    if self._log_db_writer_pool is not None:
+                        in_flight.append(self._log_db_writer_pool.submit(self._flush_log_db_batch, list(batch)))
+                    else:
+                        self._flush_log_db_batch(batch)
                     batch = []
                 if not self._log_db_writer_running:
                     break
@@ -2189,42 +2452,43 @@ class RdrsGui(QWidget):
 
             batch.append(item)
             if len(batch) >= 50:
-                self._flush_log_db_batch(batch)
+                if self._log_db_writer_pool is not None:
+                    in_flight.append(self._log_db_writer_pool.submit(self._flush_log_db_batch, list(batch)))
+                else:
+                    self._flush_log_db_batch(batch)
                 batch = []
 
         if batch:
-            self._flush_log_db_batch(batch)
+            if self._log_db_writer_pool is not None:
+                in_flight.append(self._log_db_writer_pool.submit(self._flush_log_db_batch, list(batch)))
+            else:
+                self._flush_log_db_batch(batch)
+        if in_flight:
+            wait(in_flight)
 
     def _flush_log_db_batch(self, batch: List[dict]) -> None:
         if self._logs_db is None or not batch:
             return
-
-        params = []
-        for item in batch:
-            params.append(
-                (
-                    item.get("timestamp") or time.time(),
-                    item.get("event_type", ""),
-                    item.get("file_path", ""),
-                    item.get("file_name", ""),
-                    item.get("process"),
-                    item.get("pid"),
-                    item.get("executable"),
-                    item.get("parent"),
-                )
-            )
         try:
-            self._logs_db.executemany(
-                """
-                INSERT INTO file_events
-                    (timestamp, event_type, file_path, file_name, process, pid, executable, parent)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                params,
-                commit=True,
-            )
+            self._logs_db.log_events_batch(batch)
         except Exception:
             logger.exception("Failed to write batched log events to logs.db")
+
+    def _on_high_score_rescan_requested(self, file_paths: List[str], context: Dict[str, object]) -> None:
+        """Queue highest-priority filesystem-truth entropy rescans from monitor workers."""
+        if self._entropy_monitor is None or not file_paths:
+            return
+        try:
+            paths = [Path(path) for path in file_paths]
+            self._entropy_monitor.queue_rescan_for_paths(paths)
+            logger.info(
+                "Queued high-score entropy rescan for %s files (pid=%s score=%s)",
+                len(paths),
+                context.get("pid"),
+                context.get("score"),
+            )
+        except Exception:
+            logger.exception("Failed to queue high-score entropy rescan.")
 
     def handle_error(self, message: str) -> None:
         self.output_bridge.error_occurred.emit(message)
@@ -2245,16 +2509,17 @@ class RdrsGui(QWidget):
             self._update_process_state_table(entry)
             return
 
+        if str(entry.get("event_type") or "").upper().startswith("FILE "):
+            return
+
         if entry.get("event_type") == "EXTENSION_CHANGE":
             self._persist_extension_change(entry)
 
         self.event_rows.append(entry)
+        self._trim_gui_event_cache()
 
         self.event_count += 1
-        try:
-            self.total_events_label.setText(f"Total events: {self.event_count}")
-        except Exception:
-            pass
+        self._pending_total_events_refresh = True
 
         self._pending_log_refresh = True
         self._pending_counter_refresh = True
@@ -2325,12 +2590,12 @@ class RdrsGui(QWidget):
         self._refresh_file_event_counters()
 
     def _load_persisted_response_actions(self, limit: int = 200) -> None:
-        """Load persisted quarantine/delete action history from alerts.db."""
+        """Load persisted response-action history from alerts.db."""
         if self._alerts_db is None:
             return
 
         loaded_rows = []
-        for action_type in ("QUARANTINE_ACTION", "DELETE_ACTION"):
+        for action_type in ("QUARANTINE_ACTION", "DELETE_ACTION", "IGNORE_ACTION"):
             try:
                 rows = self._alerts_db.get_by_type(action_type, limit=limit)
             except Exception:
@@ -2349,7 +2614,13 @@ class RdrsGui(QWidget):
                     "timestamp": datetime.fromtimestamp(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
                     "timestamp_epoch": row["timestamp"],
                     "action_type": row["alert_type"] or action_type,
-                    "action_label": "Quarantine" if (row["alert_type"] or action_type) == "QUARANTINE_ACTION" else "Delete",
+                    "action_label": (
+                        "Quarantine"
+                        if (row["alert_type"] or action_type) == "QUARANTINE_ACTION"
+                        else "Ignore"
+                        if (row["alert_type"] or action_type) == "IGNORE_ACTION"
+                        else "Remove / Terminate"
+                    ),
                     "status": payload.get("status", "SUCCEEDED"),
                     "process": row["process_name"] or "",
                     "pid": str(row["pid"]) if row["pid"] is not None else "",
@@ -2385,6 +2656,8 @@ class RdrsGui(QWidget):
     def _incident_status_for(self, process_entry: dict, action_rows: List[dict]) -> str:
         if action_rows:
             latest = action_rows[-1]
+            if latest.get("action_type") == "IGNORE_ACTION" and latest.get("status") == "SUCCEEDED":
+                return "Ignored"
             if latest.get("status") == "SUCCEEDED":
                 return "Contained" if latest.get("action_type") == "QUARANTINE_ACTION" else "Removed"
             if latest.get("status") == "FAILED":
@@ -2448,65 +2721,13 @@ class RdrsGui(QWidget):
             "containment_actions": actions,
         }
 
-    def _clear_home_incident_panel(self) -> None:
-        self._selected_home_process_key = None
-        self.home_export_button.setEnabled(False)
-        self.home_incident_hint.setVisible(True)
-        self.home_response_hint.setVisible(True)
-        for key, label in self.home_incident_labels.items():
-            title = key.replace("_", " ").title()
-            if key == "pid":
-                title = "PID"
-            elif key == "score":
-                title = "Threat Score"
-            elif key == "process":
-                title = "Suspected Process"
-            elif key == "reason":
-                title = "Why Flagged"
-            elif key == "first_seen":
-                title = "First Seen"
-            elif key == "last_seen":
-                title = "Last Seen"
-            elif key == "status":
-                title = "Current Status"
-            elif key == "response":
-                title = "Response Taken"
-            label.setText(f"{title}: —")
-        self.home_response_table.setRowCount(0)
-
-    def _refresh_home_response_table(self, process_key: Tuple[Optional[str], str]) -> None:
-        actions = self._response_actions_for_process(process_key)
-        self.home_response_table.setRowCount(0)
-        self.home_response_hint.setVisible(not actions)
-        if not actions:
-            return
-
-        for action in actions:
-            row = self.home_response_table.rowCount()
-            self.home_response_table.insertRow(row)
-            values = [
-                action.get("timestamp", ""),
-                action.get("action_label", ""),
-                action.get("result_path") or action.get("source_path") or "",
-                action.get("status", ""),
-                action.get("message") or action.get("termination_status") or "",
-            ]
-            for col_index, value in enumerate(values):
-                item = QTableWidgetItem(str(value or ""))
-                if col_index == 3:
-                    status_value = str(action.get("status", "")).upper()
-                    if status_value == "SUCCEEDED":
-                        item.setForeground(QBrush(QColor("#00c853")))
-                    elif status_value == "FAILED":
-                        item.setForeground(QBrush(QColor("#ff5252")))
-                self.home_response_table.setItem(row, col_index, item)
-
     def _on_home_selection_changed(self) -> None:
         selected_items = self.home_table.selectedItems()
         if not selected_items:
             self._selected_home_process_key = None
             self.home_details_button.setEnabled(False)
             self.home_export_button.setEnabled(False)
+            self.incident_button.setEnabled(False)
             self.home_selection_hint.setText(
                 "Select a suspicious process above and click View Incident Details to inspect the detection in depth."
             )
@@ -2518,11 +2739,13 @@ class RdrsGui(QWidget):
             self._selected_home_process_key = None
             self.home_details_button.setEnabled(False)
             self.home_export_button.setEnabled(False)
+            self.incident_button.setEnabled(False)
             return
 
         self._selected_home_process_key = process_key
         self.home_details_button.setEnabled(True)
         self.home_export_button.setEnabled(True)
+        self.incident_button.setEnabled(True)
         self.home_selection_hint.setText(
             "Click View Incident Details to open the dedicated incident report for the selected process."
         )
@@ -2536,9 +2759,122 @@ class RdrsGui(QWidget):
         if process_data is None:
             self.show_error("Selected process no longer exists.")
             return
+        self._populate_incident_page(self._selected_home_process_key)
+        self.select_page(5)
 
-        details_dialog = ProcessDetailsDialog(self, process_data, self._selected_home_process_key)
-        details_dialog.show()
+    def _severity_for_score(self, score_value: int) -> str:
+        if score_value >= 80:
+            return "Critical"
+        if score_value >= 50:
+            return "High"
+        if score_value > 0:
+            return "Suspicious"
+        return "Observed"
+
+    def _populate_incident_page(self, process_key: Tuple[Optional[str], str]) -> None:
+        process_entry = self.process_state_cache.get(process_key, {}).copy()
+        detection_entry = self.suspicious_process_entries.get(process_key, {}).copy()
+        if not process_entry and not detection_entry:
+            return
+
+        combined = process_entry.copy()
+        combined.update({k: v for k, v in detection_entry.items() if v not in (None, "")})
+
+        try:
+            score_value = int(str(combined.get("score") or "0"))
+        except Exception:
+            score_value = 0
+
+        timeline_rows: List[dict] = []
+        pid = str(process_key[0] or "")
+        executable = str(process_key[1] or "")
+        process_name = str(combined.get("process") or "")
+        for row in self.event_rows:
+            row_pid = str(row.get("pid") or "")
+            row_exe = str(row.get("executable") or "")
+            row_process = str(row.get("process") or "")
+            if (pid and row_pid == pid) or (executable and row_exe == executable) or (process_name and row_process == process_name):
+                timeline_rows.append(row)
+
+        timeline_rows.sort(key=lambda item: str(item.get("timestamp") or ""))
+
+        status = self._incident_status_for(combined, self._response_actions_for_process(process_key))
+        detection_time = (
+            combined.get("timestamp")
+            or combined.get("first_activity")
+            or combined.get("last_activity")
+            or "Unknown"
+        )
+        self.incident_summary_labels["process"].setText(f"Process Name: {combined.get('process') or 'Unknown process'}")
+        self.incident_summary_labels["pid"].setText(f"PID: {combined.get('pid') or 'Unknown'}")
+        self.incident_summary_labels["detection_time"].setText(f"Detection Time: {detection_time}")
+        self.incident_summary_labels["severity"].setText(f"Severity: {self._severity_for_score(score_value)}")
+        self.incident_summary_labels["score"].setText(f"Final Suspicion Score: {score_value}")
+        self.incident_summary_labels["status"].setText(f"Current Status: {status}")
+
+        self.incident_timeline_table.setSortingEnabled(False)
+        self.incident_timeline_table.setRowCount(0)
+        for row in timeline_rows:
+            idx = self.incident_timeline_table.rowCount()
+            self.incident_timeline_table.insertRow(idx)
+            event_type = str(row.get("event_type") or "")
+            message = str(row.get("message") or row.get("reason") or "")
+            rule = ""
+            rule_match = re.search(r"(Rule[0-9]+_[A-Za-z0-9_]+|EntropyIncrease)", message)
+            if rule_match:
+                rule = rule_match.group(1)
+            items = [
+                str(row.get("timestamp") or ""),
+                event_type,
+                str(row.get("file") or row.get("file_path") or row.get("file_name") or ""),
+                rule,
+                message,
+            ]
+            for col, value in enumerate(items):
+                self.incident_timeline_table.setItem(idx, col, QTableWidgetItem(value))
+        self.incident_timeline_table.setSortingEnabled(True)
+
+        files: Dict[str, dict] = {}
+        for row in timeline_rows:
+            path = str(row.get("file") or row.get("file_path") or "").strip()
+            if not path:
+                continue
+            item = files.setdefault(path, {"ext": "No", "entropy": "No", "last": ""})
+            event_type = str(row.get("event_type") or "").upper()
+            if event_type == "EXTENSION_CHANGE":
+                item["ext"] = "Yes"
+            if event_type == "ENTROPY_ALERT" or "ENTROPY" in str(row.get("message") or "").upper():
+                item["entropy"] = "Yes"
+            item["last"] = str(row.get("timestamp") or item["last"])
+
+        self.incident_files_table.setSortingEnabled(False)
+        self.incident_files_table.setRowCount(0)
+        for path, payload in files.items():
+            idx = self.incident_files_table.rowCount()
+            self.incident_files_table.insertRow(idx)
+            values = [path, payload["ext"], payload["entropy"], payload["last"]]
+            for col, value in enumerate(values):
+                self.incident_files_table.setItem(idx, col, QTableWidgetItem(value))
+        self.incident_files_table.setSortingEnabled(True)
+
+        reason = str(combined.get("reason") or "Behavioral thresholds exceeded.")
+        self.incident_behavior_table.setRowCount(0)
+        self.incident_behavior_table.insertRow(0)
+        self.incident_behavior_table.setItem(0, 0, QTableWidgetItem("Detection Rules"))
+        self.incident_behavior_table.setItem(0, 1, QTableWidgetItem(str(score_value)))
+        self.incident_behavior_table.setItem(0, 2, QTableWidgetItem(reason))
+        self.incident_total_score_label.setText(f"Total Score: {score_value}")
+
+        self.incident_executive_summary.setText(
+            f"Process {combined.get('process') or 'Unknown process'} (PID {combined.get('pid') or 'Unknown'}) "
+            f"was classified as {self._severity_for_score(score_value)} with a final score of {score_value}. "
+            f"The decision was driven by: {reason}. Current status is {status}."
+        )
+
+        self.incident_context_hint.setText(
+            "Timeline includes extension changes, file activity bursts, entropy detections, and triggered rules in chronological order."
+        )
+        self.incident_button.setEnabled(True)
 
     def _export_selected_home_incident_json(self) -> None:
         if self._selected_home_process_key is None:
@@ -2638,13 +2974,22 @@ class RdrsGui(QWidget):
         return bool(re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (INFO|ERROR|WARNING|DEBUG|CRITICAL)\b", line))
 
     def _emit_log_entry(self, lines: List[str]) -> None:
+        raw_text = "\n".join(lines)
+        if "EVENT:" in raw_text and "[Detection]" not in raw_text and "[ProcessState]" not in raw_text and "[ExtensionChange]" not in raw_text:
+            return
+
         entry = self._parse_logger_entry(lines)
         entry["raw_event"] = "\n".join(lines)
         # Try to enrich the record (best-effort; never blocks the monitor).
-        try:
-            self._enrich_record(entry)
-        except Exception:
-            pass
+        if not str(entry.get("event_type") or "").upper().startswith("FILE "):
+            try:
+                self._enrich_record(entry)
+            except Exception:
+                pass
+
+        if str(entry.get("event_type") or "").upper().startswith("FILE "):
+            return
+
         self.output_bridge.new_log_entry.emit(entry)
 
     def _enrich_record(self, record: dict) -> None:
@@ -3076,13 +3421,16 @@ class RdrsGui(QWidget):
                 score_int = int(score)
             except Exception:
                 score_int = 0
-            severity = "Critical" if score_int >= 80 else "High" if score_int >= 50 else "Suspicious"
+            severity = self._severity_for_score(score_int)
+            status = self._incident_status_for(entry, self._response_actions_for_process(key))
+            detection_time = entry.get("timestamp") or entry.get("last_activity") or ""
             values = [
                 entry.get("process", ""),
                 entry.get("pid", ""),
                 str(score),
                 severity,
-                entry.get("last_activity", ""),
+                detection_time,
+                status,
             ]
             for col_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -3100,6 +3448,22 @@ class RdrsGui(QWidget):
         self.home_table.setSortingEnabled(True)
 
     def _flush_pending_gui_updates(self) -> None:
+        drained_events = 0
+        while drained_events < 800:
+            try:
+                entry = self._filesystem_event_gui_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.event_rows.append(entry)
+            self.event_count += 1
+            drained_events += 1
+
+        if drained_events:
+            self._trim_gui_event_cache()
+            self._pending_log_refresh = True
+            self._pending_counter_refresh = True
+            self._pending_total_events_refresh = True
+
         if self._pending_suspicious_refresh:
             self._refresh_suspicious_process_table()
             self._pending_suspicious_refresh = False
@@ -3119,6 +3483,13 @@ class RdrsGui(QWidget):
         if self._pending_metrics_refresh:
             self._refresh_dashboard_metrics()
             self._pending_metrics_refresh = False
+
+        if self._pending_total_events_refresh:
+            self.total_events_label.setText(f"Total events: {self.event_count}")
+            self._pending_total_events_refresh = False
+
+        if self.page_stack.currentIndex() == 5 and self._selected_home_process_key is not None:
+            self._populate_incident_page(self._selected_home_process_key)
 
     def _refresh_dashboard_metrics(self) -> None:
         """Refresh the summary cards on the Home dashboard."""
@@ -3151,6 +3522,17 @@ class RdrsGui(QWidget):
             label = self.dashboard_metric_labels.get(key)
             if label is not None:
                 label.setText(value)
+
+    def _trim_gui_event_cache(self) -> None:
+        """Bound UI-side event cache size; full history stays in logs.db."""
+        if _CONFIG_AVAILABLE:
+            max_rows = max(500, int(get_config().monitoring.max_gui_events_displayed))
+        else:
+            max_rows = 5000
+        if len(self.event_rows) <= max_rows:
+            return
+        overflow = len(self.event_rows) - max_rows
+        del self.event_rows[:overflow]
 
     def _refresh_log_table_view(self) -> None:
         """Apply search and type filters to the File Monitoring table."""
@@ -3306,6 +3688,26 @@ class RdrsGui(QWidget):
         if process_name:
             msg += f"  ·  Process: {process_name}"
         self._show_alert_banner(msg)
+        self.event_rows.append(
+            {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "level": "WARNING",
+                "event_type": "ENTROPY_ALERT",
+                "file": file_path,
+                "file_name": Path(file_path).name,
+                "process": process_name,
+                "pid": "",
+                "executable": "",
+                "parent_process": "",
+                "message": f"Entropy increased from {previous_entropy:.3f} to {current_entropy:.3f} (delta {delta:.3f})",
+                "raw_event": "",
+            }
+        )
+        self._trim_gui_event_cache()
+        self.event_count += 1
+        self._pending_log_refresh = True
+        self._pending_counter_refresh = True
+        self._pending_total_events_refresh = True
 
     def _show_alert_banner(self, message: str) -> None:
         """Display the red alert banner on the Home page.
@@ -3336,19 +3738,29 @@ class RdrsGui(QWidget):
         Returns:
             Process-state dict or None when no process is available.
         """
-        selected_items = self.home_table.selectedItems() if hasattr(self, "home_table") else []
+        state = self.__dict__
+        selected_process_key = state.get("_selected_home_process_key")
+        process_state_cache = state.get("process_state_cache", {})
+        if selected_process_key is not None:
+            selected_target = process_state_cache.get(selected_process_key)
+            if selected_target is not None:
+                return selected_target
+
+        home_table = state.get("home_table")
+        selected_items = home_table.selectedItems() if home_table is not None else []
         if selected_items:
             row = selected_items[0].row()
-            for key, mapped_row in self.suspicious_process_rows.items():
+            for key, mapped_row in state.get("suspicious_process_rows", {}).items():
                 if mapped_row == row:
-                    return self.process_state_cache.get(key)
+                    return process_state_cache.get(key)
 
-        if self._last_alert_process_key is not None:
-            target = self.process_state_cache.get(self._last_alert_process_key)
+        last_alert_key = state.get("_last_alert_process_key")
+        if last_alert_key is not None:
+            target = process_state_cache.get(last_alert_key)
             if target is not None:
                 return target
 
-        if not self.process_state_cache:
+        if not process_state_cache:
             return None
 
         def _score(item: dict) -> int:
@@ -3357,7 +3769,7 @@ class RdrsGui(QWidget):
             except Exception:
                 return 0
 
-        return max(self.process_state_cache.values(), key=_score)
+        return max(process_state_cache.values(), key=_score)
 
     def _terminate_process_if_running(self, pid_value: Optional[str]) -> str:
         """Attempt graceful then forced termination for a PID.
@@ -3405,7 +3817,13 @@ class RdrsGui(QWidget):
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "timestamp_epoch": time.time(),
             "action_type": action,
-            "action_label": "Quarantine" if action == "QUARANTINE_ACTION" else "Delete",
+            "action_label": (
+                "Quarantine"
+                if action == "QUARANTINE_ACTION"
+                else "Ignore"
+                if action == "IGNORE_ACTION"
+                else "Remove / Terminate"
+            ),
             "status": status,
             "process": process_data.get("process") or "",
             "pid": str(pid_value or ""),
@@ -3418,6 +3836,9 @@ class RdrsGui(QWidget):
         self.response_action_rows.append(action_row)
         if self._selected_home_process_key is not None:
             self._on_home_selection_changed()
+            self._populate_incident_page(self._selected_home_process_key)
+        self._pending_suspicious_refresh = True
+        self._pending_metrics_refresh = True
 
         if self._alerts_db is None:
             return

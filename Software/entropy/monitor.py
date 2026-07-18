@@ -38,14 +38,21 @@ import logging
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Set
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from entropy.calculator import calculate_entropy
 from database.metadata_db import MetadataDatabase
 from database.logs_db import LogsDatabase
 from database.alerts_db import AlertsDatabase
+
+try:
+    from config import get_config
+    _CONFIG_AVAILABLE = True
+except ImportError:
+    _CONFIG_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -156,12 +163,42 @@ class EntropyMonitor:
         self._retention_days = retention_days
         self._persist_events_to_logs = persist_events_to_logs
 
-        self._queue: queue.Queue[Optional[_FileEvent]] = queue.Queue(maxsize=2000)
+        if _CONFIG_AVAILABLE:
+            cfg = get_config()
+            self._queue_maxsize = max(500, int(cfg.entropy.queue_maxsize))
+            self._worker_count = max(1, int(cfg.entropy.worker_count))
+            mcfg = cfg.monitoring
+            self._packet_normal_max = int(mcfg.packet_normal_max)
+            self._packet_medium_max = int(mcfg.packet_medium_max)
+            self._packet_large_max = int(mcfg.packet_large_max)
+            self._packet_medium_size = int(mcfg.packet_medium_size)
+            self._packet_large_size = int(mcfg.packet_large_size)
+            self._packet_extreme_size = int(mcfg.packet_extreme_size)
+        else:
+            self._queue_maxsize = 4000
+            self._worker_count = 3
+            self._packet_normal_max = 50
+            self._packet_medium_max = 200
+            self._packet_large_max = 1000
+            self._packet_medium_size = 20
+            self._packet_large_size = 50
+            self._packet_extreme_size = 100
+
+        self._queue: "queue.PriorityQueue[Tuple[int, float, int, _FileEvent]]" = queue.PriorityQueue(
+            maxsize=self._queue_maxsize
+        )
         self._worker_thread: Optional[threading.Thread] = None
         self._baseline_thread: Optional[threading.Thread] = None
+        self._db_writer_thread: Optional[threading.Thread] = None
         self._running = False
+        self._sequence = 0
+        self._queue_lock = threading.Lock()
+        self._modified_event_index: Dict[str, _FileEvent] = {}
         self._inflight_paths: Set[str] = set()
         self._inflight_lock = threading.Lock()
+        self._metadata_update_lock = threading.Lock()
+        self._pending_metadata_updates: Dict[str, Tuple[float, str, Optional[float], int, float]] = {}
+        self._worker_pool: Optional[ThreadPoolExecutor] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -177,7 +214,17 @@ class EntropyMonitor:
             name="rdrs-entropy-worker",
             daemon=True,
         )
+        self._worker_pool = ThreadPoolExecutor(
+            max_workers=self._worker_count,
+            thread_name_prefix="rdrs-entropy-calc",
+        )
         self._worker_thread.start()
+        self._db_writer_thread = threading.Thread(
+            target=self._metadata_writer_loop,
+            name="rdrs-entropy-db-writer",
+            daemon=True,
+        )
+        self._db_writer_thread.start()
         if self._monitored_roots:
             self._baseline_thread = threading.Thread(
                 target=self._baseline_scan,
@@ -199,13 +246,19 @@ class EntropyMonitor:
         self._running = False
         # Unblock the worker thread with a sentinel None.
         try:
-            self._queue.put_nowait(None)
+            self._queue.put_nowait((99, time.time(), 0, _FileEvent("STOP", "", None, None, None, None, None)))
         except queue.Full:
             pass
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
         if self._baseline_thread is not None:
             self._baseline_thread.join(timeout=5.0)
+        if self._db_writer_thread is not None:
+            self._db_writer_thread.join(timeout=5.0)
+        if self._worker_pool is not None:
+            self._worker_pool.shutdown(wait=True)
+            self._worker_pool = None
+        self._flush_pending_metadata_updates()
         logger.info("EntropyMonitor stopped.")
 
     # ------------------------------------------------------------------
@@ -238,7 +291,7 @@ class EntropyMonitor:
             parent:       Parent process name if known.
         """
         if not self._running:
-            logger.warning(
+            logger.debug(
                 "[ENTROPY_TRACE][ENTROPY.on_file_event] monitor_not_running event=%s file=%s",
                 event_type,
                 file_path,
@@ -255,8 +308,8 @@ class EntropyMonitor:
             parent=parent,
         )
         try:
-            self._queue.put_nowait(evt)
-            logger.info(
+            self._enqueue_event(evt)
+            logger.debug(
                 "[ENTROPY_TRACE][ENTROPY.on_file_event] enqueued event=%s file=%s qsize=%s",
                 event_type,
                 file_path,
@@ -269,6 +322,66 @@ class EntropyMonitor:
                 event_type,
                 file_path,
             )
+
+    @staticmethod
+    def _event_priority(event_type: str) -> int:
+        event = (event_type or "").upper()
+        if event in {"ENTROPY_RESCAN", "HIGH_SCORE_RESCAN"}:
+            return 0
+        if "MOVE" in event or "RENAME" in event or "DELETE" in event:
+            return 0
+        if "MODIF" in event or "CREAT" in event:
+            return 1
+        return 2
+
+    def _enqueue_event(self, evt: _FileEvent) -> None:
+        event_type_upper = (evt.event_type or "").upper()
+        normalized_path = str(Path(evt.file_path))
+        is_modified = "MODIF" in event_type_upper
+
+        with self._queue_lock:
+            if is_modified and normalized_path in self._modified_event_index:
+                existing = self._modified_event_index[normalized_path]
+                existing.process_name = evt.process_name or existing.process_name
+                existing.pid = evt.pid if evt.pid is not None else existing.pid
+                existing.executable = evt.executable or existing.executable
+                existing.parent = evt.parent or existing.parent
+                return
+
+            self._sequence += 1
+            item = (self._event_priority(evt.event_type), time.time(), self._sequence, evt)
+            try:
+                self._queue.put_nowait(item)
+                if is_modified:
+                    self._modified_event_index[normalized_path] = evt
+            except queue.Full:
+                if is_modified:
+                    return
+                self._force_enqueue_critical(item)
+
+    def _force_enqueue_critical(self, critical_item: Tuple[int, float, int, _FileEvent]) -> None:
+        drained: List[Tuple[int, float, int, _FileEvent]] = []
+        dropped = False
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            _, _, _, evt = item
+            if not dropped and "MODIF" in (evt.event_type or "").upper():
+                dropped = True
+                self._modified_event_index.pop(str(Path(evt.file_path)), None)
+                continue
+            drained.append(item)
+        try:
+            self._queue.put_nowait(critical_item)
+        except queue.Full:
+            pass
+        for item in drained:
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                break
 
     def _baseline_scan(self) -> None:
         """Prime the entropy cache for all monitored roots without blocking the UI."""
@@ -337,24 +450,47 @@ class EntropyMonitor:
     def _worker_loop(self) -> None:
         """Process events from the queue until stopped."""
         while True:
-            try:
-                evt = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                if not self._running:
+            packet = self._drain_packet(self._adaptive_packet_size())
+            if not packet:
+                if not self._running and self._queue.empty():
                     break
+                time.sleep(0.02)
                 continue
 
-            if evt is None:
-                # Sentinel: stop requested.
-                break
+            futures = []
+            for evt in packet:
+                if evt.event_type == "STOP":
+                    self._running = False
+                    continue
+                if self._worker_pool is None:
+                    continue
+                futures.append(self._worker_pool.submit(self._process_event, evt))
 
+            if futures:
+                wait(futures)
+
+    def _adaptive_packet_size(self) -> int:
+        qsize = self._queue.qsize()
+        if qsize < self._packet_normal_max:
+            return 1
+        if qsize < self._packet_medium_max:
+            return self._packet_medium_size
+        if qsize < self._packet_large_max:
+            return self._packet_large_size
+        return self._packet_extreme_size
+
+    def _drain_packet(self, packet_size: int) -> List[_FileEvent]:
+        packet: List[_FileEvent] = []
+        while len(packet) < packet_size:
             try:
-                self._process_event(evt)
-            except Exception as exc:
-                logger.error("EntropyMonitor worker error processing %s: %s",
-                             evt.file_path, exc, exc_info=True)
-            finally:
-                self._queue.task_done()
+                _, _, _, evt = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if "MODIF" in (evt.event_type or "").upper():
+                with self._queue_lock:
+                    self._modified_event_index.pop(str(Path(evt.file_path)), None)
+            packet.append(evt)
+        return packet
 
     def _process_event(self, evt: _FileEvent) -> None:
         """Handle a single file event: entropy check, DB update, alert check.
@@ -365,7 +501,7 @@ class EntropyMonitor:
         file_path = evt.file_path
         path = Path(file_path)
         resolved_path = str(path.resolve()) if path.exists() else str(path)
-        logger.info(
+        logger.debug(
             "[ENTROPY_TRACE][ENTROPY.worker] processing event=%s file=%s suffix=%s",
             evt.event_type,
             file_path,
@@ -373,29 +509,7 @@ class EntropyMonitor:
         )
 
         # -----------------------------------------------------------------
-        # 1. Extension filter — only process allowed file types
-        #
-        # Note: filesystem event persistence to logs.db is handled by the
-        # monitor callback chain in ransomwaredetector.py so that *all* events are
-        # stored, not only entropy-supported extensions.
-        # -----------------------------------------------------------------
-        extension = path.suffix.lower().lstrip(".")
-        if extension not in self._allowed_extensions:
-            logger.info(
-                "[ENTROPY_TRACE][ENTROPY.worker] filtered_extension extension=%s allowed=%s file=%s",
-                extension,
-                extension in self._allowed_extensions,
-                file_path,
-            )
-            return
-        logger.info(
-            "[ENTROPY_TRACE][ENTROPY.worker] extension_ok extension=%s file=%s",
-            extension,
-            file_path,
-        )
-
-        # -----------------------------------------------------------------
-        # 2. Handle move/rename and deletion events up front
+        # 1. Handle move/rename and deletion events before extension filtering.
         # -----------------------------------------------------------------
         event_type_upper = evt.event_type.upper()
         if "MOVE" in event_type_upper or "RENAME" in event_type_upper:
@@ -404,16 +518,17 @@ class EntropyMonitor:
                     self._metadata_db.rename_entropy_path(evt.previous_path, file_path)
                 except Exception as exc:
                     logger.warning("Failed to rename entropy cache %s -> %s: %s", evt.previous_path, file_path, exc)
-            if "MOVE" in event_type_upper or "RENAME" in event_type_upper:
                 try:
-                    self._metadata_db.mark_deleted(evt.previous_path or file_path)
+                    self._metadata_db.mark_deleted(evt.previous_path)
                 except Exception:
                     pass
+
+            # Continue processing destination path so extension changes remain tracked.
 
         if "DELETE" in event_type_upper:
             try:
                 self._metadata_db.mark_deleted(file_path)
-                logger.info(
+                logger.debug(
                     "[ENTROPY_TRACE][ENTROPY.worker] mark_deleted_ok file=%s",
                     file_path,
                 )
@@ -421,6 +536,18 @@ class EntropyMonitor:
                 logger.warning("Failed to mark deleted: %s — %s", file_path, exc)
             if self._persist_events_to_logs:
                 self._log_event(evt)
+            return
+
+        # -----------------------------------------------------------------
+        # 2. Extension filter (after rename/delete handling)
+        # -----------------------------------------------------------------
+        extension = path.suffix.lower().lstrip(".")
+        if extension not in self._allowed_extensions:
+            logger.debug(
+                "Filtered extension=%s file=%s",
+                extension,
+                file_path,
+            )
             return
 
         # -----------------------------------------------------------------
@@ -440,7 +567,7 @@ class EntropyMonitor:
 
         with self._inflight_lock:
             if resolved_path in self._inflight_paths:
-                logger.info("[ENTROPY_TRACE][ENTROPY.worker] duplicate_scan_ignored file=%s", resolved_path)
+                logger.debug("[ENTROPY_TRACE][ENTROPY.worker] duplicate_scan_ignored file=%s", resolved_path)
                 return
             self._inflight_paths.add(resolved_path)
 
@@ -455,7 +582,7 @@ class EntropyMonitor:
                 previous_entropy = existing["current_entropy"]
             elif existing_cache is not None:
                 previous_entropy = existing_cache["entropy"]
-            logger.info(
+            logger.debug(
                 "[ENTROPY_TRACE][ENTROPY.worker] metadata_lookup existing=%s prev_entropy=%s file=%s",
                 existing is not None,
                 previous_entropy,
@@ -478,7 +605,7 @@ class EntropyMonitor:
                 self._sample_size,
             )
             return
-        logger.info(
+        logger.debug(
             "[ENTROPY_TRACE][ENTROPY.worker] entropy_calc_ok current=%.5f file=%s",
             current_entropy,
             file_path,
@@ -487,22 +614,15 @@ class EntropyMonitor:
         # -----------------------------------------------------------------
         # 6. Upsert metadata database
         # -----------------------------------------------------------------
-        self._metadata_db.upsert_entropy_cache(
-            path=resolved_path,
-            entropy=current_entropy,
-            file_size=file_size,
-            modified_time=last_modified,
-            exists=True,
-        )
-        self._metadata_db.upsert_file(
-            file_path=resolved_path,
+        self._queue_metadata_upsert(
+            resolved_path=resolved_path,
             file_name=path.name,
             current_entropy=current_entropy,
             previous_entropy=previous_entropy,
             file_size=file_size,
-            last_modified_ts=last_modified,
+            last_modified=last_modified,
         )
-        logger.info(
+        logger.debug(
             "[ENTROPY_TRACE][ENTROPY.worker] metadata_upsert_ok file=%s prev=%s current=%.5f",
             file_path,
             previous_entropy,
@@ -513,12 +633,12 @@ class EntropyMonitor:
         # 7. Alert check — only on modifications (not initial creation scans)
         # -----------------------------------------------------------------
         if (
-            "MODIF" in event_type_upper
+            ("MODIF" in event_type_upper or "RESCAN" in event_type_upper)
             and previous_entropy is not None
             and current_entropy is not None
         ):
             delta = current_entropy - previous_entropy
-            logger.info(
+            logger.debug(
                 "[ENTROPY_TRACE][ENTROPY.recalculated] file=%s prev=%.5f current=%.5f delta=%.5f",
                 resolved_path,
                 previous_entropy,
@@ -530,6 +650,57 @@ class EntropyMonitor:
 
         if self._persist_events_to_logs:
             self._log_event(evt)
+
+    def _queue_metadata_upsert(
+        self,
+        *,
+        resolved_path: str,
+        file_name: str,
+        current_entropy: float,
+        previous_entropy: Optional[float],
+        file_size: int,
+        last_modified: float,
+    ) -> None:
+        """Coalesce metadata updates by file path for periodic batch flushes."""
+        with self._metadata_update_lock:
+            self._pending_metadata_updates[resolved_path] = (
+                current_entropy,
+                file_name,
+                previous_entropy,
+                file_size,
+                last_modified,
+            )
+
+    def _metadata_writer_loop(self) -> None:
+        """Flush coalesced metadata updates in short periodic batches."""
+        while self._running or self._pending_metadata_updates:
+            self._flush_pending_metadata_updates()
+            time.sleep(0.2)
+
+    def _flush_pending_metadata_updates(self) -> None:
+        with self._metadata_update_lock:
+            if not self._pending_metadata_updates:
+                return
+            batch = list(self._pending_metadata_updates.items())
+            self._pending_metadata_updates.clear()
+
+        for resolved_path, payload in batch:
+            current_entropy, file_name, previous_entropy, file_size, last_modified = payload
+            self._metadata_db.upsert_entropy_cache(
+                path=resolved_path,
+                entropy=current_entropy,
+                file_size=file_size,
+                modified_time=last_modified,
+                exists=True,
+            )
+            self._metadata_db.upsert_file(
+                file_path=resolved_path,
+                file_name=file_name,
+                current_entropy=current_entropy,
+                previous_entropy=previous_entropy,
+                file_size=file_size,
+                last_modified_ts=last_modified,
+            )
 
     def _log_event(self, evt: _FileEvent) -> None:
         """Persist a filesystem event to logs_db.
@@ -630,7 +801,7 @@ class EntropyMonitor:
         for path in paths:
             if not path.exists() or not path.is_file():
                 continue
-            self.on_file_event("FILE MODIFIED", str(path))
+            self.on_file_event("ENTROPY_RESCAN", str(path))
 
     def get_files_in_directory(self, directory: str) -> list:
         """Return monitored files under a given directory prefix.

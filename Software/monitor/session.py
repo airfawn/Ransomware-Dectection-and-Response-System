@@ -49,6 +49,7 @@ class MonitorSession:
         emit_started: Optional[Callable[[], None]] = None,
         emit_stopped: Optional[Callable[[], None]] = None,
         event_callback: Optional[Callable] = None,
+        high_score_callback: Optional[Callable] = None,
     ) -> None:
         """Initialise the session.
 
@@ -73,6 +74,7 @@ class MonitorSession:
         self._emit_started = emit_started
         self._emit_stopped = emit_stopped
         self._event_callback = event_callback
+        self._high_score_callback = high_score_callback
 
         self._thread: Optional[threading.Thread] = None
         self._monitor: Optional[FileSystemMonitor] = None
@@ -139,6 +141,7 @@ class MonitorSession:
                 recursive=self._recursive,
                 logger=logger,
                 event_callback=self._event_callback,
+                high_score_callback=self._high_score_callback,
             )
             with self._stop_lock:
                 self._monitor = monitor

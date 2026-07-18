@@ -103,6 +103,42 @@ class LogsDatabase(BaseDatabase):
         # Throttled retention enforcement — count query is cheap when indexed.
         self._maybe_trim()
 
+    def log_events_batch(self, events: List[dict]) -> None:
+        """Insert many filesystem events in one transaction and enforce trimming.
+
+        Args:
+            events: List of dictionaries using the same fields accepted by
+                log_event(). Missing optional fields are stored as NULL.
+        """
+        if not events:
+            return
+
+        params = []
+        for item in events:
+            params.append(
+                (
+                    item.get("timestamp") or time.time(),
+                    item.get("event_type", ""),
+                    item.get("file_path", ""),
+                    item.get("file_name", ""),
+                    item.get("process"),
+                    item.get("pid"),
+                    item.get("executable"),
+                    item.get("parent"),
+                )
+            )
+
+        self.executemany(
+            """
+            INSERT INTO file_events
+                (timestamp, event_type, file_path, file_name, process, pid, executable, parent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+            commit=True,
+        )
+        self._maybe_trim()
+
     def _maybe_trim(self) -> None:
         """Delete the oldest rows if the table exceeds ``_max_rows``.
 

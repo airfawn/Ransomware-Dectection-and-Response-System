@@ -42,7 +42,8 @@ def get_log_dir() -> Path:
     Returns:
         Path object pointing to the logs directory.
     """
-    log_dir = get_base_dir() / "logs"
+    root = get_data_dir() if is_frozen() else get_base_dir()
+    log_dir = root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -55,7 +56,8 @@ def get_config_dir() -> Path:
     Returns:
         Path object pointing to the config directory.
     """
-    config_dir = get_base_dir() / "config"
+    root = get_data_dir() if is_frozen() else get_base_dir()
+    config_dir = root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 

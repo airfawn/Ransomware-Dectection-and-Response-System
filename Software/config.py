@@ -53,6 +53,41 @@ class MonitoringConfig:
     max_gui_events_displayed: int = 5000
     """Maximum number of events to display in the file monitoring table."""
 
+    # Producer-consumer queue and worker pool sizing
+    filesystem_queue_maxsize: int = 8000
+    """Bounded capacity for filesystem event queue."""
+
+    filesystem_worker_count: int = 4
+    """Number of worker threads used to process filesystem packets."""
+
+    # Adaptive packet thresholds and sizes
+    packet_normal_max: int = 50
+    """Below this modified-event volume, process immediately."""
+
+    packet_medium_max: int = 200
+    """50-200 modified files -> packet size 20."""
+
+    packet_large_max: int = 1000
+    """200-1000 modified files -> packet size 50."""
+
+    packet_medium_size: int = 20
+    """Packet size for medium burst windows."""
+
+    packet_large_size: int = 50
+    """Packet size for large burst windows."""
+
+    packet_extreme_size: int = 100
+    """Packet size for extreme burst windows (>1000)."""
+
+    burst_window_seconds: float = 2.0
+    """Sliding window used for adaptive burst-volume calculations."""
+
+    high_score_rescan_threshold: int = 30
+    """Trigger filesystem-truth entropy rescan when score exceeds this value."""
+
+    high_score_rescan_cooldown_seconds: float = 5.0
+    """Minimum time between repeated high-score rescans for same process."""
+
 
 @dataclass
 class DetectionConfig:
@@ -230,6 +265,12 @@ class EntropyConfig:
     # Score delta the Engine adds on EntropyIncreaseDetected.
     score: int = 30
 
+    worker_count: int = 3
+    """Number of worker threads used for entropy event processing."""
+
+    queue_maxsize: int = 4000
+    """Bounded capacity for queued entropy events."""
+
 
 @dataclass
 class DatabaseConfig:
@@ -244,6 +285,9 @@ class DatabaseConfig:
 
     # Maximum rows in the logs table; oldest rows purged when exceeded.
     max_log_rows: int = 500_000
+
+    log_writer_pool_size: int = 2
+    """Number of background workers for batched log persistence."""
 
 
 @dataclass
