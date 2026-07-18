@@ -14,7 +14,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence, Set
 
-from PyQt5.QtCore import QObject, pyqtSignal
+try:
+    from PyQt5.QtCore import QObject, pyqtSignal
+    _QT_AVAILABLE = True
+except ImportError:
+    _QT_AVAILABLE = False
+
+    class QObject:  # type: ignore[override]
+        """Fallback QObject shim for non-GUI test environments."""
+
+    class _NullSignal:
+        def emit(self, *args, **kwargs) -> None:
+            return
+
+    def pyqtSignal(*args, **kwargs):  # type: ignore[override]
+        """Fallback signal factory returning a no-op signal."""
+        return _NullSignal()
 
 from entropy.calculator import calculate_entropy
 from database.metadata_db import MetadataDatabase

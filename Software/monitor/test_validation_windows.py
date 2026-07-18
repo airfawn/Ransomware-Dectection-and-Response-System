@@ -58,8 +58,8 @@ class WindowsPipelineValidationTest(unittest.TestCase):
 
         captured = []
 
-        def callback(event_type, file_path, process_name, pid, executable, parent, previous_path=None):
-            captured.append((event_type, file_path, process_name, pid, executable, parent, previous_path))
+        def callback(event_type, file_path, process_name, pid, executable, parent, previous_path=None, file_identifier=None):
+            captured.append((event_type, file_path, process_name, pid, executable, parent, previous_path, file_identifier))
 
         handler._event_callback = callback
 
@@ -75,7 +75,8 @@ class WindowsPipelineValidationTest(unittest.TestCase):
         self.assertCountEqual([item[0] for item in captured], ["FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED"])
         moved_captured = [item for item in captured if item[0] == "FILE MOVED"]
         self.assertEqual(len(moved_captured), 1)
-        self.assertEqual(moved_captured[0][-1], r"C:\temp\old.txt")
+        self.assertEqual(moved_captured[0][6], r"C:\temp\old.txt")
+        self.assertIsNotNone(moved_captured[0][7])
         self.assertEqual(len(tracker.events), 4)
         self.assertTrue(any(event[0] == "FILE MOVED" and event[-1] == r"C:\temp\old.txt" for event in tracker.events))
         handler.stop()
@@ -203,9 +204,61 @@ class WindowsPipelineValidationTest(unittest.TestCase):
             try:
                 with patch("entropy.monitor.calculate_entropy", return_value=4.25) as entropy_mock:
                     monitor._process_event(
-                        type("Evt", (), {"event_type": "FILE MODIFIED", "file_path": str(data_file), "previous_path": None, "process_name": None, "pid": None, "executable": None, "parent": None})
+                        type("Evt", (), {"event_type": "FILE MODIFIED", "file_path": str(data_file), "previous_path": None, "file_id": None, "process_name": None, "pid": None, "executable": None, "parent": None})
                     )
                 self.assertEqual(entropy_mock.call_count, 1)
+            finally:
+                monitor.stop()
+                metadata_db.close()
+                logs_db.close()
+                alerts_db.close()
+
+    def test_entropy_tracking_survives_extension_change_for_known_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "sample.txt"
+            renamed = root / "sample.locked"
+            original.write_text("baseline\n", encoding="utf-8")
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            logs_db = LogsDatabase(root / "logs.db")
+            alerts_db = AlertsDatabase(root / "alerts.db")
+
+            monitor = EntropyMonitor(
+                metadata_db=metadata_db,
+                logs_db=logs_db,
+                alerts_db=alerts_db,
+                allowed_extensions={"txt"},
+                monitored_roots=[root],
+                threshold=1.0,
+            )
+
+            try:
+                monitor._scan_file_for_cache(original)
+                original.rename(renamed)
+
+                with patch("entropy.monitor.calculate_entropy", return_value=6.5) as entropy_mock:
+                    monitor._process_event(
+                        type(
+                            "Evt",
+                            (),
+                            {
+                                "event_type": "FILE MODIFIED",
+                                "file_path": str(renamed),
+                                "previous_path": None,
+                                "file_id": None,
+                                "process_name": None,
+                                "pid": None,
+                                "executable": None,
+                                "parent": None,
+                            },
+                        )
+                    )
+
+                self.assertEqual(entropy_mock.call_count, 1)
+                row = metadata_db.get_entropy_record(str(renamed))
+                self.assertIsNotNone(row)
+                self.assertTrue(row["exists"])
             finally:
                 monitor.stop()
                 metadata_db.close()

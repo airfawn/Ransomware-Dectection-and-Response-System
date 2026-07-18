@@ -35,6 +35,7 @@ Isolation guarantees
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -85,6 +86,7 @@ class _FileEvent:
         "event_type",
         "file_path",
         "previous_path",
+        "file_id",
         "process_name",
         "pid",
         "executable",
@@ -96,6 +98,7 @@ class _FileEvent:
         event_type: str,
         file_path: str,
         previous_path: Optional[str],
+        file_id: Optional[str],
         process_name: Optional[str],
         pid: Optional[int],
         executable: Optional[str],
@@ -104,6 +107,7 @@ class _FileEvent:
         self.event_type = event_type
         self.file_path = file_path
         self.previous_path = previous_path
+        self.file_id = file_id
         self.process_name = process_name
         self.pid = pid
         self.executable = executable
@@ -197,7 +201,7 @@ class EntropyMonitor:
         self._inflight_paths: Set[str] = set()
         self._inflight_lock = threading.Lock()
         self._metadata_update_lock = threading.Lock()
-        self._pending_metadata_updates: Dict[str, Tuple[float, str, Optional[float], int, float]] = {}
+        self._pending_metadata_updates: Dict[str, Tuple[float, str, Optional[float], int, float, Optional[str]]] = {}
         self._worker_pool: Optional[ThreadPoolExecutor] = None
 
     # ------------------------------------------------------------------
@@ -246,7 +250,7 @@ class EntropyMonitor:
         self._running = False
         # Unblock the worker thread with a sentinel None.
         try:
-            self._queue.put_nowait((99, time.time(), 0, _FileEvent("STOP", "", None, None, None, None, None)))
+            self._queue.put_nowait((99, time.time(), 0, _FileEvent("STOP", "", None, None, None, None, None, None)))
         except queue.Full:
             pass
         if self._worker_thread is not None:
@@ -271,6 +275,7 @@ class EntropyMonitor:
         file_path: str,
         *,
         previous_path: Optional[str] = None,
+        file_identifier: Optional[str] = None,
         process_name: Optional[str] = None,
         pid: Optional[int] = None,
         executable: Optional[str] = None,
@@ -302,6 +307,7 @@ class EntropyMonitor:
             event_type=event_type,
             file_path=file_path,
             previous_path=previous_path,
+            file_id=file_identifier,
             process_name=process_name,
             pid=pid,
             executable=executable,
@@ -346,6 +352,7 @@ class EntropyMonitor:
                 existing.pid = evt.pid if evt.pid is not None else existing.pid
                 existing.executable = evt.executable or existing.executable
                 existing.parent = evt.parent or existing.parent
+                existing.file_id = evt.file_id or existing.file_id
                 return
 
             self._sequence += 1
@@ -433,6 +440,9 @@ class EntropyMonitor:
             modified_time=stat.st_mtime,
             exists=True,
         )
+        file_id = self._build_file_identity(path, stat)
+        if file_id:
+            self._metadata_db.upsert_entropy_identity(file_id, str(path), exists=True)
         previous_entropy = existing_legacy["current_entropy"] if existing_legacy else None
         self._metadata_db.upsert_file(
             file_path=str(path),
@@ -523,6 +533,12 @@ class EntropyMonitor:
                 except Exception:
                     pass
 
+                if evt.file_id:
+                    try:
+                        self._metadata_db.upsert_entropy_identity(evt.file_id, file_path, exists=True)
+                    except Exception as exc:
+                        logger.debug("Failed to update identity map for move %s: %s", evt.file_id, exc)
+
             # Continue processing destination path so extension changes remain tracked.
 
         if "DELETE" in event_type_upper:
@@ -534,30 +550,64 @@ class EntropyMonitor:
                 )
             except Exception as exc:
                 logger.warning("Failed to mark deleted: %s — %s", file_path, exc)
+            if evt.file_id:
+                try:
+                    self._metadata_db.mark_entropy_identity_deleted(evt.file_id)
+                except Exception as exc:
+                    logger.debug("Failed to mark identity deleted for %s: %s", evt.file_id, exc)
             if self._persist_events_to_logs:
                 self._log_event(evt)
             return
 
         # -----------------------------------------------------------------
-        # 2. Extension filter (after rename/delete handling)
-        # -----------------------------------------------------------------
-        extension = path.suffix.lower().lstrip(".")
-        if extension not in self._allowed_extensions:
-            logger.debug(
-                "Filtered extension=%s file=%s",
-                extension,
-                file_path,
-            )
-            return
-
-        # -----------------------------------------------------------------
-        # 3. Stat the file before reading (fast exit if gone)
+        # 2. Resolve filesystem stat and stable identity.
         # -----------------------------------------------------------------
         try:
             stat = path.stat()
         except OSError:
             logger.warning(
                 "[ENTROPY_TRACE][ENTROPY.worker] stat_failed file=%s (likely transient)",
+                file_path,
+            )
+            return
+
+        resolved_path = self._normalize_runtime_path(path)
+        file_id = evt.file_id or self._build_file_identity(path, stat)
+
+        if file_id:
+            try:
+                mapped_path = self._metadata_db.resolve_entropy_path(file_id)
+            except Exception:
+                mapped_path = None
+
+            if mapped_path and mapped_path != resolved_path:
+                try:
+                    self._metadata_db.rename_entropy_path(mapped_path, resolved_path)
+                except Exception as exc:
+                    logger.debug(
+                        "Identity remap failed for file_id=%s (%s -> %s): %s",
+                        file_id,
+                        mapped_path,
+                        resolved_path,
+                        exc,
+                    )
+
+            try:
+                self._metadata_db.upsert_entropy_identity(file_id, resolved_path, exists=True)
+            except Exception as exc:
+                logger.debug("Failed to persist identity map for %s: %s", resolved_path, exc)
+
+        existing_cache = self._metadata_db.get_entropy_record(resolved_path)
+        tracked_by_history = bool(existing_cache and existing_cache["exists"] == 1)
+
+        # -----------------------------------------------------------------
+        # 3. Extension filter (allow already-tracked files after rename).
+        # -----------------------------------------------------------------
+        extension = path.suffix.lower().lstrip(".")
+        if extension not in self._allowed_extensions and not tracked_by_history:
+            logger.debug(
+                "Filtered extension=%s file=%s",
+                extension,
                 file_path,
             )
             return
@@ -576,7 +626,6 @@ class EntropyMonitor:
             # 4. Fetch existing record to get previous entropy
             # -----------------------------------------------------------------
             existing = self._metadata_db.get_file(resolved_path)
-            existing_cache = self._metadata_db.get_entropy_record(resolved_path)
             previous_entropy: Optional[float] = None
             if existing:
                 previous_entropy = existing["current_entropy"]
@@ -621,6 +670,7 @@ class EntropyMonitor:
             previous_entropy=previous_entropy,
             file_size=file_size,
             last_modified=last_modified,
+            file_id=file_id,
         )
         logger.debug(
             "[ENTROPY_TRACE][ENTROPY.worker] metadata_upsert_ok file=%s prev=%s current=%.5f",
@@ -660,6 +710,7 @@ class EntropyMonitor:
         previous_entropy: Optional[float],
         file_size: int,
         last_modified: float,
+        file_id: Optional[str],
     ) -> None:
         """Coalesce metadata updates by file path for periodic batch flushes."""
         with self._metadata_update_lock:
@@ -669,6 +720,7 @@ class EntropyMonitor:
                 previous_entropy,
                 file_size,
                 last_modified,
+                file_id,
             )
 
     def _metadata_writer_loop(self) -> None:
@@ -685,7 +737,7 @@ class EntropyMonitor:
             self._pending_metadata_updates.clear()
 
         for resolved_path, payload in batch:
-            current_entropy, file_name, previous_entropy, file_size, last_modified = payload
+            current_entropy, file_name, previous_entropy, file_size, last_modified, file_id = payload
             self._metadata_db.upsert_entropy_cache(
                 path=resolved_path,
                 entropy=current_entropy,
@@ -701,6 +753,31 @@ class EntropyMonitor:
                 file_size=file_size,
                 last_modified_ts=last_modified,
             )
+            if file_id:
+                self._metadata_db.upsert_entropy_identity(file_id, resolved_path, exists=True)
+
+    @staticmethod
+    def _normalize_runtime_path(path: Path) -> str:
+        try:
+            return os.path.realpath(os.path.abspath(str(path)))
+        except Exception:
+            return str(path)
+
+    @staticmethod
+    def _build_file_identity(path: Path, stat_result: os.stat_result) -> Optional[str]:
+        """Return a stable identity for rename/extension-churn resilience."""
+        try:
+            inode = int(getattr(stat_result, "st_ino", 0) or 0)
+            device = int(getattr(stat_result, "st_dev", 0) or 0)
+            if inode > 0:
+                return f"{device}:{inode}"
+        except Exception:
+            pass
+
+        try:
+            return f"path:{os.path.normcase(os.path.realpath(str(path)))}"
+        except Exception:
+            return None
 
     def _log_event(self, evt: _FileEvent) -> None:
         """Persist a filesystem event to logs_db.

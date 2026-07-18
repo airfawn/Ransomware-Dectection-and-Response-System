@@ -1240,6 +1240,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                             executable: Optional[str],
                             parent: Optional[str],
                             previous_path: Optional[str] = None,
+                            file_identifier: Optional[str] = None,
                         ) -> None
 
                 The callback is called on the watchdog observer thread; it
@@ -1579,6 +1580,8 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                 previous_path=queued_event.previous_path,
             )
 
+            file_identifier = self._compute_file_identifier(path, queued_event.previous_path)
+
             try:
                 resolved_path = str(path.resolve() if path.exists() else path.absolute())
             except Exception:
@@ -1607,7 +1610,28 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                         queued_event.process_metadata.executable,
                         queued_event.process_metadata.parent_name,
                         queued_event.previous_path,
+                        file_identifier,
                     )
+
+                    if (
+                        queued_event.previous_path
+                        and getattr(self.behavior_tracker, "_extension_monitor_enabled", True)
+                        and is_genuine_extension_change(
+                            queued_event.previous_path,
+                            str(resolved_path),
+                            ignored_extensions=getattr(self.behavior_tracker, "_ignored_extensions", None),
+                        )
+                    ):
+                        self._event_callback(
+                            "FILE EXTENSION CHANGED",
+                            str(resolved_path),
+                            queued_event.process_metadata.name,
+                            queued_event.process_metadata.pid,
+                            queued_event.process_metadata.executable,
+                            queued_event.process_metadata.parent_name,
+                            queued_event.previous_path,
+                            file_identifier,
+                        )
                 except Exception as cb_exc:
                     self.logger.error(
                         "[ENTROPY_TRACE][FSM->CALLBACK] dispatch_error file=%s err=%s",
@@ -1675,6 +1699,31 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             self._high_score_callback(list(payload_paths), context)
         except Exception as exc:
             self.logger.error("Failed high-priority rescan callback: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _compute_file_identifier(path: Path, previous_path: Optional[str]) -> Optional[str]:
+        """Build a stable file identity for rename/extension change tracking."""
+        candidate_paths: List[Path] = [path]
+        if previous_path:
+            candidate_paths.append(Path(previous_path))
+
+        for candidate in candidate_paths:
+            try:
+                stat = candidate.stat()
+                inode = int(getattr(stat, "st_ino", 0) or 0)
+                device = int(getattr(stat, "st_dev", 0) or 0)
+                if inode > 0:
+                    return f"{device}:{inode}"
+            except Exception:
+                continue
+
+        for candidate in candidate_paths:
+            try:
+                return f"path:{os.path.normcase(os.path.realpath(str(candidate)))}"
+            except Exception:
+                continue
+
+        return None
 
 
 class FileSystemMonitor:
