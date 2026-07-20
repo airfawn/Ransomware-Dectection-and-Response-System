@@ -96,6 +96,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+APP_VERSION = "v1.0"
+
 
 def _safe_export_name(value: str, fallback: str = "event") -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._")
@@ -1655,6 +1657,13 @@ class RdrsGui(QWidget):
 
         bottom_layout.addWidget(status_container, 1)
 
+        self.version_label = QLabel(APP_VERSION)
+        self.version_label.setStyleSheet("color: #9fb3d1; font-weight: 600;")
+        self.version_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        self.version_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        bottom_layout.addWidget(self.version_label, 0, Qt.AlignRight | Qt.AlignBottom)
+        self._update_version_label_font()
+
         content = QWidget()
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1774,11 +1783,30 @@ class RdrsGui(QWidget):
         self.entropy_table.setColumnWidth(3, max(120, self.entropy_table.sizeHintForColumn(3) + 20))
         self.entropy_table.setColumnWidth(0, file_name_width)
 
+    def _update_version_label_font(self) -> None:
+        """Keep the footer version text small while allowing gentle resize scaling."""
+        if not hasattr(self, "version_label"):
+            return
+
+        width = max(0, self.width())
+        point_size = 8.0
+        if width >= 1200:
+            point_size = 9.0
+        if width >= 1600:
+            point_size = 10.0
+        if width >= 2000:
+            point_size = 11.0
+
+        font = self.version_label.font()
+        font.setPointSizeF(point_size)
+        self.version_label.setFont(font)
+
     def resizeEvent(self, event) -> None:
         """Keep responsive table proportions as the window size changes."""
         super().resizeEvent(event)
         if hasattr(self, "entropy_table"):
             self._resize_entropy_columns()
+        self._update_version_label_font()
 
     def select_page(self, index: int):
         self.page_stack.setCurrentIndex(index)
