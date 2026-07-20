@@ -10,7 +10,12 @@ from database.logs_db import LogsDatabase
 from database.metadata_db import MetadataDatabase
 from entropy.loader import build_entropy_cache
 from entropy.monitor import EntropyMonitor
-from monitor.filesystem_monitor import FileSystemMonitorHandler, ProcessMetadata, ProcessResolver
+from monitor.filesystem_monitor import (
+    FileSystemMonitorHandler,
+    ProcessBehaviorTracker,
+    ProcessMetadata,
+    ProcessResolver,
+)
 
 
 class _DummyLogger:
@@ -212,6 +217,50 @@ class WindowsPipelineValidationTest(unittest.TestCase):
                 metadata_db.close()
                 logs_db.close()
                 alerts_db.close()
+
+    def test_entropy_verification_adds_bonus_when_average_increase_exceeds_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_file = root / "target.txt"
+            target_file.write_bytes(os.urandom(4096))
+            stat = target_file.stat()
+            file_id = f"{int(getattr(stat, 'st_dev', 0) or 0)}:{int(getattr(stat, 'st_ino', 0) or 0)}"
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            metadata_db.upsert_file(
+                file_path=str(target_file),
+                file_name=target_file.name,
+                current_entropy=1.0,
+                previous_entropy=1.0,
+                file_size=stat.st_size,
+                last_modified_ts=stat.st_mtime,
+                file_id=file_id,
+                baseline_entropy=1.0,
+            )
+
+            try:
+                with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
+                    tracker = ProcessBehaviorTracker(_DummyLogger())
+
+                process_meta = ProcessMetadata(
+                    pid=7777,
+                    name="powershell.exe",
+                    executable="C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+                    parent_name="explorer.exe",
+                    start_time="2026-07-20 10:00:00",
+                    start_time_epoch=time.time() - 10,
+                )
+
+                record = None
+                for _ in range(11):
+                    record = tracker.record_event("FILE MODIFIED", str(target_file), process_meta)
+
+                self.assertIsNotNone(record)
+                self.assertIn("EntropyIncrease", record.active_rules)
+                self.assertGreaterEqual(record.entropy_score_bonus, 30)
+                self.assertGreaterEqual(record.score, 60)
+            finally:
+                metadata_db.close()
 
     def test_entropy_tracking_survives_extension_change_for_known_file(self):
         with tempfile.TemporaryDirectory() as tmp:
