@@ -95,7 +95,7 @@ class ProcessResolver:
         _lock: Threading lock for cache access.
     """
 
-    def __init__(self, max_cache_size: int = 1024):
+    def __init__(self, max_cache_size: int = 1024, resolve_timeout_seconds: float = 1.25):
         """Initialize the ProcessResolver with optional caching.
         
         Args:
@@ -105,6 +105,7 @@ class ProcessResolver:
         self._directory_cache: Dict[str, ProcessMetadata] = {}
         self._max_cache_size = max_cache_size
         self._lock = threading.Lock()
+        self._resolve_timeout_seconds = max(0.05, float(resolve_timeout_seconds))
 
     def resolve(
         self,
@@ -112,6 +113,7 @@ class ProcessResolver:
         *,
         previous_path: Optional[Path] = None,
         event_type: Optional[str] = None,
+        time_budget_seconds: Optional[float] = None,
     ) -> ProcessMetadata:
         """Return process metadata matching an open file handle for the path.
         
@@ -147,29 +149,43 @@ class ProcessResolver:
                     return self._directory_cache[previous_directory]
         
         # Resolve without holding lock
-        result = self._resolve_uncached(path, normalized_target, normalized_previous, event_type)
+        result = self._resolve_uncached(
+            path,
+            normalized_target,
+            normalized_previous,
+            event_type,
+            time_budget_seconds=time_budget_seconds,
+        )
         
-        # Update cache (thread-safe)
-        with self._lock:
-            if len(self._cache) >= self._max_cache_size:
-                # Simple eviction: clear oldest half
-                items = list(self._cache.items())
-                self._cache = dict(items[len(items) // 2:])
-            self._cache[normalized_target] = result
-            self._directory_cache[directory_target] = result
-            if normalized_previous is not None:
-                self._cache[normalized_previous] = result
-                self._directory_cache[self._normalize_path(Path(previous_path).parent)] = result
+        # Update cache (thread-safe) only when attribution is meaningful.
+        if self._is_attributed(result):
+            with self._lock:
+                if len(self._cache) >= self._max_cache_size:
+                    # Simple eviction: clear oldest half
+                    items = list(self._cache.items())
+                    self._cache = dict(items[len(items) // 2:])
+                self._cache[normalized_target] = result
+                self._directory_cache[directory_target] = result
+                if normalized_previous is not None:
+                    self._cache[normalized_previous] = result
+                    self._directory_cache[self._normalize_path(Path(previous_path).parent)] = result
         
         return result
 
     def remember(self, path: Path, metadata: ProcessMetadata) -> None:
         """Record a successful mapping for exact-path and directory reuse."""
+        if not self._is_attributed(metadata):
+            return
         normalized_target = self._normalize_path(path)
         directory_target = self._normalize_path(path.parent)
         with self._lock:
             self._cache[normalized_target] = metadata
             self._directory_cache[directory_target] = metadata
+
+    @staticmethod
+    def _is_attributed(metadata: ProcessMetadata) -> bool:
+        """Return True if metadata has enough process information to be useful."""
+        return metadata.pid is not None or bool(metadata.executable) or bool(metadata.name)
 
     def _resolve_uncached(
         self,
@@ -177,6 +193,8 @@ class ProcessResolver:
         normalized_target: str,
         normalized_previous: Optional[str],
         event_type: Optional[str],
+        *,
+        time_budget_seconds: Optional[float],
     ) -> ProcessMetadata:
         """Perform uncached process resolution by scanning process handles.
         
@@ -195,12 +213,16 @@ class ProcessResolver:
             return ProcessMetadata(pid=None, name=None, executable=None, parent_name=None, start_time=None)
 
         # Keep process-resolution latency bounded so the watchdog queue remains healthy.
-        deadline = time.perf_counter() + 0.35
+        effective_budget = self._resolve_timeout_seconds if time_budget_seconds is None else max(0.05, float(time_budget_seconds))
+        deadline = time.perf_counter() + effective_budget
 
         try:
             if os.name == "nt" and event_type_upper in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
                 parent_norm = self._normalize_path(path.parent)
-                for process in psutil.process_iter(["pid", "name", "exe", "ppid"]):
+                processes = self._prioritized_process_list()
+                for index, process in enumerate(processes):
+                    if index >= 32 and time.perf_counter() > deadline:
+                        break
                     if time.perf_counter() > deadline:
                         break
                     try:
@@ -212,10 +234,13 @@ class ProcessResolver:
                     except Exception as exc:
                         logging.debug("Unexpected error checking process cwd: %s", exc)
 
-            # Open-file scans are expensive, so only attempt them for modify events
-            # and while within a strict time budget.
-            if event_type_upper == "FILE MODIFIED":
-                for process in psutil.process_iter(["pid", "name", "exe", "ppid"]):
+            # Open-file scans are expensive, so only attempt them for events that
+            # are likely to have active write handles and while within the time budget.
+            if event_type_upper in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
+                processes = self._prioritized_process_list()
+                for index, process in enumerate(processes):
+                    if index >= 32 and time.perf_counter() > deadline:
+                        break
                     if time.perf_counter() > deadline:
                         break
                     try:
@@ -235,6 +260,26 @@ class ProcessResolver:
         
         # No process owns the file
         return ProcessMetadata(pid=None, name=None, executable=None, parent_name=None, start_time=None)
+
+    @staticmethod
+    def _process_priority(process: psutil.Process) -> int:
+        """Prioritize likely script hosts and shells for quicker attribution."""
+        name = ""
+        try:
+            name = (process.info.get("name") or "").lower()
+        except Exception:
+            name = ""
+        if "python" in name:
+            return 0
+        if "powershell" in name or name in {"pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe"}:
+            return 1
+        return 2
+
+    def _prioritized_process_list(self) -> List[psutil.Process]:
+        """Return processes ordered by likelihood of owning scripted file writes."""
+        processes = list(psutil.process_iter(["pid", "name", "exe", "ppid"]))
+        processes.sort(key=self._process_priority)
+        return processes
 
     def _extract_process_metadata(self, process: psutil.Process) -> ProcessMetadata:
         """Extract metadata from a psutil Process object.
@@ -731,6 +776,11 @@ class ProcessBehaviorTracker:
             self._entropy_score_delta = int(config.entropy.score)
             self._entropy_trigger_score = int(config.monitoring.high_score_rescan_threshold)
             self._entropy_eval_cooldown = float(config.monitoring.high_score_rescan_cooldown_seconds)
+            self._unknown_entropy_fallback_enabled = True
+            self._unknown_fallback_window_seconds = 2.0
+            self._unknown_fallback_modified_threshold = 10
+            self._unknown_fallback_extension_threshold = 5
+            self._unknown_fallback_move_threshold = 5
 
             # File Extension Change Monitor settings (detection, not scoring).
             ext_cfg = config.extension_monitor
@@ -752,6 +802,11 @@ class ProcessBehaviorTracker:
             self._entropy_score_delta = 30
             self._entropy_trigger_score = 30
             self._entropy_eval_cooldown = 5.0
+            self._unknown_entropy_fallback_enabled = True
+            self._unknown_fallback_window_seconds = 2.0
+            self._unknown_fallback_modified_threshold = 10
+            self._unknown_fallback_extension_threshold = 5
+            self._unknown_fallback_move_threshold = 5
 
         self._entropy_rule_name = "EntropyIncrease"
         self._entropy_last_eval: Dict[ProcessIdentity, float] = {}
@@ -1034,13 +1089,26 @@ class ProcessBehaviorTracker:
         identity = ProcessIdentity(pid=record.pid, executable=record.executable or record.process_name)
         last_eval = self._entropy_last_eval.get(identity)
         if last_eval is not None and (timestamp - last_eval) < self._entropy_eval_cooldown:
+            if int(record.entropy_score_bonus or 0) > 0:
+                record.active_rules.add(self._entropy_rule_name)
             return
 
-        behavioral_score = record.score - int(record.entropy_score_bonus or 0)
-        if behavioral_score < self._entropy_trigger_score:
-            record.entropy_score_bonus = 0
-            record.active_rules.discard(self._entropy_rule_name)
-            return
+        is_unattributed = self._is_unattributed_process(record)
+        if is_unattributed:
+            if not self._unknown_entropy_fallback_enabled:
+                record.entropy_score_bonus = 0
+                record.active_rules.discard(self._entropy_rule_name)
+                return
+            if not self._unknown_fallback_triggered(record, timestamp):
+                record.entropy_score_bonus = 0
+                record.active_rules.discard(self._entropy_rule_name)
+                return
+        else:
+            behavioral_score = record.score - int(record.entropy_score_bonus or 0)
+            if behavioral_score < self._entropy_trigger_score:
+                record.entropy_score_bonus = 0
+                record.active_rules.discard(self._entropy_rule_name)
+                return
 
         candidate_paths: List[str] = []
         seen: Set[str] = set()
@@ -1139,6 +1207,37 @@ class ProcessBehaviorTracker:
         else:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
+
+    @staticmethod
+    def _is_unattributed_process(record: ProcessState) -> bool:
+        """Return True when process attribution is not reliable."""
+        if record.pid is not None:
+            return False
+        if record.executable:
+            return False
+        process_name = (record.process_name or "").strip().lower()
+        return process_name in {"", "unknown"}
+
+    def _unknown_fallback_triggered(self, record: ProcessState, timestamp: float) -> bool:
+        """Return True when unknown-attributed activity exceeds fallback thresholds."""
+        window_start = timestamp - self._unknown_fallback_window_seconds
+        modified_count = 0
+        move_count = 0
+        for ts, evt_type, _, _ in record.recent_events:
+            if ts < window_start:
+                continue
+            evt_upper = evt_type.upper()
+            if "MODIF" in evt_upper:
+                modified_count += 1
+            if "MOVE" in evt_upper or "RENAME" in evt_upper:
+                move_count += 1
+
+        extension_count = record.count_extension_changes(self._unknown_fallback_window_seconds)
+        return (
+            modified_count >= self._unknown_fallback_modified_threshold
+            or extension_count >= self._unknown_fallback_extension_threshold
+            or move_count >= self._unknown_fallback_move_threshold
+        )
 
     @staticmethod
     def _compute_file_identity(path: Path) -> Optional[str]:
@@ -1483,7 +1582,6 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         super().__init__()
         self.logger = logger
         self.behavior_tracker = behavior_tracker
-        self._process_resolver = ProcessResolver()
         self._event_callback: Optional[Callable] = event_callback
         self._high_score_callback = high_score_callback
 
@@ -1500,6 +1598,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             self._filesystem_worker_count = max(1, int(cfg.filesystem_worker_count))
             self._high_score_threshold = int(cfg.high_score_rescan_threshold)
             self._high_score_cooldown_seconds = float(cfg.high_score_rescan_cooldown_seconds)
+            resolver_timeout_seconds = 1.25
         else:
             queue_maxsize = 8000
             self._burst_window_seconds = 2.0
@@ -1512,6 +1611,9 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
             self._filesystem_worker_count = 4
             self._high_score_threshold = 30
             self._high_score_cooldown_seconds = 5.0
+            resolver_timeout_seconds = 1.25
+
+        self._process_resolver = ProcessResolver(resolve_timeout_seconds=resolver_timeout_seconds)
 
         self._event_queue: "queue.PriorityQueue[Tuple[int, float, int, _QueuedFileEvent]]" = queue.PriorityQueue(
             maxsize=queue_maxsize
@@ -1583,11 +1685,23 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
     def _report_event(self, event_type: str, src_path: str, previous_path: Optional[str] = None) -> None:
         """Queue a filesystem event for burst-safe background processing."""
         try:
+            process_metadata = None
+            event_type_upper = event_type.upper()
+            if event_type_upper in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
+                try:
+                    process_metadata = self._process_resolver.resolve(
+                        Path(src_path),
+                        previous_path=Path(previous_path) if previous_path else None,
+                        event_type=event_type,
+                        time_budget_seconds=0.08,
+                    )
+                except Exception:
+                    process_metadata = None
             self._enqueue_event(
                 event_type=event_type,
                 src_path=src_path,
                 previous_path=previous_path,
-                process_metadata=None,
+                process_metadata=process_metadata,
                 timestamp=time.time(),
             )
         except Exception as exc:

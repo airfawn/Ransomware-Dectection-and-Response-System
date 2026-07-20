@@ -1320,7 +1320,7 @@ class RdrsGui(QWidget):
         details_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
         details_layout.addWidget(details_title)
 
-        self.entropy_details_hint = QLabel("Select a row to inspect previous entropy, scan time, and file size.")
+        self.entropy_details_hint = QLabel("Select a row to inspect baseline entropy, scan time, and file size.")
         self.entropy_details_hint.setWordWrap(True)
         self.entropy_details_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
         details_layout.addWidget(self.entropy_details_hint)
@@ -1329,7 +1329,7 @@ class RdrsGui(QWidget):
         detail_fields = [
             ("File Name", "file_name"),
             ("Current Entropy", "current_entropy"),
-            ("Previous Entropy", "previous_entropy"),
+            ("Baseline Entropy", "previous_entropy"),
             ("Delta Entropy", "delta_entropy"),
             ("File Size", "file_size"),
             ("Last Scan", "last_scan"),
@@ -2197,7 +2197,7 @@ class RdrsGui(QWidget):
                     file_path,
                 )
 
-        forward_to_entropy = event_type in {"FILE CREATED", "FILE MOVED", "FILE DELETED", "FILE RENAMED"}
+        forward_to_entropy = event_type in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED", "FILE DELETED", "FILE RENAMED"}
         if self._entropy_monitor is not None and forward_to_entropy:
             try:
                 self._entropy_monitor.on_file_event(
@@ -4146,21 +4146,21 @@ class RdrsGui(QWidget):
 
             file_name    = r["file_name"] or ""
             curr_ent     = r["current_entropy"]
-            prev_ent     = r["previous_entropy"]
+            baseline_ent = r["baseline_entropy"] if "baseline_entropy" in r.keys() else r["previous_entropy"]
             file_size    = r["file_size"]
             last_scan    = r["last_scan_ts"]
             exists       = r["exists"]
 
             # Δ entropy
-            if curr_ent is not None and prev_ent is not None:
-                delta = curr_ent - prev_ent
+            if curr_ent is not None and baseline_ent is not None:
+                delta = curr_ent - baseline_ent
                 delta_str = f"{delta:+.4f}"
             else:
                 delta = None
                 delta_str = "—"
 
             curr_str    = f"{curr_ent:.4f}" if curr_ent is not None else "—"
-            prev_str    = f"{prev_ent:.4f}" if prev_ent is not None else "—"
+            prev_str    = f"{baseline_ent:.4f}" if baseline_ent is not None else "—"
             size_str    = self._format_size(file_size) if file_size else "—"
             scan_str    = (
                 datetime.fromtimestamp(last_scan).strftime("%Y-%m-%d %H:%M:%S")
@@ -4221,7 +4221,10 @@ class RdrsGui(QWidget):
             values = [
                 row["file_name"] or Path(row["file_path"]).name,
                 f"{row['current_entropy']:.4f}" if row["current_entropy"] is not None else "—",
-                f"{(row['current_entropy'] - row['previous_entropy']):+.4f}" if row["current_entropy"] is not None and row["previous_entropy"] is not None else "—",
+                f"{(row['current_entropy'] - (row['baseline_entropy'] if 'baseline_entropy' in row.keys() else row['previous_entropy'])):+.4f}"
+                if row["current_entropy"] is not None
+                and ((row["baseline_entropy"] if "baseline_entropy" in row.keys() else row["previous_entropy"]) is not None)
+                else "—",
                 "Exists" if row["exists"] else "Deleted",
             ]
             for col_index, value in enumerate(values):
@@ -4294,7 +4297,7 @@ class RdrsGui(QWidget):
         self.entropy_details_hint.setVisible(False)
         self.entropy_detail_labels["file_name"].setText(f"File Name: {payload.get('file_name', '—')}")
         self.entropy_detail_labels["current_entropy"].setText(f"Current Entropy: {payload.get('current_entropy', '—')}")
-        self.entropy_detail_labels["previous_entropy"].setText(f"Previous Entropy: {payload.get('previous_entropy', '—')}")
+        self.entropy_detail_labels["previous_entropy"].setText(f"Baseline Entropy: {payload.get('previous_entropy', '—')}")
         self.entropy_detail_labels["delta_entropy"].setText(f"Delta Entropy: {payload.get('delta_entropy', '—')}")
         self.entropy_detail_labels["file_size"].setText(f"File Size: {payload.get('file_size', '—')}")
         self.entropy_detail_labels["last_scan"].setText(f"Last Scan: {payload.get('last_scan', '—')}")

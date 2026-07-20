@@ -262,6 +262,50 @@ class WindowsPipelineValidationTest(unittest.TestCase):
             finally:
                 metadata_db.close()
 
+    def test_unknown_process_fallback_triggers_entropy_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_file = root / "unknown_target.txt"
+            target_file.write_bytes(os.urandom(4096))
+            stat = target_file.stat()
+            file_id = f"{int(getattr(stat, 'st_dev', 0) or 0)}:{int(getattr(stat, 'st_ino', 0) or 0)}"
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            metadata_db.upsert_file(
+                file_path=str(target_file),
+                file_name=target_file.name,
+                current_entropy=1.0,
+                previous_entropy=1.0,
+                file_size=stat.st_size,
+                last_modified_ts=stat.st_mtime,
+                file_id=file_id,
+                baseline_entropy=1.0,
+            )
+
+            try:
+                with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
+                    tracker = ProcessBehaviorTracker(_DummyLogger())
+
+                unknown_process = ProcessMetadata(
+                    pid=None,
+                    name=None,
+                    executable=None,
+                    parent_name=None,
+                    start_time=None,
+                    start_time_epoch=None,
+                )
+
+                record = None
+                for _ in range(11):
+                    record = tracker.record_event("FILE MODIFIED", str(target_file), unknown_process)
+
+                self.assertIsNotNone(record)
+                self.assertIn("EntropyIncrease", record.active_rules)
+                self.assertGreaterEqual(record.entropy_score_bonus, 30)
+                self.assertGreaterEqual(record.score, 50)
+            finally:
+                metadata_db.close()
+
     def test_entropy_rename_preserves_baseline_and_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
