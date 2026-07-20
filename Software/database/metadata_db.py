@@ -47,6 +47,7 @@ class MetadataDatabase(BaseDatabase):
     def __init__(self, db_path: Path) -> None:
         super().__init__(db_path)
         self._ensure_identity_map_schema()
+        self._ensure_file_metadata_columns()
 
     @staticmethod
     def _normalize_path(file_path: str) -> str:
@@ -120,6 +121,50 @@ class MetadataDatabase(BaseDatabase):
         self.execute("CREATE INDEX IF NOT EXISTS idx_entropy_identity_path ON entropy_identity_map (path);")
         self.execute("CREATE INDEX IF NOT EXISTS idx_entropy_identity_exists ON entropy_identity_map (\"exists\");")
 
+    def _ensure_file_metadata_columns(self) -> None:
+        """Apply non-destructive schema upgrades for legacy database files."""
+        self.execute("ALTER TABLE file_metadata ADD COLUMN file_id TEXT", commit=False)
+        self.execute("ALTER TABLE file_metadata ADD COLUMN current_path TEXT", commit=False)
+        self.execute("ALTER TABLE file_metadata ADD COLUMN current_filename TEXT", commit=False)
+        self.execute("ALTER TABLE file_metadata ADD COLUMN current_extension TEXT", commit=False)
+        self.execute("ALTER TABLE file_metadata ADD COLUMN baseline_entropy REAL", commit=False)
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metadata_file_id ON file_metadata (file_id)",
+            commit=False,
+        )
+        self.execute(
+            "UPDATE file_metadata SET current_path = file_path WHERE current_path IS NULL",
+            commit=False,
+        )
+        self.execute(
+            "UPDATE file_metadata SET current_filename = file_name WHERE current_filename IS NULL",
+            commit=False,
+        )
+        self.execute(
+            "UPDATE file_metadata SET current_extension = lower(trim(substr(file_name, instr(file_name, '.') + 1))) "
+            "WHERE current_extension IS NULL AND instr(file_name, '.') > 0",
+            commit=False,
+        )
+        self.execute(
+            "UPDATE file_metadata SET baseline_entropy = current_entropy WHERE baseline_entropy IS NULL",
+            commit=True,
+        )
+
+    def execute(
+        self,
+        sql: str,
+        params=(),
+        *,
+        commit: bool = True,
+    ):
+        """Execute SQL while tolerating idempotent ALTER TABLE column-additions."""
+        try:
+            return super().execute(sql, params, commit=commit)
+        except Exception as exc:
+            if "duplicate column name" in str(exc).lower() and "alter table" in sql.lower():
+                return self._conn.execute("SELECT 1")
+            raise
+
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
@@ -134,6 +179,8 @@ class MetadataDatabase(BaseDatabase):
         file_size: Optional[int],
         last_modified_ts: Optional[float],
         sha256_hash: Optional[str] = None,
+        file_id: Optional[str] = None,
+        baseline_entropy: Optional[float] = None,
     ) -> None:
         """Insert or update a file metadata record.
 
@@ -154,13 +201,17 @@ class MetadataDatabase(BaseDatabase):
         """
         now = time.time()
         file_path = self._normalize_path(file_path)
+        extension = ""
+        if "." in file_name:
+            extension = file_name.rsplit(".", 1)[-1].lower()
         self.execute(
             """
             INSERT INTO file_metadata
                 (file_path, file_name, sha256_hash, current_entropy,
                  previous_entropy, file_size, last_modified_ts, last_scan_ts,
-                 "exists", deleted_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL)
+                 "exists", deleted_ts, file_id, current_path, current_filename,
+                 current_extension, baseline_entropy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 file_name        = excluded.file_name,
                 sha256_hash      = COALESCE(excluded.sha256_hash, sha256_hash),
@@ -169,6 +220,11 @@ class MetadataDatabase(BaseDatabase):
                 file_size        = excluded.file_size,
                 last_modified_ts = excluded.last_modified_ts,
                 last_scan_ts     = excluded.last_scan_ts,
+                file_id          = COALESCE(excluded.file_id, file_id),
+                current_path     = excluded.current_path,
+                current_filename = excluded.current_filename,
+                current_extension = excluded.current_extension,
+                baseline_entropy = COALESCE(baseline_entropy, excluded.baseline_entropy),
                 "exists"         = 1,
                 deleted_ts       = NULL
             """,
@@ -181,8 +237,34 @@ class MetadataDatabase(BaseDatabase):
                 file_size,
                 last_modified_ts,
                 now,
+                file_id,
+                file_path,
+                file_name,
+                extension,
+                baseline_entropy if baseline_entropy is not None else current_entropy,
             ),
         )
+
+    def get_file_by_identifier(self, file_id: Optional[str], file_path: str):
+        """Fetch a file row by stable identifier, falling back to canonical path."""
+        normalized_path = self._normalize_path(file_path)
+        if file_id:
+            row = self.fetchone(
+                'SELECT * FROM file_metadata WHERE file_id = ? AND "exists" = 1',
+                (file_id,),
+            )
+            if row is not None:
+                return row
+        return self.fetchone(
+            "SELECT * FROM file_metadata WHERE file_path = ?",
+            (normalized_path,),
+        )
+
+    def reset_runtime_state(self) -> None:
+        """Clear runtime metadata so startup can rebuild from filesystem truth."""
+        self.execute("DELETE FROM file_metadata")
+        self.execute("DELETE FROM entropy_cache")
+        self.execute("DELETE FROM entropy_identity_map")
 
     # ------------------------------------------------------------------
     # Entropy cache operations

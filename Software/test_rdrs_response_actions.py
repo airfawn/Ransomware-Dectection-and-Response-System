@@ -30,6 +30,10 @@ class RdrsResponseActionsTest(unittest.TestCase):
         gui.suspicious_process_rows = {}
         gui.process_state_cache = {}
         gui._last_alert_process_key = None
+        gui._auto_quarantine_attempted = set()
+        gui._selected_home_process_key = None
+        gui._pending_process_state_refresh = False
+        gui._pending_metrics_refresh = False
         gui.home_table = _HomeTableStub()
         gui._alerts_db = None
         return gui
@@ -84,7 +88,8 @@ class RdrsResponseActionsTest(unittest.TestCase):
             errors = []
 
             gui._get_response_target_process = lambda: target
-            gui._terminate_process_if_running = lambda pid: "PID 321 terminated"
+            gui._suspend_process_if_running = lambda pid: "PID 321 suspended"
+            gui._kill_process_if_running = lambda pid: "PID 321 killed"
             gui._show_alert_banner = lambda msg: banner_messages.append(msg)
             gui._log_response_action = lambda action, process, notes, **kwargs: logged_actions.append((action, process, notes, kwargs))
             gui.show_error = lambda msg: errors.append(msg)
@@ -124,7 +129,7 @@ class RdrsResponseActionsTest(unittest.TestCase):
             errors = []
 
             gui._get_response_target_process = lambda: target
-            gui._terminate_process_if_running = lambda pid: "PID 654 terminated"
+            gui._kill_process_if_running = lambda pid: "PID 654 killed"
             gui._show_alert_banner = lambda msg: banner_messages.append(msg)
             gui._log_response_action = lambda action, process, notes, **kwargs: logged_actions.append((action, process, notes, kwargs))
             gui.show_error = lambda msg: errors.append(msg)
@@ -140,6 +145,26 @@ class RdrsResponseActionsTest(unittest.TestCase):
             self.assertEqual(len(logged_actions), 1)
             self.assertEqual(logged_actions[0][0], "DELETE_ACTION")
             self.assertEqual(logged_actions[0][3]["status"], "SUCCEEDED")
+
+    def test_auto_quarantine_triggers_once_at_score_50(self):
+        gui = self._make_gui_shell()
+
+        calls = []
+        gui._perform_quarantine_for_target = lambda target, automatic=False: calls.append((target, automatic)) or True
+
+        entry = {
+            "event_type": "PROCESS_STATE",
+            "pid": "999",
+            "process": "suspect",
+            "executable": "/tmp/suspect.exe",
+            "score": "50",
+        }
+
+        gui._update_process_state_table(entry)
+        gui._update_process_state_table(entry)
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1])
 
 
 if __name__ == "__main__":

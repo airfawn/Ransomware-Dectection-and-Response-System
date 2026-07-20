@@ -451,6 +451,8 @@ class EntropyMonitor:
             previous_entropy=previous_entropy,
             file_size=stat.st_size,
             last_modified_ts=stat.st_mtime,
+            file_id=file_id,
+            baseline_entropy=entropy if existing_legacy is None else None,
         )
 
     # ------------------------------------------------------------------
@@ -625,7 +627,7 @@ class EntropyMonitor:
             # -----------------------------------------------------------------
             # 4. Fetch existing record to get previous entropy
             # -----------------------------------------------------------------
-            existing = self._metadata_db.get_file(resolved_path)
+            existing = self._metadata_db.get_file_by_identifier(file_id, resolved_path)
             previous_entropy: Optional[float] = None
             if existing:
                 previous_entropy = existing["current_entropy"]
@@ -752,6 +754,7 @@ class EntropyMonitor:
                 previous_entropy=previous_entropy,
                 file_size=file_size,
                 last_modified_ts=last_modified,
+                file_id=file_id,
             )
             if file_id:
                 self._metadata_db.upsert_entropy_identity(file_id, resolved_path, exists=True)

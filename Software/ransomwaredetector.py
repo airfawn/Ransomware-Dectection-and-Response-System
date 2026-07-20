@@ -96,6 +96,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+APP_VERSION = "v1.0"
+
 
 def _safe_export_name(value: str, fallback: str = "event") -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value or "").strip("._")
@@ -730,6 +732,7 @@ class RdrsGui(QWidget):
         self.suspicious_process_rows: Dict[Tuple[Optional[str], str], int] = {}
         self.suspicious_process_entries: Dict[Tuple[Optional[str], str], dict] = {}
         self._last_alert_process_key: Optional[Tuple[Optional[str], str]] = None
+        self._auto_quarantine_attempted: Set[Tuple[Optional[str], str]] = set()
         self._selected_home_process_key: Optional[Tuple[Optional[str], str]] = None
         self.response_action_rows: List[dict] = []
         self.active_process_rows: Dict[Tuple[Optional[str], str], int] = {}
@@ -1654,6 +1657,13 @@ class RdrsGui(QWidget):
 
         bottom_layout.addWidget(status_container, 1)
 
+        self.version_label = QLabel(APP_VERSION)
+        self.version_label.setStyleSheet("color: #9fb3d1; font-weight: 600;")
+        self.version_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        self.version_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+        bottom_layout.addWidget(self.version_label, 0, Qt.AlignRight | Qt.AlignBottom)
+        self._update_version_label_font()
+
         content = QWidget()
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -1773,11 +1783,30 @@ class RdrsGui(QWidget):
         self.entropy_table.setColumnWidth(3, max(120, self.entropy_table.sizeHintForColumn(3) + 20))
         self.entropy_table.setColumnWidth(0, file_name_width)
 
+    def _update_version_label_font(self) -> None:
+        """Keep the footer version text small while allowing gentle resize scaling."""
+        if not hasattr(self, "version_label"):
+            return
+
+        width = max(0, self.width())
+        point_size = 8.0
+        if width >= 1200:
+            point_size = 9.0
+        if width >= 1600:
+            point_size = 10.0
+        if width >= 2000:
+            point_size = 11.0
+
+        font = self.version_label.font()
+        font.setPointSizeF(point_size)
+        self.version_label.setFont(font)
+
     def resizeEvent(self, event) -> None:
         """Keep responsive table proportions as the window size changes."""
         super().resizeEvent(event)
         if hasattr(self, "entropy_table"):
             self._resize_entropy_columns()
+        self._update_version_label_font()
 
     def select_page(self, index: int):
         self.page_stack.setCurrentIndex(index)
@@ -2106,7 +2135,7 @@ class RdrsGui(QWidget):
             emit_started=self.output_bridge.process_started.emit,
             emit_stopped=self._on_monitor_stopped,
             event_callback=self._on_filesystem_event,
-            high_score_callback=self._on_high_score_rescan_requested,
+            high_score_callback=None,
         )
 
         if not self.monitor_session.start():
@@ -2168,7 +2197,8 @@ class RdrsGui(QWidget):
                     file_path,
                 )
 
-        if self._entropy_monitor is not None and event_type != "FILE EXTENSION CHANGED":
+        forward_to_entropy = event_type in {"FILE CREATED", "FILE MOVED", "FILE DELETED", "FILE RENAMED"}
+        if self._entropy_monitor is not None and forward_to_entropy:
             try:
                 self._entropy_monitor.on_file_event(
                     event_type,
@@ -2192,10 +2222,11 @@ class RdrsGui(QWidget):
                     file_path,
                 )
         else:
-            logger.warning(
-                "[ENTROPY_TRACE][GUI_CALLBACK] entropy monitor is None; skip forward event=%s file=%s",
+            logger.debug(
+                "[ENTROPY_TRACE][GUI_CALLBACK] entropy forwarding skipped event=%s file=%s monitor=%s",
                 event_type,
                 file_path,
+                self._entropy_monitor is not None,
             )
 
         try:
@@ -3257,6 +3288,16 @@ class RdrsGui(QWidget):
                     record["pid"] = value
                 elif current_key == "executable":
                     record["executable"] = value
+                elif current_key == "parent_pid":
+                    record["parent_pid"] = value
+                elif current_key == "parent_executable":
+                    record["parent_executable"] = value
+                elif current_key == "command_line":
+                    record["command_line"] = value
+                elif current_key == "working_directory":
+                    record["working_directory"] = value
+                elif current_key == "username":
+                    record["username"] = value
                 elif current_key == "process_age":
                     record["process_age"] = value
                 elif current_key == "files_created":
@@ -3350,10 +3391,28 @@ class RdrsGui(QWidget):
             return
         key = (entry.get("pid"), entry.get("executable", ""))
         self.process_state_cache[key] = entry.copy()
+        self._maybe_auto_quarantine_process(key, entry)
         self._pending_process_state_refresh = True
         self._pending_metrics_refresh = True
         if self._selected_home_process_key == key:
             self._on_home_selection_changed()
+
+    def _maybe_auto_quarantine_process(self, process_key: Tuple[Optional[str], str], entry: dict) -> None:
+        """Automatically quarantine processes that reach score threshold 50."""
+        if process_key in self._auto_quarantine_attempted:
+            return
+        try:
+            score_value = int(str(entry.get("score") or "0"))
+        except Exception:
+            score_value = 0
+        if score_value < 50:
+            return
+
+        self._auto_quarantine_attempted.add(process_key)
+        self._perform_quarantine_for_target(
+            entry,
+            automatic=True,
+        )
 
     def _refresh_process_state_tables(self) -> None:
         self.active_process_table.setRowCount(0)
@@ -3775,33 +3834,47 @@ class RdrsGui(QWidget):
 
         return max(process_state_cache.values(), key=_score)
 
-    def _terminate_process_if_running(self, pid_value: Optional[str]) -> str:
-        """Attempt graceful then forced termination for a PID.
-
-        Returns:
-            Human-readable termination status.
-        """
+    def _suspend_process_if_running(self, pid_value: Optional[str]) -> str:
+        """Suspend a running process, handling already-exited PIDs gracefully."""
         if not pid_value or not str(pid_value).isdigit():
-            return "PID unavailable; termination skipped"
+            return "PID unavailable; suspension skipped"
         if psutil is None:
-            return "psutil unavailable; termination skipped"
+            return "psutil unavailable; suspension skipped"
 
         pid = int(str(pid_value))
         try:
             proc = psutil.Process(pid)
             if not proc.is_running():
-                return f"PID {pid} is not running"
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-                return f"PID {pid} terminated"
-            except psutil.TimeoutExpired:
-                proc.kill()
-                return f"PID {pid} killed"
+                return "Process exited before quarantine could be performed."
+            proc.suspend()
+            return f"PID {pid} suspended"
         except psutil.NoSuchProcess:
-            return f"PID {pid} not found"
+            return "Process exited before quarantine could be performed."
         except Exception as exc:
-            return f"PID {pid} termination failed: {exc}"
+            return f"PID {pid} suspension failed: {exc}"
+
+    def _kill_process_if_running(self, pid_value: Optional[str]) -> str:
+        """Kill a running process after quarantine succeeds."""
+        if not pid_value or not str(pid_value).isdigit():
+            return "PID unavailable; kill skipped"
+        if psutil is None:
+            return "psutil unavailable; kill skipped"
+
+        pid = int(str(pid_value))
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running():
+                return "Process exited before quarantine could be performed."
+            proc.kill()
+            return f"PID {pid} killed"
+        except psutil.NoSuchProcess:
+            return "Process exited before quarantine could be performed."
+        except Exception as exc:
+            return f"PID {pid} kill failed: {exc}"
+
+    def _terminate_process_if_running(self, pid_value: Optional[str]) -> str:
+        """Backward-compatible wrapper retained for existing callers/tests."""
+        return self._kill_process_if_running(pid_value)
 
     def _log_response_action(
         self,
@@ -3865,38 +3938,39 @@ class RdrsGui(QWidget):
         except Exception:
             logger.exception("Failed to persist response action: %s", action)
 
-    def _on_quarantine_alert_process(self) -> None:
-        """Terminate suspected process and move executable into quarantine."""
-        target = self._get_response_target_process()
-        if target is None:
-            self.show_error("No suspicious process available to quarantine.")
-            return
-
+    def _perform_quarantine_for_target(self, target: dict, *, automatic: bool) -> bool:
+        """Suspend, quarantine executable, then kill process if quarantine succeeds."""
         executable = str(target.get("executable") or "").strip()
         if not executable:
+            message = "Selected process had no executable path; quarantine aborted."
             self._log_response_action(
                 "QUARANTINE_ACTION",
                 target,
-                "Selected process had no executable path; quarantine aborted.",
+                message,
                 status="FAILED",
                 source_path="",
             )
-            self.show_error("Selected process has no executable path; cannot quarantine.")
-            return
+            if not automatic:
+                self.show_error(message)
+            return False
 
+        suspend_status = self._suspend_process_if_running(target.get("pid"))
         exe_path = Path(executable).expanduser()
         if not exe_path.exists() or not exe_path.is_file():
+            message = f"Executable not found for quarantine: {exe_path}"
+            if "Process exited before quarantine could be performed." in suspend_status:
+                message = "Process exited before quarantine could be performed."
             self._log_response_action(
                 "QUARANTINE_ACTION",
                 target,
-                f"Executable not found for quarantine: {exe_path}",
+                message,
                 status="FAILED",
                 source_path=str(exe_path),
+                termination_status=suspend_status,
             )
-            self.show_error(f"Executable not found for quarantine: {exe_path}")
-            return
-
-        terminate_status = self._terminate_process_if_running(target.get("pid"))
+            if not automatic:
+                self.show_error(message)
+            return False
 
         quarantine_dir = get_data_dir() / "quarantine"
         quarantine_dir.mkdir(parents=True, exist_ok=True)
@@ -3906,32 +3980,48 @@ class RdrsGui(QWidget):
         try:
             moved_path = Path(shutil.move(str(exe_path), str(destination)))
         except Exception as exc:
+            message = f"Failed to quarantine executable: {exc}"
             self._log_response_action(
                 "QUARANTINE_ACTION",
                 target,
-                f"Failed to quarantine executable: {exc}",
+                message,
                 status="FAILED",
                 source_path=str(exe_path),
-                termination_status=terminate_status,
+                termination_status=suspend_status,
             )
-            self.show_error(f"Failed to quarantine executable: {exc}")
-            return
+            if not automatic:
+                self.show_error(message)
+            return False
 
-        msg = (
+        kill_status = self._kill_process_if_running(target.get("pid"))
+        message = (
             f"Quarantined {target.get('process') or exe_path.name}. "
-            f"{terminate_status}.\nMoved to: {moved_path}"
+            f"{suspend_status}; {kill_status}.\nMoved to: {moved_path}"
         )
-        self._show_alert_banner(msg)
+        self._show_alert_banner(message)
         self._log_response_action(
             "QUARANTINE_ACTION",
             target,
-            msg,
+            message,
             status="SUCCEEDED",
             source_path=str(exe_path),
             result_path=str(moved_path),
-            termination_status=terminate_status,
+            termination_status=kill_status,
         )
-        QMessageBox.information(self, "Quarantine Complete", msg)
+        if automatic:
+            logger.warning("Automatic quarantine executed for PID=%s executable=%s", target.get("pid"), executable)
+        return True
+
+    def _on_quarantine_alert_process(self) -> None:
+        """Manual quarantine action from GUI controls."""
+        target = self._get_response_target_process()
+        if target is None:
+            self.show_error("No suspicious process available to quarantine.")
+            return
+
+        success = self._perform_quarantine_for_target(target, automatic=False)
+        if success:
+            QMessageBox.information(self, "Quarantine Complete", "Quarantine action completed.")
 
     def _on_delete_alert_process(self) -> None:
         """Terminate suspected process and delete executable file."""

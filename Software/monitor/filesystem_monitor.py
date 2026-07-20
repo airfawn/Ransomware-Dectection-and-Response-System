@@ -40,6 +40,9 @@ from watchdog.events import (
 )
 from watchdog.observers import Observer
 
+from entropy.calculator import calculate_entropy
+from database import get_metadata_db
+
 try:
     from config import get_config
     from detection_engine import (
@@ -69,6 +72,11 @@ class ProcessMetadata:
     parent_name: Optional[str]
     start_time: Optional[str]
     start_time_epoch: Optional[float] = None
+    parent_pid: Optional[int] = None
+    parent_executable: Optional[str] = None
+    command_line: Optional[str] = None
+    working_directory: Optional[str] = None
+    username: Optional[str] = None
 
 
 class ProcessResolver:
@@ -252,6 +260,44 @@ class ProcessResolver:
             parent_name = parent.name() if parent else None
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
             parent_name = None
+
+        try:
+            parent = process.parent()
+            parent_pid = parent.pid if parent else None
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            parent_pid = None
+
+        try:
+            parent = process.parent()
+            parent_executable = parent.exe() if parent else None
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            parent_executable = None
+
+        try:
+            cmdline_parts = process.cmdline()
+            command_line = " ".join(cmdline_parts) if cmdline_parts else None
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            command_line = None
+
+        try:
+            working_directory = process.cwd()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            working_directory = None
+
+        try:
+            username = process.username()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            username = None
+
+        display_name = name
+        if name and "powershell" in name.lower() and command_line:
+            script_hint = None
+            for token in command_line.split():
+                if token.lower().endswith(".ps1"):
+                    script_hint = Path(token.strip('"\'' )).name
+                    break
+            if script_hint:
+                display_name = f"{name} -> {script_hint}"
         
         start_time_epoch = self._get_start_time_epoch(process)
         start_time = (
@@ -262,11 +308,16 @@ class ProcessResolver:
         
         return ProcessMetadata(
             pid=process.pid,
-            name=name,
+            name=display_name,
             executable=executable,
             parent_name=parent_name,
             start_time=start_time,
             start_time_epoch=start_time_epoch,
+            parent_pid=parent_pid,
+            parent_executable=parent_executable,
+            command_line=command_line,
+            working_directory=working_directory,
+            username=username,
         )
 
     @staticmethod
@@ -358,6 +409,11 @@ class ProcessState:
     pid: Optional[int]
     executable: Optional[str]
     parent_name: Optional[str] = None
+    parent_pid: Optional[int] = None
+    parent_executable: Optional[str] = None
+    command_line: Optional[str] = None
+    working_directory: Optional[str] = None
+    username: Optional[str] = None
     process_start_time: Optional[str] = None
     process_start_time_epoch: Optional[float] = None
     first_activity: Optional[str] = None
@@ -374,6 +430,7 @@ class ProcessState:
     rename_count: int = 0
     bytes_written: int = 0
     encryption_indicators: Dict[str, Any] = field(default_factory=dict)
+    entropy_score_bonus: int = 0
     max_event_history: int = 1000
     event_window_seconds: float = 60.0
     recent_events: Deque[Tuple[float, str, str, str]] = field(default_factory=deque)
@@ -550,7 +607,8 @@ class ProcessState:
                 "Rule3_YoungProcessBurst": 10,
                 "Rule4_ExtensionChangeBurst": 30,
             }
-        return sum(weights.get(rule_name, 0) for rule_name in self.active_rules)
+        behavioral = sum(weights.get(rule_name, 0) for rule_name in self.active_rules)
+        return behavioral + int(self.entropy_score_bonus or 0)
 
     @property
     def process_age_seconds(self) -> Optional[float]:
@@ -666,6 +724,14 @@ class ProcessBehaviorTracker:
             extension_engine = ExtensionChangeEngine(config.detection.__dict__)
             self._orchestrator.register_engine(extension_engine)
 
+            self._entropy_enabled = bool(config.entropy.enabled)
+            self._entropy_allowed_extensions = {e.lower().lstrip(".") for e in config.entropy.file_extensions}
+            self._entropy_sample_size_bytes = int(config.entropy.sample_size_bytes)
+            self._entropy_delta_threshold = float(config.entropy.threshold)
+            self._entropy_score_delta = int(config.entropy.score)
+            self._entropy_trigger_score = int(config.monitoring.high_score_rescan_threshold)
+            self._entropy_eval_cooldown = float(config.monitoring.high_score_rescan_cooldown_seconds)
+
             # File Extension Change Monitor settings (detection, not scoring).
             ext_cfg = config.extension_monitor
             self._extension_monitor_enabled = ext_cfg.enabled
@@ -679,6 +745,17 @@ class ProcessBehaviorTracker:
             self._orchestrator = None
             self._extension_monitor_enabled = True
             self._ignored_extensions = set(DEFAULT_IGNORED_TARGET_EXTENSIONS)
+            self._entropy_enabled = True
+            self._entropy_allowed_extensions = set()
+            self._entropy_sample_size_bytes = 5 * 1024 * 1024
+            self._entropy_delta_threshold = 1.4
+            self._entropy_score_delta = 30
+            self._entropy_trigger_score = 30
+            self._entropy_eval_cooldown = 5.0
+
+        self._entropy_rule_name = "EntropyIncrease"
+        self._entropy_last_eval: Dict[ProcessIdentity, float] = {}
+        self._metadata_db = get_metadata_db()
         
         # Cleanup scheduling
         self._last_cleanup_time = datetime.now().timestamp()
@@ -856,6 +933,11 @@ class ProcessBehaviorTracker:
                 pid=process_metadata.pid,
                 executable=process_metadata.executable,
                 parent_name=process_metadata.parent_name,
+                parent_pid=process_metadata.parent_pid,
+                parent_executable=process_metadata.parent_executable,
+                command_line=process_metadata.command_line,
+                working_directory=process_metadata.working_directory,
+                username=process_metadata.username,
                 process_start_time=process_metadata.start_time,
                 process_start_time_epoch=process_metadata.start_time_epoch,
                 max_event_history=self._max_event_history,
@@ -884,6 +966,16 @@ class ProcessBehaviorTracker:
             record.executable = process_metadata.executable
         if not record.parent_name and process_metadata.parent_name:
             record.parent_name = process_metadata.parent_name
+        if not record.parent_pid and process_metadata.parent_pid is not None:
+            record.parent_pid = process_metadata.parent_pid
+        if not record.parent_executable and process_metadata.parent_executable:
+            record.parent_executable = process_metadata.parent_executable
+        if not record.command_line and process_metadata.command_line:
+            record.command_line = process_metadata.command_line
+        if not record.working_directory and process_metadata.working_directory:
+            record.working_directory = process_metadata.working_directory
+        if not record.username and process_metadata.username:
+            record.username = process_metadata.username
         if not record.process_start_time and process_metadata.start_time:
             record.process_start_time = process_metadata.start_time
         if not record.process_start_time_epoch and process_metadata.start_time_epoch:
@@ -927,6 +1019,145 @@ class ProcessBehaviorTracker:
             for result in results:
                 if result.rule_name in new_activations:
                     self._log_detection(record, result)
+
+        # Verification-based entropy scoring runs only after the behavior score
+        # reaches the configured trigger and evaluates a bounded recent-file set.
+        self._apply_entropy_verification_rule(record, timestamp)
+
+    def _apply_entropy_verification_rule(self, record: ProcessState, timestamp: float) -> None:
+        """Apply entropy verification bonus based on average entropy increase."""
+        if not self._entropy_enabled:
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            return
+
+        identity = ProcessIdentity(pid=record.pid, executable=record.executable or record.process_name)
+        last_eval = self._entropy_last_eval.get(identity)
+        if last_eval is not None and (timestamp - last_eval) < self._entropy_eval_cooldown:
+            return
+
+        behavioral_score = record.score - int(record.entropy_score_bonus or 0)
+        if behavioral_score < self._entropy_trigger_score:
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            return
+
+        candidate_paths: List[str] = []
+        seen: Set[str] = set()
+        for _, evt_type, _, evt_path in reversed(record.recent_events):
+            if "MODIF" not in evt_type.upper():
+                continue
+            normalized = os.path.normcase(str(Path(evt_path)))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidate_paths.append(evt_path)
+            if len(candidate_paths) >= 10:
+                break
+
+        if not candidate_paths:
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            self._entropy_last_eval[identity] = timestamp
+            return
+
+        deltas: List[float] = []
+        for raw_path in candidate_paths:
+            path = Path(raw_path)
+            if not path.exists() or not path.is_file():
+                continue
+            extension = path.suffix.lower().lstrip(".")
+            if self._entropy_allowed_extensions and extension not in self._entropy_allowed_extensions:
+                continue
+
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+
+            file_id = self._compute_file_identity(path)
+            existing = self._metadata_db.get_file_by_identifier(file_id, str(path))
+            baseline_entropy: Optional[float] = None
+            previous_entropy: Optional[float] = None
+            if existing is not None:
+                baseline_entropy = existing["baseline_entropy"] if "baseline_entropy" in existing.keys() else None
+                previous_entropy = existing["current_entropy"]
+            if baseline_entropy is None and previous_entropy is not None:
+                baseline_entropy = previous_entropy
+            if baseline_entropy is None:
+                cache_row = self._metadata_db.get_entropy_record(str(path))
+                if cache_row is not None:
+                    baseline_entropy = cache_row["entropy"]
+            if baseline_entropy is None:
+                continue
+
+            current_entropy = calculate_entropy(path, self._entropy_sample_size_bytes)
+            if current_entropy is None:
+                continue
+
+            delta = float(current_entropy - baseline_entropy)
+            deltas.append(delta)
+
+            self._metadata_db.upsert_entropy_cache(
+                path=str(path),
+                entropy=current_entropy,
+                file_size=stat.st_size,
+                modified_time=stat.st_mtime,
+                exists=True,
+            )
+            self._metadata_db.upsert_file(
+                file_path=str(path),
+                file_name=path.name,
+                current_entropy=current_entropy,
+                previous_entropy=previous_entropy,
+                file_size=stat.st_size,
+                last_modified_ts=stat.st_mtime,
+                file_id=file_id,
+                baseline_entropy=baseline_entropy,
+            )
+
+        self._entropy_last_eval[identity] = timestamp
+        if not deltas:
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            return
+
+        avg_entropy_increase = sum(deltas) / len(deltas)
+        previously_active = self._entropy_rule_name in record.active_rules
+        if avg_entropy_increase > self._entropy_delta_threshold:
+            record.entropy_score_bonus = self._entropy_score_delta
+            record.active_rules.add(self._entropy_rule_name)
+            if not previously_active:
+                reason = (
+                    "Entropy verification rule triggered: average entropy increase "
+                    f"{avg_entropy_increase:.3f} across {len(deltas)} recent files "
+                    f"(threshold {self._entropy_delta_threshold:.3f})"
+                )
+                self._log_legacy_detection(
+                    record,
+                    self._entropy_rule_name,
+                    reason,
+                    record.score,
+                )
+        else:
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+
+    @staticmethod
+    def _compute_file_identity(path: Path) -> Optional[str]:
+        """Build stable identity for DB lookups (inode/device, then path fallback)."""
+        try:
+            stat = path.stat()
+            inode = int(getattr(stat, "st_ino", 0) or 0)
+            device = int(getattr(stat, "st_dev", 0) or 0)
+            if inode > 0:
+                return f"{device}:{inode}"
+        except Exception:
+            pass
+        try:
+            return f"path:{os.path.normcase(os.path.realpath(str(path)))}"
+        except Exception:
+            return None
 
     def _apply_legacy_rules(
         self,
@@ -1136,7 +1367,12 @@ class ProcessBehaviorTracker:
         lines.extend([
             "Process Name:", record.process_name or "unknown",
             "PID:", str(record.pid) if record.pid is not None else "unknown",
+            "Parent PID:", str(record.parent_pid) if record.parent_pid is not None else "unknown",
             "Executable:", record.executable or "unknown",
+            "Parent Executable:", record.parent_executable or "unknown",
+            "Command Line:", record.command_line or "unknown",
+            "Working Directory:", record.working_directory or "unknown",
+            "Username:", record.username or "unknown",
             "Process Age:", record.process_age,
             "Process Start Time:", record.process_start_time or "unknown",
             "First Activity:", record.first_activity or "unknown",
@@ -1644,7 +1880,8 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                     queued_event.src_path,
                 )
 
-            self._maybe_trigger_high_score_rescan(process_state)
+            # Legacy high-score rescan dispatch is intentionally disabled.
+            # Entropy scoring is now computed inside ProcessBehaviorTracker.
         except Exception as exc:
             self.logger.error(f"Failed to process queued filesystem event for {queued_event.src_path}: {exc}", exc_info=True)
         finally:
@@ -1653,39 +1890,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
 
     def _maybe_trigger_high_score_rescan(self, process_state: ProcessState) -> None:
         """Trigger filesystem-truth entropy rescans for high-score suspicious activity."""
-        if self._high_score_callback is None:
-            return
-        if process_state.score <= self._high_score_threshold:
-            return
-
-        process_key = (process_state.pid, process_state.executable or process_state.process_name or "")
-        unique_files = sorted(process_state.unique_files_touched)
-        now = time.time()
-        previous = self._high_score_rescan_state.get(process_key)
-        if previous is not None:
-            previous_count, previous_ts = previous
-            if len(unique_files) <= previous_count and (now - previous_ts) < self._high_score_cooldown_seconds:
-                return
-
-        self._high_score_rescan_state[process_key] = (len(unique_files), now)
-        packet_size = self._adaptive_packet_size()
-        context = {
-            "pid": process_state.pid,
-            "process": process_state.process_name,
-            "executable": process_state.executable,
-            "score": process_state.score,
-            "reason": "high_score_entropy_rescan",
-        }
-        for index in range(0, len(unique_files), packet_size):
-            packet = unique_files[index : index + packet_size]
-            self._enqueue_event(
-                event_type="HIGH_SCORE_RESCAN",
-                src_path=packet[0],
-                previous_path=None,
-                process_metadata=None,
-                timestamp=time.time(),
-                payload={"paths": packet, "context": context},
-            )
+        return
 
     def _dispatch_high_priority_rescan(self, queued_event: _QueuedFileEvent) -> None:
         """Dispatch highest-priority entropy rescans to downstream callback."""

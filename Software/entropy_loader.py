@@ -37,6 +37,19 @@ from database.metadata_db import MetadataDatabase
 logger = logging.getLogger(__name__)
 
 
+def _build_file_identity(path: Path) -> str:
+    """Return stable file identity, preferring filesystem inode/device."""
+    try:
+        stat = path.stat()
+        inode = int(getattr(stat, "st_ino", 0) or 0)
+        device = int(getattr(stat, "st_dev", 0) or 0)
+        if inode > 0:
+            return f"{device}:{inode}"
+    except Exception:
+        pass
+    return f"path:{os.path.normcase(os.path.realpath(str(path)))}"
+
+
 @dataclass(frozen=True)
 class EntropyLoadSummary:
     """Result summary for an entropy database build/rebuild run."""
@@ -90,6 +103,9 @@ def build_entropy_cache(
     candidates = list(_iter_candidate_files(roots, allowed_extensions))
     current_paths = {str(path.resolve()) for path in candidates if path.exists()}
 
+    # Startup must treat filesystem as source of truth and rebuild from scratch.
+    metadata_db.reset_runtime_state()
+
     try:
         existing_rows = metadata_db.get_all_existing()
         existing_paths = {row["file_path"] for row in existing_rows if row["file_path"]}
@@ -119,8 +135,8 @@ def build_entropy_cache(
             size = None
             mtime = None
 
-        previous_record = metadata_db.get_file(resolved_path)
-        previous_entropy = previous_record["current_entropy"] if previous_record is not None else None
+        previous_record = None
+        previous_entropy = None
 
         entropy_value = None
         if size is not None and mtime is not None:
@@ -146,12 +162,11 @@ def build_entropy_cache(
                 previous_entropy=previous_entropy,
                 file_size=size,
                 last_modified_ts=mtime,
+                file_id=_build_file_identity(path),
+                baseline_entropy=entropy_value,
             )
             processed += 1
-            if previous_record is None:
-                added_files += 1
-            else:
-                updated_files += 1
+            added_files += 1
 
         percent = int((idx / total) * 100) if total > 0 else 100
         if progress_callback is not None:
@@ -243,6 +258,7 @@ def rescan_specific_files(
             previous_entropy=previous_entropy,
             file_size=size,
             last_modified_ts=mtime,
+            file_id=_build_file_identity(path),
         )
         processed += 1
         if previous_record is None:
