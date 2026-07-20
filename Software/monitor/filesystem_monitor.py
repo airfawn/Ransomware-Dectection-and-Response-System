@@ -1066,9 +1066,6 @@ class ProcessBehaviorTracker:
             path = Path(raw_path)
             if not path.exists() or not path.is_file():
                 continue
-            extension = path.suffix.lower().lstrip(".")
-            if self._entropy_allowed_extensions and extension not in self._entropy_allowed_extensions:
-                continue
 
             try:
                 stat = path.stat()
