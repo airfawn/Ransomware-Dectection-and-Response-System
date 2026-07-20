@@ -530,10 +530,6 @@ class EntropyMonitor:
                     self._metadata_db.rename_entropy_path(evt.previous_path, file_path)
                 except Exception as exc:
                     logger.warning("Failed to rename entropy cache %s -> %s: %s", evt.previous_path, file_path, exc)
-                try:
-                    self._metadata_db.mark_deleted(evt.previous_path)
-                except Exception:
-                    pass
 
                 if evt.file_id:
                     try:
@@ -627,7 +623,7 @@ class EntropyMonitor:
             # -----------------------------------------------------------------
             # 4. Fetch existing record to get previous entropy
             # -----------------------------------------------------------------
-            existing = self._metadata_db.get_file_by_identifier(file_id, resolved_path)
+            existing = self._metadata_db.get_file_by_identifier(file_id, resolved_path, include_deleted=True)
             previous_entropy: Optional[float] = None
             if existing:
                 previous_entropy = existing["current_entropy"]
@@ -740,6 +736,13 @@ class EntropyMonitor:
 
         for resolved_path, payload in batch:
             current_entropy, file_name, previous_entropy, file_size, last_modified, file_id = payload
+            existing = None
+            if file_id:
+                try:
+                    existing = self._metadata_db.get_file_by_identifier(file_id, resolved_path, include_deleted=True)
+                except Exception:
+                    existing = None
+
             self._metadata_db.upsert_entropy_cache(
                 path=resolved_path,
                 entropy=current_entropy,
@@ -747,15 +750,39 @@ class EntropyMonitor:
                 modified_time=last_modified,
                 exists=True,
             )
-            self._metadata_db.upsert_file(
-                file_path=resolved_path,
-                file_name=file_name,
-                current_entropy=current_entropy,
-                previous_entropy=previous_entropy,
-                file_size=file_size,
-                last_modified_ts=last_modified,
-                file_id=file_id,
-            )
+            if file_id and existing is not None:
+                updated = self._metadata_db.update_file_by_identifier(
+                    file_id=file_id,
+                    file_path=resolved_path,
+                    file_name=file_name,
+                    current_entropy=current_entropy,
+                    previous_entropy=previous_entropy,
+                    file_size=file_size,
+                    last_modified_ts=last_modified,
+                    exists=True,
+                )
+                if not updated:
+                    self._metadata_db.upsert_file(
+                        file_path=resolved_path,
+                        file_name=file_name,
+                        current_entropy=current_entropy,
+                        previous_entropy=previous_entropy,
+                        file_size=file_size,
+                        last_modified_ts=last_modified,
+                        file_id=file_id,
+                        baseline_entropy=existing["baseline_entropy"] if "baseline_entropy" in existing.keys() else None,
+                        first_seen=existing["first_seen"] if "first_seen" in existing.keys() else None,
+                    )
+            else:
+                self._metadata_db.upsert_file(
+                    file_path=resolved_path,
+                    file_name=file_name,
+                    current_entropy=current_entropy,
+                    previous_entropy=previous_entropy,
+                    file_size=file_size,
+                    last_modified_ts=last_modified,
+                    file_id=file_id,
+                )
             if file_id:
                 self._metadata_db.upsert_entropy_identity(file_id, resolved_path, exists=True)
 

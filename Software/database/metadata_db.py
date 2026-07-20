@@ -81,6 +81,7 @@ class MetadataDatabase(BaseDatabase):
                 file_path        TEXT    NOT NULL PRIMARY KEY,
                 file_name        TEXT    NOT NULL,
                 sha256_hash      TEXT,
+                first_seen       REAL,
                 current_entropy  REAL,
                 previous_entropy REAL,
                 file_size        INTEGER,
@@ -128,6 +129,7 @@ class MetadataDatabase(BaseDatabase):
         self.execute("ALTER TABLE file_metadata ADD COLUMN current_filename TEXT", commit=False)
         self.execute("ALTER TABLE file_metadata ADD COLUMN current_extension TEXT", commit=False)
         self.execute("ALTER TABLE file_metadata ADD COLUMN baseline_entropy REAL", commit=False)
+        self.execute("ALTER TABLE file_metadata ADD COLUMN first_seen REAL", commit=False)
         self.execute(
             "CREATE INDEX IF NOT EXISTS idx_metadata_file_id ON file_metadata (file_id)",
             commit=False,
@@ -147,6 +149,10 @@ class MetadataDatabase(BaseDatabase):
         )
         self.execute(
             "UPDATE file_metadata SET baseline_entropy = current_entropy WHERE baseline_entropy IS NULL",
+            commit=True,
+        )
+        self.execute(
+            "UPDATE file_metadata SET first_seen = COALESCE(first_seen, last_scan_ts) WHERE first_seen IS NULL",
             commit=True,
         )
 
@@ -181,6 +187,7 @@ class MetadataDatabase(BaseDatabase):
         sha256_hash: Optional[str] = None,
         file_id: Optional[str] = None,
         baseline_entropy: Optional[float] = None,
+        first_seen: Optional[float] = None,
     ) -> None:
         """Insert or update a file metadata record.
 
@@ -204,14 +211,15 @@ class MetadataDatabase(BaseDatabase):
         extension = ""
         if "." in file_name:
             extension = file_name.rsplit(".", 1)[-1].lower()
+        first_seen_value = first_seen if first_seen is not None else now
         self.execute(
             """
             INSERT INTO file_metadata
-                (file_path, file_name, sha256_hash, current_entropy,
+                (file_path, file_name, sha256_hash, first_seen, current_entropy,
                  previous_entropy, file_size, last_modified_ts, last_scan_ts,
                  "exists", deleted_ts, file_id, current_path, current_filename,
                  current_extension, baseline_entropy)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 file_name        = excluded.file_name,
                 sha256_hash      = COALESCE(excluded.sha256_hash, sha256_hash),
@@ -232,6 +240,7 @@ class MetadataDatabase(BaseDatabase):
                 file_path,
                 file_name,
                 sha256_hash,
+                first_seen_value,
                 current_entropy,
                 previous_entropy,
                 file_size,
@@ -245,18 +254,96 @@ class MetadataDatabase(BaseDatabase):
             ),
         )
 
-    def get_file_by_identifier(self, file_id: Optional[str], file_path: str):
+    def update_file_by_identifier(
+        self,
+        *,
+        file_id: str,
+        file_path: str,
+        file_name: str,
+        current_entropy: Optional[float],
+        previous_entropy: Optional[float],
+        file_size: Optional[int],
+        last_modified_ts: Optional[float],
+        sha256_hash: Optional[str] = None,
+        current_path: Optional[str] = None,
+        current_filename: Optional[str] = None,
+        current_extension: Optional[str] = None,
+        exists: bool = True,
+    ) -> bool:
+        """Update an existing file row in place when identity is unchanged."""
+        if not file_id:
+            return False
+
+        now = time.time()
+        normalized_path = self._normalize_path(file_path)
+        if current_path is None:
+            current_path = normalized_path
+        if current_filename is None:
+            current_filename = file_name
+        if current_extension is None and "." in file_name:
+            current_extension = file_name.rsplit(".", 1)[-1].lower()
+
+        cursor = self.execute(
+            """
+            UPDATE file_metadata
+               SET file_path         = ?,
+                   file_name         = ?,
+                   sha256_hash       = COALESCE(?, sha256_hash),
+                   current_entropy   = ?,
+                   previous_entropy  = ?,
+                   file_size         = ?,
+                   last_modified_ts  = ?,
+                   last_scan_ts      = ?,
+                   file_id           = COALESCE(file_id, ?),
+                   current_path      = ?,
+                   current_filename  = ?,
+                   current_extension = ?,
+                   "exists"          = ?,
+                   deleted_ts        = NULL
+             WHERE file_id = ?
+            """,
+            (
+                normalized_path,
+                file_name,
+                sha256_hash,
+                current_entropy,
+                previous_entropy,
+                file_size,
+                last_modified_ts,
+                now,
+                file_id,
+                normalized_path,
+                current_filename,
+                current_extension,
+                1 if exists else 0,
+                file_id,
+            ),
+        )
+        return cursor.rowcount > 0
+
+    def get_file_by_identifier(self, file_id: Optional[str], file_path: str, *, include_deleted: bool = False):
         """Fetch a file row by stable identifier, falling back to canonical path."""
         normalized_path = self._normalize_path(file_path)
         if file_id:
-            row = self.fetchone(
-                'SELECT * FROM file_metadata WHERE file_id = ? AND "exists" = 1',
-                (file_id,),
-            )
+            if include_deleted:
+                row = self.fetchone(
+                    "SELECT * FROM file_metadata WHERE file_id = ?",
+                    (file_id,),
+                )
+            else:
+                row = self.fetchone(
+                    'SELECT * FROM file_metadata WHERE file_id = ? AND "exists" = 1',
+                    (file_id,),
+                )
             if row is not None:
                 return row
+        if include_deleted:
+            return self.fetchone(
+                "SELECT * FROM file_metadata WHERE file_path = ?",
+                (normalized_path,),
+            )
         return self.fetchone(
-            "SELECT * FROM file_metadata WHERE file_path = ?",
+            'SELECT * FROM file_metadata WHERE file_path = ? AND "exists" = 1',
             (normalized_path,),
         )
 

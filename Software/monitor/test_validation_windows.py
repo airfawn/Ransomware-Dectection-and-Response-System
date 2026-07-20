@@ -262,7 +262,7 @@ class WindowsPipelineValidationTest(unittest.TestCase):
             finally:
                 metadata_db.close()
 
-    def test_entropy_tracking_survives_extension_change_for_known_file(self):
+    def test_entropy_rename_preserves_baseline_and_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = root / "sample.txt"
@@ -284,6 +284,12 @@ class WindowsPipelineValidationTest(unittest.TestCase):
 
             try:
                 monitor._scan_file_for_cache(original)
+                original_row = metadata_db.get_file(str(original))
+                self.assertIsNotNone(original_row)
+                original_baseline = original_row["baseline_entropy"]
+                original_first_seen = original_row["first_seen"]
+                original_file_id = original_row["file_id"]
+
                 original.rename(renamed)
 
                 with patch("entropy.monitor.calculate_entropy", return_value=6.5) as entropy_mock:
@@ -292,10 +298,78 @@ class WindowsPipelineValidationTest(unittest.TestCase):
                             "Evt",
                             (),
                             {
-                                "event_type": "FILE MODIFIED",
+                                "event_type": "FILE MOVED",
                                 "file_path": str(renamed),
+                                "previous_path": str(original),
+                                "file_id": original_file_id,
+                                "process_name": None,
+                                "pid": None,
+                                "executable": None,
+                                "parent": None,
+                            },
+                        )
+                    )
+                monitor._flush_pending_metadata_updates()
+
+                self.assertEqual(entropy_mock.call_count, 1)
+                row = metadata_db.get_entropy_record(str(renamed))
+                self.assertIsNotNone(row)
+                self.assertTrue(row["exists"])
+                self.assertAlmostEqual(row["entropy"], 6.5)
+                legacy = metadata_db.get_file_by_identifier(original_file_id, str(renamed), include_deleted=True)
+                self.assertIsNotNone(legacy)
+                self.assertEqual(legacy["file_id"], original_file_id)
+                self.assertEqual(legacy["first_seen"], original_first_seen)
+                self.assertAlmostEqual(legacy["baseline_entropy"], original_baseline)
+                self.assertGreater(legacy["current_entropy"] - legacy["baseline_entropy"], 0.0)
+                self.assertIsNone(metadata_db.get_file(str(original)))
+            finally:
+                monitor.stop()
+                metadata_db.close()
+                logs_db.close()
+                alerts_db.close()
+
+    def test_copy_delete_creates_new_identity_when_file_id_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = root / "sample.txt"
+            copied = root / "sample.locked"
+            original.write_text("baseline\n", encoding="utf-8")
+            copied.write_text("encrypted payload\n", encoding="utf-8")
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            logs_db = LogsDatabase(root / "logs.db")
+            alerts_db = AlertsDatabase(root / "alerts.db")
+
+            monitor = EntropyMonitor(
+                metadata_db=metadata_db,
+                logs_db=logs_db,
+                alerts_db=alerts_db,
+                allowed_extensions={"txt", "locked"},
+                monitored_roots=[root],
+                threshold=1.0,
+            )
+
+            try:
+                monitor._scan_file_for_cache(original)
+                original_row = metadata_db.get_file(str(original))
+                self.assertIsNotNone(original_row)
+                original_baseline = original_row["baseline_entropy"]
+                original_file_id = original_row["file_id"]
+
+                copied_stat = copied.stat()
+                copied_file_id = f"{int(getattr(copied_stat, 'st_dev', 0) or 0)}:{int(getattr(copied_stat, 'st_ino', 0) or 0)}"
+
+                with patch("entropy.monitor.calculate_entropy", return_value=6.5):
+                    monitor._process_event(
+                        type(
+                            "DeleteEvt",
+                            (),
+                            {
+                                "event_type": "FILE DELETED",
+                                "file_path": str(original),
                                 "previous_path": None,
-                                "file_id": None,
+                                "file_id": original_file_id,
                                 "process_name": None,
                                 "pid": None,
                                 "executable": None,
@@ -304,10 +378,35 @@ class WindowsPipelineValidationTest(unittest.TestCase):
                         )
                     )
 
-                self.assertEqual(entropy_mock.call_count, 1)
-                row = metadata_db.get_entropy_record(str(renamed))
-                self.assertIsNotNone(row)
-                self.assertTrue(row["exists"])
+                    monitor._process_event(
+                        type(
+                            "CreateEvt",
+                            (),
+                            {
+                                "event_type": "FILE CREATED",
+                                "file_path": str(copied),
+                                "previous_path": None,
+                                "file_id": copied_file_id,
+                                "process_name": None,
+                                "pid": None,
+                                "executable": None,
+                                "parent": None,
+                            },
+                        )
+                    )
+                monitor._flush_pending_metadata_updates()
+
+                deleted_row = metadata_db.get_file_by_identifier(original_file_id, str(original), include_deleted=True)
+                copied_row = metadata_db.get_file_by_identifier(copied_file_id, str(copied), include_deleted=True)
+
+                self.assertIsNotNone(deleted_row)
+                self.assertEqual(deleted_row["exists"], 0)
+                self.assertIsNotNone(copied_row)
+                self.assertEqual(copied_row["exists"], 1)
+                self.assertEqual(copied_row["file_id"], copied_file_id)
+                self.assertNotEqual(copied_row["file_id"], original_file_id)
+                self.assertNotEqual(copied_row["baseline_entropy"], original_baseline)
+                self.assertAlmostEqual(copied_row["baseline_entropy"], copied_row["current_entropy"])
             finally:
                 monitor.stop()
                 metadata_db.close()
