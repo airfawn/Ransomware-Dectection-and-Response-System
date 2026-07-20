@@ -2128,6 +2128,7 @@ class RdrsGui(QWidget):
         executable: str,
         parent: str,
         previous_path: Optional[str] = None,
+        file_identifier: Optional[str] = None,
     ) -> None:
         """Handle raw filesystem events from the monitor callback.
 
@@ -2156,6 +2157,7 @@ class RdrsGui(QWidget):
                         "pid": pid,
                         "executable": executable,
                         "parent": parent,
+                        "file_identifier": file_identifier,
                         "timestamp": time.time(),
                     }
                 )
@@ -2166,12 +2168,13 @@ class RdrsGui(QWidget):
                     file_path,
                 )
 
-        if self._entropy_monitor is not None:
+        if self._entropy_monitor is not None and event_type != "FILE EXTENSION CHANGED":
             try:
                 self._entropy_monitor.on_file_event(
                     event_type,
                     file_path,
                     previous_path=previous_path,
+                    file_identifier=file_identifier,
                     process_name=process_name,
                     pid=pid,
                     executable=executable,
@@ -2207,6 +2210,7 @@ class RdrsGui(QWidget):
                     "pid": str(pid) if pid is not None else "",
                     "executable": executable or "",
                     "parent_process": parent or "",
+                    "file_identifier": file_identifier or "",
                     "message": (
                         f"Renamed from {previous_path}" if previous_path and "MOVE" in event_type.upper() else ""
                     ),

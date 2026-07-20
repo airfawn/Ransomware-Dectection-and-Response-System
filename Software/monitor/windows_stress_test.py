@@ -52,7 +52,7 @@ def run_batch(count: int, strict: bool = False) -> dict[str, int]:
         incoming.mkdir(parents=True, exist_ok=True)
         moved.mkdir(parents=True, exist_ok=True)
 
-        def callback(event_type, file_path, process_name, pid, executable, parent, previous_path=None):
+        def callback(event_type, file_path, process_name, pid, executable, parent, previous_path=None, file_identifier=None):
             counts[event_type] += 1
 
         monitor = FileSystemMonitor(

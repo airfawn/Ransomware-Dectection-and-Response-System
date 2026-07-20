@@ -44,6 +44,10 @@ from database.base_db import BaseDatabase
 class MetadataDatabase(BaseDatabase):
     """Access layer for the file metadata SQLite database."""
 
+    def __init__(self, db_path: Path) -> None:
+        super().__init__(db_path)
+        self._ensure_identity_map_schema()
+
     @staticmethod
     def _normalize_path(file_path: str) -> str:
         """Normalize path to a canonical absolute form for stable DB keys.
@@ -89,7 +93,32 @@ class MetadataDatabase(BaseDatabase):
             "CREATE INDEX IF NOT EXISTS idx_metadata_deleted ON file_metadata (deleted_ts);",
             # Index for sorting by last scan time (GUI refresh).
             "CREATE INDEX IF NOT EXISTS idx_metadata_scan ON file_metadata (last_scan_ts);",
+            """
+            CREATE TABLE IF NOT EXISTS entropy_identity_map (
+                file_id   TEXT    NOT NULL PRIMARY KEY,
+                path      TEXT    NOT NULL,
+                last_scan REAL    NOT NULL,
+                "exists" INTEGER NOT NULL DEFAULT 1
+            );
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_entropy_identity_path ON entropy_identity_map (path);",
+            "CREATE INDEX IF NOT EXISTS idx_entropy_identity_exists ON entropy_identity_map (\"exists\");",
         ]
+
+    def _ensure_identity_map_schema(self) -> None:
+        """Ensure identity map table exists for older database files."""
+        self.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entropy_identity_map (
+                file_id   TEXT    NOT NULL PRIMARY KEY,
+                path      TEXT    NOT NULL,
+                last_scan REAL    NOT NULL,
+                "exists" INTEGER NOT NULL DEFAULT 1
+            );
+            """
+        )
+        self.execute("CREATE INDEX IF NOT EXISTS idx_entropy_identity_path ON entropy_identity_map (path);")
+        self.execute("CREATE INDEX IF NOT EXISTS idx_entropy_identity_exists ON entropy_identity_map (\"exists\");")
 
     # ------------------------------------------------------------------
     # Write operations
@@ -200,6 +229,15 @@ class MetadataDatabase(BaseDatabase):
             """,
             (path, now),
         )
+        self.execute(
+            """
+            UPDATE entropy_identity_map
+               SET "exists" = 0,
+                   last_scan = ?
+             WHERE path = ?
+            """,
+            (now, path),
+        )
 
     def rename_entropy_path(self, old_path: str, new_path: str) -> None:
         """Move an entropy cache entry to a new path after rename/move."""
@@ -225,6 +263,16 @@ class MetadataDatabase(BaseDatabase):
                 time.time(),
                 row["exists"],
             ),
+        )
+        self.execute(
+            """
+            UPDATE entropy_identity_map
+               SET path = ?,
+                   last_scan = ?,
+                   "exists" = 1
+             WHERE path = ?
+            """,
+            (new_path, time.time(), old_path),
         )
 
     def get_entropy_record(self, path: str):
@@ -283,6 +331,51 @@ class MetadataDatabase(BaseDatabase):
         """Remove an entropy cache row entirely when the file no longer exists."""
         path = self._normalize_path(path)
         self.execute("DELETE FROM entropy_cache WHERE path = ?", (path,))
+        self.execute("DELETE FROM entropy_identity_map WHERE path = ?", (path,))
+
+    def upsert_entropy_identity(self, file_id: str, path: str, *, exists: bool = True) -> None:
+        """Upsert a durable mapping from stable file identity to current path."""
+        if not file_id:
+            return
+        path = self._normalize_path(path)
+        now = time.time()
+        self.execute(
+            """
+            INSERT INTO entropy_identity_map (file_id, path, last_scan, "exists")
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET
+                path = excluded.path,
+                last_scan = excluded.last_scan,
+                "exists" = excluded."exists"
+            """,
+            (file_id, path, now, 1 if exists else 0),
+        )
+
+    def resolve_entropy_path(self, file_id: str) -> Optional[str]:
+        """Return the most recent known path for a stable file identity."""
+        if not file_id:
+            return None
+        row = self.fetchone(
+            "SELECT path FROM entropy_identity_map WHERE file_id = ? AND \"exists\" = 1",
+            (file_id,),
+        )
+        if row is None:
+            return None
+        return self._normalize_path(row["path"])
+
+    def mark_entropy_identity_deleted(self, file_id: str) -> None:
+        """Mark a tracked identity as deleted when a delete event is observed."""
+        if not file_id:
+            return
+        self.execute(
+            """
+            UPDATE entropy_identity_map
+               SET "exists" = 0,
+                   last_scan = ?
+             WHERE file_id = ?
+            """,
+            (time.time(), file_id),
+        )
 
     def cleanup_old_deleted(self, retention_days: int) -> int:
         """Remove deleted file records older than ``retention_days``.
