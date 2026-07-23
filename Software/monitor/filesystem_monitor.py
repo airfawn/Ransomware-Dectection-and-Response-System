@@ -1697,7 +1697,6 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         self._modified_event_index: Dict[str, _QueuedFileEvent] = {}
         self._recent_modification_timestamps: Deque[float] = deque(maxlen=5000)
         self._high_score_rescan_state: Dict[Tuple[Optional[int], str], Tuple[int, float]] = {}
-        self._completed_process_keys: Set[Tuple[Optional[int], str]] = set()
 
         self._burst_worker_running = True
         self._burst_packet_count = 0
@@ -1758,23 +1757,11 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
     def _report_event(self, event_type: str, src_path: str, previous_path: Optional[str] = None) -> None:
         """Queue a filesystem event for burst-safe background processing."""
         try:
-            process_metadata = None
-            event_type_upper = event_type.upper()
-            if event_type_upper in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED"}:
-                try:
-                    process_metadata = self._process_resolver.resolve(
-                        Path(src_path),
-                        previous_path=Path(previous_path) if previous_path else None,
-                        event_type=event_type,
-                        time_budget_seconds=0.08,
-                    )
-                except Exception:
-                    process_metadata = None
             self._enqueue_event(
                 event_type=event_type,
                 src_path=src_path,
                 previous_path=previous_path,
-                process_metadata=process_metadata,
+                process_metadata=None,
                 timestamp=time.time(),
             )
         except Exception as exc:
@@ -1908,6 +1895,14 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
     def _adaptive_packet_size(self) -> int:
         """Select packet size based on modification-volume tiers."""
         volume = self._modification_volume()
+        return self._adaptive_packet_size_for_volume(volume)
+
+    def _adaptive_packet_size_for_volume(self, volume: int) -> int:
+        """Return packet size for a known modification volume.
+
+        Accepting the precomputed volume avoids re-entering _event_lock from
+        status paths that already hold it.
+        """
         if volume < self._packet_normal_max:
             return 1
         if volume < self._packet_medium_max:
@@ -1934,6 +1929,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
     def get_burst_status(self) -> Dict[str, Any]:
         """Return lightweight burst metrics for monitoring and UI status panels."""
         volume = self._modification_volume()
+        adaptive_packet_size = self._adaptive_packet_size_for_volume(volume)
         with self._event_lock:
             queue_size = self._event_queue.qsize()
             pending_count = len(self._queued_event_keys)
@@ -1948,14 +1944,24 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                 "deferred_low_priority_events": self._deferred_low_priority_events,
                 "burst_active": volume >= self._packet_normal_max,
                 "modification_volume": volume,
-                "adaptive_packet_size": self._adaptive_packet_size(),
+                "adaptive_packet_size": adaptive_packet_size,
             }
 
     def stop(self) -> None:
         """Stop the burst worker thread cleanly."""
         self._burst_worker_running = False
-        if getattr(self, "_burst_worker_thread", None) is not None and self._burst_worker_thread.is_alive():
-            self._burst_worker_thread.join(timeout=2.0)
+        burst_thread = getattr(self, "_burst_worker_thread", None)
+        if burst_thread is not None and burst_thread.is_alive():
+            burst_thread.join(timeout=5.0)
+
+        if burst_thread is not None and burst_thread.is_alive():
+            self.logger.warning(
+                "Burst worker did not drain before timeout; forcing shutdown with %d queued event(s).",
+                self._event_queue.qsize(),
+            )
+            self._worker_pool.shutdown(wait=False, cancel_futures=True)
+            return
+
         self._worker_pool.shutdown(wait=True)
 
     def enqueue_high_priority_rescan(self, file_paths: List[str], reason: str = "manual") -> None:
@@ -1973,7 +1979,6 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
 
     def _process_event(self, queued_event: _QueuedFileEvent) -> None:
         """Process one queued filesystem event and notify downstream modules."""
-        process_key: Tuple[Optional[int], str] = (None, "")
         process_alive: Optional[bool] = None
         with self._event_lock:
             self._processing_event_keys.add(queued_event.event_key)
@@ -1991,6 +1996,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                     Path(queued_event.src_path),
                     previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
                     event_type=queued_event.event_type,
+                    time_budget_seconds=0.08,
                 )
 
             process_lookup_pid = queued_event.process_metadata.pid if queued_event.process_metadata else None
@@ -1999,17 +2005,6 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                     process_alive = psutil.Process(process_lookup_pid).is_running()
                 except Exception:
                     process_alive = False
-
-            process_key = (
-                queued_event.process_metadata.pid if queued_event.process_metadata else None,
-                (queued_event.process_metadata.executable or queued_event.process_metadata.name or "")
-                if queued_event.process_metadata
-                else "",
-            )
-            if process_alive:
-                self._completed_process_keys.discard(process_key)
-            elif process_key in self._completed_process_keys:
-                return
 
             path = Path(queued_event.src_path)
             event_time = datetime.fromtimestamp(queued_event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
@@ -2100,15 +2095,6 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         finally:
             with self._event_lock:
                 self._processing_event_keys.discard(queued_event.event_key)
-
-            if process_alive is False:
-                status_after = self.get_burst_status()
-                if (
-                    status_after.get("queue_size", 0) == 0
-                    and status_after.get("pending_count", 0) == 0
-                    and status_after.get("processing_count", 0) == 0
-                ):
-                    self._completed_process_keys.add(process_key)
 
     def _maybe_trigger_high_score_rescan(self, process_state: ProcessState) -> None:
         """Trigger filesystem-truth entropy rescans for high-score suspicious activity."""
@@ -2211,9 +2197,9 @@ class FileSystemMonitor:
     def stop(self) -> None:
         """Stop the observer cleanly."""
         try:
-            self.handler.stop()
             self.observer.stop()
             self.observer.join(timeout=5)
+            self.handler.stop()
         except Exception as exc:
             self.logger.error(f"Error stopping monitor: {exc}")
 

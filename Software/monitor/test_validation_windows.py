@@ -36,8 +36,8 @@ class _DummyTracker:
     def __init__(self):
         self.events = []
 
-    def record_event(self, event_type, src_path, process_metadata, previous_path=None):
-        self.events.append((event_type, src_path, process_metadata, previous_path))
+    def record_event(self, event_type, src_path, process_metadata, previous_path=None, runtime_status=None):
+        self.events.append((event_type, src_path, process_metadata, previous_path, runtime_status))
         return None
 
 
@@ -83,7 +83,7 @@ class WindowsPipelineValidationTest(unittest.TestCase):
         self.assertEqual(moved_captured[0][6], r"C:\temp\old.txt")
         self.assertIsNotNone(moved_captured[0][7])
         self.assertEqual(len(tracker.events), 4)
-        self.assertTrue(any(event[0] == "FILE MOVED" and event[-1] == r"C:\temp\old.txt" for event in tracker.events))
+        self.assertTrue(any(event[0] == "FILE MOVED" and event[-2] == r"C:\temp\old.txt" for event in tracker.events))
         handler.stop()
 
     def test_process_resolver_reuses_directory_and_previous_path_cache(self):
@@ -467,8 +467,8 @@ class WindowsPipelineValidationTest(unittest.TestCase):
                 def __init__(self):
                     self.events = []
 
-                def record_event(self, event_type, src_path, process_metadata, previous_path=None):
-                    self.events.append((event_type, src_path, previous_path))
+                def record_event(self, event_type, src_path, process_metadata, previous_path=None, runtime_status=None):
+                    self.events.append((event_type, src_path, previous_path, runtime_status))
 
             tracker = DummyTracker()
             handler = FileSystemMonitorHandler(_DummyLogger(), tracker)
