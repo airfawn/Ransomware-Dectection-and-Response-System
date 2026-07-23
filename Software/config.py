@@ -271,6 +271,15 @@ class EntropyConfig:
     queue_maxsize: int = 4000
     """Bounded capacity for queued entropy events."""
 
+    stability_check_interval_ms: int = 150
+    """Delay between consecutive file-stability probes before entropy reads."""
+
+    stability_required_ms: int = 500
+    """How long size+mtime must remain unchanged to treat a file as stable."""
+
+    stability_max_wait_ms: int = 3000
+    """Maximum wait budget for stability checks before skipping/retrying later."""
+
 
 @dataclass
 class DatabaseConfig:
@@ -504,6 +513,12 @@ def _apply_yaml_to_config(cfg: AppConfig, data: Dict[str, Any]) -> None:
         cfg.entropy.score = int(ent["score"])
     if "enabled" in ent:
         cfg.entropy.enabled = bool(ent["enabled"])
+    if "stability_check_interval_ms" in ent:
+        cfg.entropy.stability_check_interval_ms = int(ent["stability_check_interval_ms"])
+    if "stability_required_ms" in ent:
+        cfg.entropy.stability_required_ms = int(ent["stability_required_ms"])
+    if "stability_max_wait_ms" in ent:
+        cfg.entropy.stability_max_wait_ms = int(ent["stability_max_wait_ms"])
     if "file_extensions" in mon:
         exts = mon["file_extensions"]
         if isinstance(exts, list):

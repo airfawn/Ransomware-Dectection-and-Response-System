@@ -66,6 +66,12 @@ entropy:
   # itself never modifies scores.
   score: 30
 
+  # File-stability gate before entropy reads to avoid sampling while
+  # ransomware is still actively writing.
+  stability_check_interval_ms: 150
+  stability_required_ms: 500
+  stability_max_wait_ms: 3000
+
   # Master on/off switch for the entropy-increase scoring rule. Edited from
   # the GUI's "Active Rules" page alongside the other behavioral rules.
   enabled: true

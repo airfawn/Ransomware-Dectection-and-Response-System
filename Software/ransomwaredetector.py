@@ -3102,6 +3102,10 @@ class RdrsGui(QWidget):
             "last_activity": "",
             "process_age": "",
             "classification": "",
+            "process_alive": "",
+            "queue_pending": "",
+            "queue_processed": "",
+            "process_completed": "",
             "message": "",
             "raw_event": "",
         }
@@ -3316,6 +3320,14 @@ class RdrsGui(QWidget):
                     record["score"] = value
                 elif current_key == "classification":
                     record["classification"] = value
+                elif current_key == "process_alive":
+                    record["process_alive"] = value
+                elif current_key == "queue_pending":
+                    record["queue_pending"] = value
+                elif current_key == "queue_processed":
+                    record["queue_processed"] = value
+                elif current_key == "process_completed":
+                    record["process_completed"] = value
                 elif current_key == "last_activity":
                     record["last_activity"] = value
                 elif current_key == "process_start_time":
@@ -3429,7 +3441,7 @@ class RdrsGui(QWidget):
 
         for key, entry in sorted(self.process_state_cache.items(), key=_score_for_sort, reverse=True):
             last_activity = entry.get("last_activity", "")
-            is_active = self._process_is_active(last_activity)
+            is_active = self._process_is_active(last_activity, entry)
             target_table = self.active_process_table if is_active else self.inactive_process_table
             row = target_table.rowCount()
             target_table.insertRow(row)
@@ -3669,7 +3681,9 @@ class RdrsGui(QWidget):
         self.file_event_counter_labels["FILE DELETED"].setText(f"Deleted: {counts['FILE DELETED']}")
         self.file_event_counter_labels["EXTENSION_CHANGE"].setText(f"Ext. Changed: {counts['EXTENSION_CHANGE']}")
 
-    def _process_is_active(self, last_activity: str) -> bool:
+    def _process_is_active(self, last_activity: str, entry: Optional[dict] = None) -> bool:
+        if entry is not None and str(entry.get("process_completed", "")).strip().lower() in {"true", "1", "yes"}:
+            return False
         if not last_activity:
             return False
         try:

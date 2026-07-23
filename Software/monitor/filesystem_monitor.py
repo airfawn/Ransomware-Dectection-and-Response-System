@@ -776,6 +776,12 @@ class ProcessBehaviorTracker:
             self._entropy_score_delta = int(config.entropy.score)
             self._entropy_trigger_score = int(config.monitoring.high_score_rescan_threshold)
             self._entropy_eval_cooldown = float(config.monitoring.high_score_rescan_cooldown_seconds)
+            self._entropy_stability_check_interval_ms = max(50, int(config.entropy.stability_check_interval_ms))
+            self._entropy_stability_required_ms = max(100, int(config.entropy.stability_required_ms))
+            self._entropy_stability_max_wait_ms = max(
+                self._entropy_stability_required_ms,
+                int(config.entropy.stability_max_wait_ms),
+            )
             self._unknown_entropy_fallback_enabled = True
             self._unknown_fallback_window_seconds = 2.0
             self._unknown_fallback_modified_threshold = 10
@@ -802,6 +808,9 @@ class ProcessBehaviorTracker:
             self._entropy_score_delta = 30
             self._entropy_trigger_score = 30
             self._entropy_eval_cooldown = 5.0
+            self._entropy_stability_check_interval_ms = 150
+            self._entropy_stability_required_ms = 500
+            self._entropy_stability_max_wait_ms = 3000
             self._unknown_entropy_fallback_enabled = True
             self._unknown_fallback_window_seconds = 2.0
             self._unknown_fallback_modified_threshold = 10
@@ -831,6 +840,7 @@ class ProcessBehaviorTracker:
         src_path: str,
         process_metadata: ProcessMetadata,
         previous_path: Optional[str] = None,
+        runtime_status: Optional[Dict[str, Any]] = None,
     ) -> ProcessState:
         """Record a filesystem event and update process behavior state.
         
@@ -864,6 +874,9 @@ class ProcessBehaviorTracker:
             
             # Record the event
             record.record_event(event_type, src_path, now)
+
+            if runtime_status:
+                record.encryption_indicators.update(runtime_status)
             
             # Detect genuine file-extension changes (independent of scoring
             # rules, which are applied below via the detection orchestrator).
@@ -1060,6 +1073,21 @@ class ProcessBehaviorTracker:
         
         # Use detection orchestrator
         active_rules = self._orchestrator.get_active_rules(record)
+        if _CONFIG_AVAILABLE:
+            weights = get_config().detection.rule_weights
+        else:
+            weights = {
+                "Rule1_FileBurst": 20,
+                "Rule2_MultipleDirectories": 30,
+                "Rule3_YoungProcessBurst": 10,
+                "Rule4_ExtensionChangeBurst": 30,
+            }
+
+        contributions = []
+        for rule_name in sorted(active_rules):
+            contributions.append(f"+{int(weights.get(rule_name, 0))} {rule_name}")
+        if int(record.entropy_score_bonus or 0) > 0:
+            contributions.append(f"+{int(record.entropy_score_bonus or 0)} {self._entropy_rule_name}")
         
         # Detect newly activated rules
         new_activations = active_rules - record.active_rules
@@ -1078,6 +1106,13 @@ class ProcessBehaviorTracker:
         # Verification-based entropy scoring runs only after the behavior score
         # reaches the configured trigger and evaluates a bounded recent-file set.
         self._apply_entropy_verification_rule(record, timestamp)
+
+        post_contributions = []
+        for rule_name in sorted(record.active_rules):
+            if rule_name == self._entropy_rule_name:
+                continue
+            post_contributions.append(f"+{int(weights.get(rule_name, 0))} {rule_name}")
+        post_contributions.append(f"+{int(record.entropy_score_bonus or 0)} {self._entropy_rule_name}")
 
     def _apply_entropy_verification_rule(self, record: ProcessState, timestamp: float) -> None:
         """Apply entropy verification bonus based on average entropy increase."""
@@ -1130,14 +1165,14 @@ class ProcessBehaviorTracker:
             return
 
         deltas: List[float] = []
+        evaluation_completed = False
         for raw_path in candidate_paths:
             path = Path(raw_path)
             if not path.exists() or not path.is_file():
                 continue
 
-            try:
-                stat = path.stat()
-            except OSError:
+            stat = self._wait_for_file_stable(path)
+            if stat is None:
                 continue
 
             file_id = self._compute_file_identity(path)
@@ -1159,6 +1194,7 @@ class ProcessBehaviorTracker:
             current_entropy = calculate_entropy(path, self._entropy_sample_size_bytes)
             if current_entropy is None:
                 continue
+            evaluation_completed = True
 
             delta = float(current_entropy - baseline_entropy)
             deltas.append(delta)
@@ -1181,7 +1217,8 @@ class ProcessBehaviorTracker:
                 baseline_entropy=baseline_entropy,
             )
 
-        self._entropy_last_eval[identity] = timestamp
+        if evaluation_completed:
+            self._entropy_last_eval[identity] = timestamp
         if not deltas:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
@@ -1207,6 +1244,37 @@ class ProcessBehaviorTracker:
         else:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
+
+    def _wait_for_file_stable(self, path: Path) -> Optional[os.stat_result]:
+        """Wait until file size and mtime stay unchanged for the required interval."""
+        interval_s = self._entropy_stability_check_interval_ms / 1000.0
+        required_s = self._entropy_stability_required_ms / 1000.0
+        max_wait_s = self._entropy_stability_max_wait_ms / 1000.0
+
+        started = time.monotonic()
+        stable_since: Optional[float] = None
+        last_signature: Optional[Tuple[int, float]] = None
+
+        while (time.monotonic() - started) <= max_wait_s:
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+
+            signature = (int(stat.st_size), float(stat.st_mtime))
+            now = time.monotonic()
+            if signature == last_signature:
+                if stable_since is None:
+                    stable_since = now
+                if (now - stable_since) >= required_s:
+                    return stat
+            else:
+                last_signature = signature
+                stable_since = None
+
+            time.sleep(interval_s)
+
+        return None
 
     @staticmethod
     def _is_unattributed_process(record: ProcessState) -> bool:
@@ -1483,6 +1551,10 @@ class ProcessBehaviorTracker:
             "Current Score:", str(record.score),
             "Classification:", record.classification,
             "Active Rules:", ", ".join(sorted(record.active_rules)) or "None",
+            "Process Alive:", str(record.encryption_indicators.get("process_alive", "unknown")),
+            "Queue Pending:", str(record.encryption_indicators.get("queue_pending", 0)),
+            "Queue Processed:", str(record.encryption_indicators.get("queue_processed", 0)),
+            "Process Completed:", str(record.encryption_indicators.get("process_completed", False)),
         ])
         lines.append("")
         lines.append("----------------------------")
@@ -1625,6 +1697,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         self._modified_event_index: Dict[str, _QueuedFileEvent] = {}
         self._recent_modification_timestamps: Deque[float] = deque(maxlen=5000)
         self._high_score_rescan_state: Dict[Tuple[Optional[int], str], Tuple[int, float]] = {}
+        self._completed_process_keys: Set[Tuple[Optional[int], str]] = set()
 
         self._burst_worker_running = True
         self._burst_packet_count = 0
@@ -1900,6 +1973,8 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
 
     def _process_event(self, queued_event: _QueuedFileEvent) -> None:
         """Process one queued filesystem event and notify downstream modules."""
+        process_key: Tuple[Optional[int], str] = (None, "")
+        process_alive: Optional[bool] = None
         with self._event_lock:
             self._processing_event_keys.add(queued_event.event_key)
             self._queued_event_keys.discard(queued_event.event_key)
@@ -1917,16 +1992,43 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                     previous_path=Path(queued_event.previous_path) if queued_event.previous_path else None,
                     event_type=queued_event.event_type,
                 )
+
+            process_lookup_pid = queued_event.process_metadata.pid if queued_event.process_metadata else None
+            if process_lookup_pid is not None:
+                try:
+                    process_alive = psutil.Process(process_lookup_pid).is_running()
+                except Exception:
+                    process_alive = False
+
+            process_key = (
+                queued_event.process_metadata.pid if queued_event.process_metadata else None,
+                (queued_event.process_metadata.executable or queued_event.process_metadata.name or "")
+                if queued_event.process_metadata
+                else "",
+            )
+            if process_alive:
+                self._completed_process_keys.discard(process_key)
+            elif process_key in self._completed_process_keys:
+                return
+
             path = Path(queued_event.src_path)
             event_time = datetime.fromtimestamp(queued_event.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+            status_before = self.get_burst_status()
+            runtime_status = {
+                "process_alive": bool(process_alive) if process_alive is not None else "unknown",
+                "queue_pending": int(status_before.get("pending_count", 0)),
+                "queue_processed": int(status_before.get("processed_event_count", 0)),
+                "process_completed": False,
+            }
 
             process_state = self.behavior_tracker.record_event(
                 queued_event.event_type,
                 queued_event.src_path,
                 queued_event.process_metadata,
                 previous_path=queued_event.previous_path,
+                runtime_status=runtime_status,
             )
-
             file_identifier = self._compute_file_identifier(path, queued_event.previous_path)
 
             try:
@@ -1998,6 +2100,15 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
         finally:
             with self._event_lock:
                 self._processing_event_keys.discard(queued_event.event_key)
+
+            if process_alive is False:
+                status_after = self.get_burst_status()
+                if (
+                    status_after.get("queue_size", 0) == 0
+                    and status_after.get("pending_count", 0) == 0
+                    and status_after.get("processing_count", 0) == 0
+                ):
+                    self._completed_process_keys.add(process_key)
 
     def _maybe_trigger_high_score_rescan(self, process_state: ProcessState) -> None:
         """Trigger filesystem-truth entropy rescans for high-score suspicious activity."""

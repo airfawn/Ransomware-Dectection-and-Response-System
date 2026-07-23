@@ -86,6 +86,8 @@ class _FileEvent:
         "event_type",
         "file_path",
         "previous_path",
+        "event_ts",
+        "retry_count",
         "file_id",
         "process_name",
         "pid",
@@ -98,6 +100,8 @@ class _FileEvent:
         event_type: str,
         file_path: str,
         previous_path: Optional[str],
+        event_ts: float,
+        retry_count: int,
         file_id: Optional[str],
         process_name: Optional[str],
         pid: Optional[int],
@@ -107,6 +111,8 @@ class _FileEvent:
         self.event_type = event_type
         self.file_path = file_path
         self.previous_path = previous_path
+        self.event_ts = event_ts
+        self.retry_count = retry_count
         self.file_id = file_id
         self.process_name = process_name
         self.pid = pid
@@ -171,6 +177,9 @@ class EntropyMonitor:
             cfg = get_config()
             self._queue_maxsize = max(500, int(cfg.entropy.queue_maxsize))
             self._worker_count = max(1, int(cfg.entropy.worker_count))
+            self._stability_check_interval_ms = max(50, int(cfg.entropy.stability_check_interval_ms))
+            self._stability_required_ms = max(100, int(cfg.entropy.stability_required_ms))
+            self._stability_max_wait_ms = max(self._stability_required_ms, int(cfg.entropy.stability_max_wait_ms))
             mcfg = cfg.monitoring
             self._packet_normal_max = int(mcfg.packet_normal_max)
             self._packet_medium_max = int(mcfg.packet_medium_max)
@@ -181,6 +190,9 @@ class EntropyMonitor:
         else:
             self._queue_maxsize = 4000
             self._worker_count = 3
+            self._stability_check_interval_ms = 150
+            self._stability_required_ms = 500
+            self._stability_max_wait_ms = 3000
             self._packet_normal_max = 50
             self._packet_medium_max = 200
             self._packet_large_max = 1000
@@ -250,7 +262,7 @@ class EntropyMonitor:
         self._running = False
         # Unblock the worker thread with a sentinel None.
         try:
-            self._queue.put_nowait((99, time.time(), 0, _FileEvent("STOP", "", None, None, None, None, None, None)))
+            self._queue.put_nowait((99, time.time(), 0, _FileEvent("STOP", "", None, time.time(), 0, None, None, None, None, None)))
         except queue.Full:
             pass
         if self._worker_thread is not None:
@@ -307,6 +319,8 @@ class EntropyMonitor:
             event_type=event_type,
             file_path=file_path,
             previous_path=previous_path,
+            event_ts=time.time(),
+            retry_count=0,
             file_id=file_identifier,
             process_name=process_name,
             pid=pid,
@@ -512,7 +526,8 @@ class EntropyMonitor:
         """
         file_path = evt.file_path
         path = Path(file_path)
-        resolved_path = str(path.resolve()) if path.exists() else str(path)
+        path_exists = path.exists()
+        resolved_path = str(path.resolve()) if path_exists else str(path)
         logger.debug(
             "[ENTROPY_TRACE][ENTROPY.worker] processing event=%s file=%s suffix=%s",
             evt.event_type,
@@ -560,14 +575,25 @@ class EntropyMonitor:
         # -----------------------------------------------------------------
         # 2. Resolve filesystem stat and stable identity.
         # -----------------------------------------------------------------
-        try:
-            stat = path.stat()
-        except OSError:
-            logger.warning(
-                "[ENTROPY_TRACE][ENTROPY.worker] stat_failed file=%s (likely transient)",
-                file_path,
-            )
+        stat = self._wait_for_file_stable(path)
+        if stat is None:
+            max_retries = max(1, self._stability_max_wait_ms // max(100, self._stability_check_interval_ms))
+            if evt.retry_count < max_retries:
+                self._schedule_stability_retry(evt)
+                logger.debug(
+                    "[ENTROPY_TRACE][ENTROPY.worker] stability_retry_scheduled file=%s retry=%s/%s",
+                    file_path,
+                    evt.retry_count + 1,
+                    max_retries,
+                )
+            else:
+                logger.warning(
+                    "[ENTROPY_TRACE][ENTROPY.worker] stability_check_failed file=%s retries=%s",
+                    file_path,
+                    evt.retry_count,
+                )
             return
+
 
         resolved_path = self._normalize_runtime_path(path)
         file_id = evt.file_id or self._build_file_identity(path, stat)
@@ -625,8 +651,10 @@ class EntropyMonitor:
             # -----------------------------------------------------------------
             existing = self._metadata_db.get_file_by_identifier(file_id, resolved_path, include_deleted=True)
             previous_entropy: Optional[float] = None
+            baseline_entropy: Optional[float] = None
             if existing:
                 previous_entropy = existing["current_entropy"]
+                baseline_entropy = existing["baseline_entropy"] if "baseline_entropy" in existing.keys() else None
             elif existing_cache is not None:
                 previous_entropy = existing_cache["entropy"]
             logger.debug(
@@ -698,6 +726,66 @@ class EntropyMonitor:
 
         if self._persist_events_to_logs:
             self._log_event(evt)
+
+    def _wait_for_file_stable(self, path: Path) -> Optional[os.stat_result]:
+        """Return a stable stat snapshot once size+mtime stop changing."""
+        interval_s = self._stability_check_interval_ms / 1000.0
+        required_s = self._stability_required_ms / 1000.0
+        max_wait_s = self._stability_max_wait_ms / 1000.0
+
+        started = time.monotonic()
+        stable_since: Optional[float] = None
+        last_signature: Optional[Tuple[int, float]] = None
+
+        while (time.monotonic() - started) <= max_wait_s:
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+
+            signature = (int(stat.st_size), float(stat.st_mtime))
+            now = time.monotonic()
+            if signature == last_signature:
+                if stable_since is None:
+                    stable_since = now
+                if (now - stable_since) >= required_s:
+                    return stat
+            else:
+                last_signature = signature
+                stable_since = None
+
+            time.sleep(interval_s)
+
+        return None
+
+    def _schedule_stability_retry(self, evt: _FileEvent) -> None:
+        """Requeue an event after a short delay when the target file is still changing."""
+        retry_evt = _FileEvent(
+            event_type=evt.event_type,
+            file_path=evt.file_path,
+            previous_path=evt.previous_path,
+            event_ts=time.time(),
+            retry_count=evt.retry_count + 1,
+            file_id=evt.file_id,
+            process_name=evt.process_name,
+            pid=evt.pid,
+            executable=evt.executable,
+            parent=evt.parent,
+        )
+
+        delay_s = self._stability_check_interval_ms / 1000.0
+
+        def _enqueue_retry() -> None:
+            if not self._running:
+                return
+            try:
+                self._enqueue_event(retry_evt)
+            except Exception:
+                logger.debug("Failed to enqueue stability retry for %s", retry_evt.file_path)
+
+        timer = threading.Timer(delay_s, _enqueue_retry)
+        timer.daemon = True
+        timer.start()
 
     def _queue_metadata_upsert(
         self,

@@ -38,7 +38,6 @@ def calculate_entropy(file_path: str | Path, sample_size_bytes: int = 5 * 1024 *
         be read (missing, permission denied, zero-length, etc.).
     """
     path = Path(file_path)
-
     try:
         with path.open("rb") as fh:
             if sample_size_bytes > 0:
