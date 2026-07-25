@@ -1199,24 +1199,6 @@ class ProcessBehaviorTracker:
             delta = float(current_entropy - baseline_entropy)
             deltas.append(delta)
 
-            self._metadata_db.upsert_entropy_cache(
-                path=str(path),
-                entropy=current_entropy,
-                file_size=stat.st_size,
-                modified_time=stat.st_mtime,
-                exists=True,
-            )
-            self._metadata_db.upsert_file(
-                file_path=str(path),
-                file_name=path.name,
-                current_entropy=current_entropy,
-                previous_entropy=previous_entropy,
-                file_size=stat.st_size,
-                last_modified_ts=stat.st_mtime,
-                file_id=file_id,
-                baseline_entropy=baseline_entropy,
-            )
-
         if evaluation_completed:
             self._entropy_last_eval[identity] = timestamp
         if not deltas:
