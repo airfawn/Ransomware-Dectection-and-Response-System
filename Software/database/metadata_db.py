@@ -34,6 +34,7 @@ Behaviour:
 from __future__ import annotations
 
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -105,6 +106,16 @@ class MetadataDatabase(BaseDatabase):
             """,
             "CREATE INDEX IF NOT EXISTS idx_entropy_identity_path ON entropy_identity_map (path);",
             "CREATE INDEX IF NOT EXISTS idx_entropy_identity_exists ON entropy_identity_map (\"exists\");",
+            """
+            CREATE TABLE IF NOT EXISTS entropy_runtime_baseline (
+                id                       INTEGER PRIMARY KEY CHECK (id = 1),
+                initial_average_entropy  REAL,
+                initial_max_entropy      REAL,
+                baseline_file_count      INTEGER NOT NULL DEFAULT 0,
+                source_roots             TEXT,
+                computed_at              REAL NOT NULL
+            );
+            """,
         ]
 
     def _ensure_identity_map_schema(self) -> None:
@@ -164,6 +175,18 @@ class MetadataDatabase(BaseDatabase):
         commit: bool = True,
     ):
         """Execute SQL while tolerating idempotent ALTER TABLE column-additions."""
+        if "alter table" in sql.lower() and "add column" in sql.lower():
+            conn = self._conn
+            try:
+                cursor = conn.execute(sql, params)
+                if commit:
+                    conn.commit()
+                return cursor
+            except sqlite3.Error as exc:
+                if "duplicate column name" in str(exc).lower():
+                    return conn.execute("SELECT 1")
+                conn.rollback()
+                raise
         try:
             return super().execute(sql, params, commit=commit)
         except Exception as exc:
@@ -352,6 +375,49 @@ class MetadataDatabase(BaseDatabase):
         self.execute("DELETE FROM file_metadata")
         self.execute("DELETE FROM entropy_cache")
         self.execute("DELETE FROM entropy_identity_map")
+        self.execute("DELETE FROM entropy_runtime_baseline")
+
+    def set_runtime_entropy_baseline(
+        self,
+        *,
+        initial_average_entropy: Optional[float],
+        initial_max_entropy: Optional[float],
+        baseline_file_count: int,
+        source_roots: Optional[str] = None,
+    ) -> None:
+        """Persist one startup entropy baseline snapshot for the current run."""
+        self.execute(
+            """
+            INSERT INTO entropy_runtime_baseline (
+                id,
+                initial_average_entropy,
+                initial_max_entropy,
+                baseline_file_count,
+                source_roots,
+                computed_at
+            )
+            VALUES (1, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                initial_average_entropy = excluded.initial_average_entropy,
+                initial_max_entropy = excluded.initial_max_entropy,
+                baseline_file_count = excluded.baseline_file_count,
+                source_roots = excluded.source_roots,
+                computed_at = excluded.computed_at
+            """,
+            (
+                initial_average_entropy,
+                initial_max_entropy,
+                max(0, int(baseline_file_count)),
+                source_roots,
+                time.time(),
+            ),
+        )
+
+    def get_runtime_entropy_baseline(self):
+        """Return the persisted startup entropy baseline snapshot."""
+        return self.fetchone(
+            "SELECT * FROM entropy_runtime_baseline WHERE id = 1"
+        )
 
     # ------------------------------------------------------------------
     # Entropy cache operations

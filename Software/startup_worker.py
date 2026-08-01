@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Dict
 
@@ -10,6 +11,8 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from config import reload_config, get_config
 from database import get_metadata_db, get_logs_db, get_alerts_db
 from entropy_loader import build_entropy_cache
+
+logger = logging.getLogger(__name__)
 
 
 class StartupWorker(QObject):
@@ -104,7 +107,42 @@ class StartupWorker(QObject):
         )
         ctx["entropy_total"] = summary.total_files
         ctx["entropy_processed"] = summary.processed_files
+        self._persist_initial_entropy_baseline(metadata_db, ctx)
         return f"Scanned {summary.processed_files} / {summary.total_files} files"
+
+    def _persist_initial_entropy_baseline(self, metadata_db, ctx: Dict[str, Any]) -> None:
+        """Compute and persist startup baseline values for score-50 validation."""
+        rows = metadata_db.get_entropy_existing()
+        entropy_values = [
+            float(row["entropy"])
+            for row in rows
+            if row["entropy"] is not None
+        ]
+        if entropy_values:
+            initial_average_entropy = sum(entropy_values) / len(entropy_values)
+            initial_max_entropy = max(entropy_values)
+        else:
+            initial_average_entropy = None
+            initial_max_entropy = None
+
+        metadata_db.set_runtime_entropy_baseline(
+            initial_average_entropy=initial_average_entropy,
+            initial_max_entropy=initial_max_entropy,
+            baseline_file_count=len(entropy_values),
+            source_roots=str(self._entropy_dir),
+        )
+
+        ctx["initial_average_entropy"] = initial_average_entropy
+        ctx["initial_max_entropy"] = initial_max_entropy
+        ctx["baseline_file_count"] = len(entropy_values)
+
+        logger.debug(
+            "Entropy baseline initialized (avg=%s, max=%s, files=%s, root=%s)",
+            f"{initial_average_entropy:.6f}" if initial_average_entropy is not None else "None",
+            f"{initial_max_entropy:.6f}" if initial_max_entropy is not None else "None",
+            len(entropy_values),
+            self._entropy_dir,
+        )
 
     def _step_init_modules(self, ctx: Dict[str, Any]) -> str:
         # Importing validates that monitor modules are available.

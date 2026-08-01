@@ -770,23 +770,15 @@ class ProcessBehaviorTracker:
             self._orchestrator.register_engine(extension_engine)
 
             self._entropy_enabled = bool(config.entropy.enabled)
-            self._entropy_allowed_extensions = {e.lower().lstrip(".") for e in config.entropy.file_extensions}
             self._entropy_sample_size_bytes = int(config.entropy.sample_size_bytes)
-            self._entropy_delta_threshold = float(config.entropy.threshold)
             self._entropy_score_delta = int(config.entropy.score)
-            self._entropy_trigger_score = int(config.monitoring.high_score_rescan_threshold)
-            self._entropy_eval_cooldown = float(config.monitoring.high_score_rescan_cooldown_seconds)
+            self._entropy_trigger_score = int(config.detection.alert_threshold)
             self._entropy_stability_check_interval_ms = max(50, int(config.entropy.stability_check_interval_ms))
             self._entropy_stability_required_ms = max(100, int(config.entropy.stability_required_ms))
             self._entropy_stability_max_wait_ms = max(
                 self._entropy_stability_required_ms,
                 int(config.entropy.stability_max_wait_ms),
             )
-            self._unknown_entropy_fallback_enabled = True
-            self._unknown_fallback_window_seconds = 2.0
-            self._unknown_fallback_modified_threshold = 10
-            self._unknown_fallback_extension_threshold = 5
-            self._unknown_fallback_move_threshold = 5
 
             # File Extension Change Monitor settings (detection, not scoring).
             ext_cfg = config.extension_monitor
@@ -802,28 +794,45 @@ class ProcessBehaviorTracker:
             self._extension_monitor_enabled = True
             self._ignored_extensions = set(DEFAULT_IGNORED_TARGET_EXTENSIONS)
             self._entropy_enabled = True
-            self._entropy_allowed_extensions = set()
             self._entropy_sample_size_bytes = 5 * 1024 * 1024
-            self._entropy_delta_threshold = 1.4
             self._entropy_score_delta = 30
-            self._entropy_trigger_score = 30
-            self._entropy_eval_cooldown = 5.0
+            self._entropy_trigger_score = 50
             self._entropy_stability_check_interval_ms = 150
             self._entropy_stability_required_ms = 500
             self._entropy_stability_max_wait_ms = 3000
-            self._unknown_entropy_fallback_enabled = True
-            self._unknown_fallback_window_seconds = 2.0
-            self._unknown_fallback_modified_threshold = 10
-            self._unknown_fallback_extension_threshold = 5
-            self._unknown_fallback_move_threshold = 5
 
         self._entropy_rule_name = "EntropyIncrease"
-        self._entropy_last_eval: Dict[ProcessIdentity, float] = {}
         self._metadata_db = get_metadata_db()
+        self._entropy_validation_armed: Dict[ProcessIdentity, bool] = {}
+        self._entropy_baseline_missing_logged = False
+        self._entropy_initial_average: Optional[float] = None
+        self._entropy_initial_max: Optional[float] = None
+        self._entropy_initial_file_count: int = 0
+        self._load_startup_entropy_baseline()
         
         # Cleanup scheduling
         self._last_cleanup_time = datetime.now().timestamp()
         self._cleanup_enabled = True
+
+    def _load_startup_entropy_baseline(self) -> None:
+        """Load startup baseline values persisted by the initialization worker."""
+        row = self._metadata_db.get_runtime_entropy_baseline()
+        if row is None:
+            self._entropy_initial_average = None
+            self._entropy_initial_max = None
+            self._entropy_initial_file_count = 0
+            return
+        self._entropy_initial_average = (
+            float(row["initial_average_entropy"])
+            if row["initial_average_entropy"] is not None
+            else None
+        )
+        self._entropy_initial_max = (
+            float(row["initial_max_entropy"])
+            if row["initial_max_entropy"] is not None
+            else None
+        )
+        self._entropy_initial_file_count = int(row["baseline_file_count"] or 0)
 
     def get_process_state(self, process_metadata: ProcessMetadata) -> Optional[ProcessState]:
         """Return the current ProcessState for a process identity if it exists."""
@@ -1082,12 +1091,6 @@ class ProcessBehaviorTracker:
                 "Rule3_YoungProcessBurst": 10,
                 "Rule4_ExtensionChangeBurst": 30,
             }
-
-        contributions = []
-        for rule_name in sorted(active_rules):
-            contributions.append(f"+{int(weights.get(rule_name, 0))} {rule_name}")
-        if int(record.entropy_score_bonus or 0) > 0:
-            contributions.append(f"+{int(record.entropy_score_bonus or 0)} {self._entropy_rule_name}")
         
         # Detect newly activated rules
         new_activations = active_rules - record.active_rules
@@ -1107,115 +1110,104 @@ class ProcessBehaviorTracker:
         # reaches the configured trigger and evaluates a bounded recent-file set.
         self._apply_entropy_verification_rule(record, timestamp)
 
-        post_contributions = []
-        for rule_name in sorted(record.active_rules):
-            if rule_name == self._entropy_rule_name:
-                continue
-            post_contributions.append(f"+{int(weights.get(rule_name, 0))} {rule_name}")
-        post_contributions.append(f"+{int(record.entropy_score_bonus or 0)} {self._entropy_rule_name}")
-
     def _apply_entropy_verification_rule(self, record: ProcessState, timestamp: float) -> None:
-        """Apply entropy verification bonus based on average entropy increase."""
+        """Apply score-50 entropy validation against startup baseline average."""
         if not self._entropy_enabled:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
             return
 
+        if self._entropy_initial_average is None:
+            if not self._entropy_baseline_missing_logged:
+                self.logger.debug(
+                    "Entropy baseline missing: startup average/max not initialized; "
+                    "skipping entropy validation until baseline is available."
+                )
+                self._entropy_baseline_missing_logged = True
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            return
+
         identity = ProcessIdentity(pid=record.pid, executable=record.executable or record.process_name)
-        last_eval = self._entropy_last_eval.get(identity)
-        if last_eval is not None and (timestamp - last_eval) < self._entropy_eval_cooldown:
+        behavioral_score = record.score - int(record.entropy_score_bonus or 0)
+        if behavioral_score < self._entropy_trigger_score:
+            self._entropy_validation_armed[identity] = False
+            record.entropy_score_bonus = 0
+            record.active_rules.discard(self._entropy_rule_name)
+            return
+
+        if self._entropy_validation_armed.get(identity, False):
             if int(record.entropy_score_bonus or 0) > 0:
                 record.active_rules.add(self._entropy_rule_name)
             return
 
-        is_unattributed = self._is_unattributed_process(record)
-        if is_unattributed:
-            if not self._unknown_entropy_fallback_enabled:
-                record.entropy_score_bonus = 0
-                record.active_rules.discard(self._entropy_rule_name)
-                return
-            if not self._unknown_fallback_triggered(record, timestamp):
-                record.entropy_score_bonus = 0
-                record.active_rules.discard(self._entropy_rule_name)
-                return
-        else:
-            behavioral_score = record.score - int(record.entropy_score_bonus or 0)
-            if behavioral_score < self._entropy_trigger_score:
-                record.entropy_score_bonus = 0
-                record.active_rules.discard(self._entropy_rule_name)
-                return
-
-        candidate_paths: List[str] = []
-        seen: Set[str] = set()
-        for _, evt_type, _, evt_path in reversed(record.recent_events):
-            if "MODIF" not in evt_type.upper():
-                continue
-            normalized = os.path.normcase(str(Path(evt_path)))
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            candidate_paths.append(evt_path)
-            if len(candidate_paths) >= 10:
-                break
+        self._entropy_validation_armed[identity] = True
+        candidate_paths = self._select_recent_modified_paths(record, limit=10)
 
         if not candidate_paths:
+            self.logger.debug(
+                "Entropy validation triggered but no candidate modified files were available "
+                "(pid=%s score=%s)",
+                record.pid,
+                behavioral_score,
+            )
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
-            self._entropy_last_eval[identity] = timestamp
             return
 
-        deltas: List[float] = []
-        evaluation_completed = False
+        entropy_values: List[float] = []
+        selected_valid_paths: List[str] = []
         for raw_path in candidate_paths:
             path = Path(raw_path)
             if not path.exists() or not path.is_file():
                 continue
 
-            stat = self._wait_for_file_stable(path)
-            if stat is None:
-                continue
-
-            file_id = self._compute_file_identity(path)
-            existing = self._metadata_db.get_file_by_identifier(file_id, str(path))
-            baseline_entropy: Optional[float] = None
-            previous_entropy: Optional[float] = None
-            if existing is not None:
-                baseline_entropy = existing["baseline_entropy"] if "baseline_entropy" in existing.keys() else None
-                previous_entropy = existing["current_entropy"]
-            if baseline_entropy is None and previous_entropy is not None:
-                baseline_entropy = previous_entropy
-            if baseline_entropy is None:
-                cache_row = self._metadata_db.get_entropy_record(str(path))
-                if cache_row is not None:
-                    baseline_entropy = cache_row["entropy"]
-            if baseline_entropy is None:
+            if self._wait_for_file_stable(path) is None:
                 continue
 
             current_entropy = calculate_entropy(path, self._entropy_sample_size_bytes)
             if current_entropy is None:
                 continue
-            evaluation_completed = True
 
-            delta = float(current_entropy - baseline_entropy)
-            deltas.append(delta)
+            selected_valid_paths.append(str(path))
+            entropy_values.append(float(current_entropy))
 
-        if evaluation_completed:
-            self._entropy_last_eval[identity] = timestamp
-        if not deltas:
+        if not entropy_values:
+            self.logger.debug(
+                "Entropy validation triggered but no readable stable files remained "
+                "after safety checks (pid=%s selected=%s)",
+                record.pid,
+                len(candidate_paths),
+            )
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
             return
 
-        avg_entropy_increase = sum(deltas) / len(deltas)
+        modified_average_entropy = sum(entropy_values) / len(entropy_values)
+        entropy_passed = modified_average_entropy > self._entropy_initial_average
+
+        self.logger.debug(
+            "Entropy validation triggered: pid=%s score=%s selected=%s valid=%s "
+            "modified_avg=%.6f initial_avg=%.6f initial_max=%s pass=%s",
+            record.pid,
+            behavioral_score,
+            len(candidate_paths),
+            len(selected_valid_paths),
+            modified_average_entropy,
+            self._entropy_initial_average,
+            f"{self._entropy_initial_max:.6f}" if self._entropy_initial_max is not None else "None",
+            "yes" if entropy_passed else "no",
+        )
+
         previously_active = self._entropy_rule_name in record.active_rules
-        if avg_entropy_increase > self._entropy_delta_threshold:
+        if entropy_passed:
             record.entropy_score_bonus = self._entropy_score_delta
             record.active_rules.add(self._entropy_rule_name)
             if not previously_active:
                 reason = (
-                    "Entropy verification rule triggered: average entropy increase "
-                    f"{avg_entropy_increase:.3f} across {len(deltas)} recent files "
-                    f"(threshold {self._entropy_delta_threshold:.3f})"
+                    "Entropy validation passed: modified average entropy "
+                    f"{modified_average_entropy:.3f} across {len(entropy_values)} files "
+                    f"exceeds startup baseline average {self._entropy_initial_average:.3f}"
                 )
                 self._log_legacy_detection(
                     record,
@@ -1226,6 +1218,23 @@ class ProcessBehaviorTracker:
         else:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
+
+    @staticmethod
+    def _select_recent_modified_paths(record: ProcessState, *, limit: int) -> List[str]:
+        """Return unique most-recent modified file paths for one process."""
+        candidate_paths: List[str] = []
+        seen: Set[str] = set()
+        for _, evt_type, _, evt_path in reversed(record.recent_events):
+            if "MODIF" not in evt_type.upper():
+                continue
+            normalized = os.path.normcase(str(Path(evt_path)))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidate_paths.append(evt_path)
+            if len(candidate_paths) >= max(1, int(limit)):
+                break
+        return candidate_paths
 
     def _wait_for_file_stable(self, path: Path) -> Optional[os.stat_result]:
         """Wait until file size and mtime stay unchanged for the required interval."""
@@ -1257,53 +1266,6 @@ class ProcessBehaviorTracker:
             time.sleep(interval_s)
 
         return None
-
-    @staticmethod
-    def _is_unattributed_process(record: ProcessState) -> bool:
-        """Return True when process attribution is not reliable."""
-        if record.pid is not None:
-            return False
-        if record.executable:
-            return False
-        process_name = (record.process_name or "").strip().lower()
-        return process_name in {"", "unknown"}
-
-    def _unknown_fallback_triggered(self, record: ProcessState, timestamp: float) -> bool:
-        """Return True when unknown-attributed activity exceeds fallback thresholds."""
-        window_start = timestamp - self._unknown_fallback_window_seconds
-        modified_count = 0
-        move_count = 0
-        for ts, evt_type, _, _ in record.recent_events:
-            if ts < window_start:
-                continue
-            evt_upper = evt_type.upper()
-            if "MODIF" in evt_upper:
-                modified_count += 1
-            if "MOVE" in evt_upper or "RENAME" in evt_upper:
-                move_count += 1
-
-        extension_count = record.count_extension_changes(self._unknown_fallback_window_seconds)
-        return (
-            modified_count >= self._unknown_fallback_modified_threshold
-            or extension_count >= self._unknown_fallback_extension_threshold
-            or move_count >= self._unknown_fallback_move_threshold
-        )
-
-    @staticmethod
-    def _compute_file_identity(path: Path) -> Optional[str]:
-        """Build stable identity for DB lookups (inode/device, then path fallback)."""
-        try:
-            stat = path.stat()
-            inode = int(getattr(stat, "st_ino", 0) or 0)
-            device = int(getattr(stat, "st_dev", 0) or 0)
-            if inode > 0:
-                return f"{device}:{inode}"
-        except Exception:
-            pass
-        try:
-            return f"path:{os.path.normcase(os.path.realpath(str(path)))}"
-        except Exception:
-            return None
 
     def _apply_legacy_rules(
         self,
@@ -1862,6 +1824,14 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
 
                 if packet_size > 1:
                     time.sleep(0.02)
+            except RuntimeError as exc:
+                # Shutdown can race with queued work under heavy burst load.
+                # Exit quietly once shutdown has started.
+                if "cannot schedule new futures after shutdown" in str(exc).lower():
+                    if not self._burst_worker_running:
+                        break
+                self.logger.exception("Burst worker loop failed: %s", exc)
+                time.sleep(0.1)
             except Exception as exc:
                 self.logger.exception("Burst worker loop failed: %s", exc)
                 time.sleep(0.1)

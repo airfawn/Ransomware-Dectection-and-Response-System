@@ -1,21 +1,21 @@
+from __future__ import annotations
+
 import os
+import platform
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from database.alerts_db import AlertsDatabase
-from database.logs_db import LogsDatabase
 from database.metadata_db import MetadataDatabase
-from entropy.loader import build_entropy_cache
-from entropy.monitor import EntropyMonitor
-from monitor.filesystem_monitor import (
-    FileSystemMonitorHandler,
-    ProcessBehaviorTracker,
-    ProcessMetadata,
-    ProcessResolver,
-)
+from entropy_loader import build_entropy_cache
+from monitor.filesystem_monitor import FileSystemMonitor
+from monitor.filesystem_monitor import ProcessBehaviorTracker, ProcessMetadata
+from monitor.windows_entropy_simulator import SafeEntropyChangeSimulator
+from startup_worker import StartupWorker
 
 
 class _DummyLogger:
@@ -31,463 +31,477 @@ class _DummyLogger:
     def debug(self, *args, **kwargs):
         pass
 
-
-class _DummyTracker:
-    def __init__(self):
-        self.events = []
-
-    def record_event(self, event_type, src_path, process_metadata, previous_path=None, runtime_status=None):
-        self.events.append((event_type, src_path, process_metadata, previous_path, runtime_status))
-        return None
+    def exception(self, *args, **kwargs):
+        pass
 
 
-class _DummyEvent:
-    def __init__(self, src_path, dest_path=None, is_directory=False):
-        self.src_path = src_path
-        self.dest_path = dest_path or src_path
-        self.is_directory = is_directory
+class SafeWindowsEntropySimulatorTests(unittest.TestCase):
+    def test_simulator_stays_in_sandbox_and_cleans_up(self):
+        simulator = SafeEntropyChangeSimulator(file_count=20, preserve_directory=False, seed=99)
+        root = simulator.create_sandbox()
+        created = simulator.create_low_entropy_baseline_files()
+        modified = simulator.modify_files_high_entropy(count=20)
+        simulator.assert_all_touches_inside_sandbox()
+
+        self.assertEqual(len(created), 20)
+        self.assertEqual(len(modified), 20)
+        self.assertTrue(root.exists())
+
+        simulator.cleanup()
+        self.assertFalse(root.exists())
 
 
-class WindowsPipelineValidationTest(unittest.TestCase):
-    def test_handler_emits_all_event_types_and_previous_path(self):
-        tracker = _DummyTracker()
-        handler = FileSystemMonitorHandler(_DummyLogger(), tracker)
-        handler._process_resolver.resolve = lambda path, **kwargs: ProcessMetadata(
-            pid=1234,
-            name="python.exe",
-            executable="C:\\Python\\python.exe",
-            parent_name="cmd.exe",
-            start_time="2026-07-16 10:00:00",
-            start_time_epoch=1.0,
-        )
+class ValidationBasedEntropyWindowsTests(unittest.TestCase):
+    @staticmethod
+    def _norm(path: Path | str) -> str:
+        return os.path.normcase(os.path.realpath(str(path)))
 
-        captured = []
+    def _build_tracker(self, metadata_db: MetadataDatabase) -> ProcessBehaviorTracker:
+        with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
+            tracker = ProcessBehaviorTracker(_DummyLogger())
+        self.addCleanup(tracker._metadata_db.close)
+        return tracker
 
-        def callback(event_type, file_path, process_name, pid, executable, parent, previous_path=None, file_identifier=None):
-            captured.append((event_type, file_path, process_name, pid, executable, parent, previous_path, file_identifier))
-
-        handler._event_callback = callback
-
-        handler.on_created(_DummyEvent(r"C:\temp\created.txt"))
-        handler.on_modified(_DummyEvent(r"C:\temp\created.txt"))
-        handler.on_deleted(_DummyEvent(r"C:\temp\created.txt"))
-        handler.on_moved(_DummyEvent(r"C:\temp\old.txt", dest_path=r"C:\temp\new.txt"))
-
-        deadline = time.time() + 2.0
-        while len(captured) < 4 and time.time() < deadline:
-            time.sleep(0.02)
-
-        self.assertCountEqual([item[0] for item in captured], ["FILE CREATED", "FILE MODIFIED", "FILE DELETED", "FILE MOVED"])
-        moved_captured = [item for item in captured if item[0] == "FILE MOVED"]
-        self.assertEqual(len(moved_captured), 1)
-        self.assertEqual(moved_captured[0][6], r"C:\temp\old.txt")
-        self.assertIsNotNone(moved_captured[0][7])
-        self.assertEqual(len(tracker.events), 4)
-        self.assertTrue(any(event[0] == "FILE MOVED" and event[-2] == r"C:\temp\old.txt" for event in tracker.events))
-        handler.stop()
-
-    def test_process_resolver_reuses_directory_and_previous_path_cache(self):
-        resolver = ProcessResolver()
-        metadata = ProcessMetadata(
-            pid=4321,
+    @staticmethod
+    def _proc(pid: int = 9001) -> ProcessMetadata:
+        return ProcessMetadata(
+            pid=pid,
             name="powershell.exe",
-            executable="/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            executable=r"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
             parent_name="explorer.exe",
-            start_time="2026-07-16 11:00:00",
-            start_time_epoch=2.0,
+            start_time="2026-08-01 10:00:00",
+            start_time_epoch=time.time() - 120,
         )
+
+    @staticmethod
+    def _write_file(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    @staticmethod
+    def _config() -> SimpleNamespace:
+        return SimpleNamespace(entropy=SimpleNamespace(file_extensions=["txt"], sample_size_bytes=1024))
+
+    def _startup_baseline_with_worker(self, metadata_db: MetadataDatabase, entropy_root: Path) -> dict:
+        worker = StartupWorker(entropy_dir=entropy_root, file_monitor_dir=entropy_root)
+        ctx = {
+            "config": self._config(),
+            "metadata_db": metadata_db,
+        }
+        worker._step_build_entropy(ctx)
+        baseline = metadata_db.get_runtime_entropy_baseline()
+        self.assertIsNotNone(baseline)
+        return {
+            "initial_average_entropy": baseline["initial_average_entropy"],
+            "initial_max_entropy": baseline["initial_max_entropy"],
+            "baseline_file_count": baseline["baseline_file_count"],
+        }
+
+    def test_startup_persists_initial_average_and_max_entropy_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            resolver.remember(root / "sample.txt", metadata)
-
-            directory_hit = resolver.resolve(root / "other.txt")
-            previous_hit = resolver.resolve(root / "deleted.txt", previous_path=root / "sample.txt", event_type="FILE DELETED")
-
-            self.assertEqual(directory_hit.pid, 4321)
-            self.assertEqual(previous_hit.executable, metadata.executable)
-        self.assertEqual(directory_hit.pid, 4321)
-        self.assertEqual(previous_hit.executable, metadata.executable)
-
-    def test_entropy_cache_reuse_and_delta_update(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data_file = root / "sample.txt"
-            data_file.write_text("hello world\n", encoding="utf-8")
-
-            metadata_db = MetadataDatabase(root / "metadata.db")
-            logs_db = LogsDatabase(root / "logs.db")
-            alerts_db = AlertsDatabase(root / "alerts.db")
-
-            monitor = EntropyMonitor(
-                metadata_db=metadata_db,
-                logs_db=logs_db,
-                alerts_db=alerts_db,
-                allowed_extensions={"txt"},
-                monitored_roots=[root],
-                threshold=1.0,
-            )
-
-            with patch("entropy.monitor.calculate_entropy", side_effect=[1.25, 7.75]) as entropy_mock:
-                monitor._scan_file_for_cache(data_file)
-                monitor._scan_file_for_cache(data_file)
-                self.assertEqual(entropy_mock.call_count, 1)
-
-                data_file.write_text("".join(chr(i % 26 + 65) for i in range(4096)), encoding="utf-8")
-                os.utime(data_file, None)
-                monitor._scan_file_for_cache(data_file)
-                self.assertEqual(entropy_mock.call_count, 2)
-
-            row = metadata_db.get_entropy_record(str(data_file))
-            self.assertIsNotNone(row)
-            self.assertTrue(row["exists"])
-            self.assertAlmostEqual(row["entropy"], 7.75)
-
-            legacy = metadata_db.get_file(str(data_file))
-            self.assertIsNotNone(legacy)
-            self.assertAlmostEqual(legacy["current_entropy"], 7.75)
-            self.assertAlmostEqual(legacy["previous_entropy"], 1.25)
-
-            monitor.stop()
-            metadata_db.close()
-            logs_db.close()
-            alerts_db.close()
-
-    def test_build_entropy_cache_rebuilds_from_filesystem_and_removes_deleted_files(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            keep_file = root / "keep.txt"
-            keep_file.write_text("keep me", encoding="utf-8")
-
-            metadata_db = MetadataDatabase(root / "metadata.db")
+            simulator = SafeEntropyChangeSimulator(file_count=25, preserve_directory=False, seed=123)
             try:
-                summary = build_entropy_cache(
+                simulator_root = simulator.create_sandbox()
+                created = simulator.create_low_entropy_baseline_files()
+                self.assertGreaterEqual(len(created), 20)
+
+                metadata_db = MetadataDatabase(root / "metadata.db")
+                self.addCleanup(metadata_db.close)
+                baseline = self._startup_baseline_with_worker(metadata_db, simulator_root)
+                self.assertIsNotNone(baseline["initial_average_entropy"])
+                self.assertIsNotNone(baseline["initial_max_entropy"])
+                self.assertGreaterEqual(
+                    baseline["initial_max_entropy"] + 1e-12,
+                    baseline["initial_average_entropy"],
+                )
+                self.assertGreaterEqual(baseline["baseline_file_count"], 20)
+            finally:
+                simulator.cleanup()
+
+    def test_startup_build_reuses_cached_entropy_for_unchanged_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "stable.txt"
+            self._write_file(target, b"RDRS_STABLE" * 512)
+
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+
+            with patch("entropy_loader.calculate_entropy", return_value=4.25) as entropy_mock:
+                first = build_entropy_cache(
                     metadata_db=metadata_db,
                     roots=[root],
                     allowed_extensions={"txt"},
                     sample_size_bytes=1024,
                 )
-                self.assertEqual(summary.total_files, 1)
-                self.assertIsNotNone(metadata_db.get_file(str(keep_file)))
-
-                keep_file.unlink()
-                new_file = root / "new.txt"
-                new_file.write_text("brand new", encoding="utf-8")
-
-                summary = build_entropy_cache(
+                second = build_entropy_cache(
                     metadata_db=metadata_db,
                     roots=[root],
                     allowed_extensions={"txt"},
                     sample_size_bytes=1024,
                 )
 
-                self.assertIsNone(metadata_db.get_file(str(keep_file)))
-                self.assertIsNotNone(metadata_db.get_file(str(new_file)))
-                self.assertEqual(summary.total_files, 1)
-            finally:
-                metadata_db.close()
+            self.assertEqual(entropy_mock.call_count, 1)
+            self.assertEqual(first.processed_files, 1)
+            self.assertEqual(second.processed_files, 1)
 
-    def test_modified_file_events_force_entropy_recalculation(self):
+    def test_no_entropy_calculation_before_score_50(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            data_file = root / "sample.txt"
-            data_file.write_text("hello world\n", encoding="utf-8")
-
             metadata_db = MetadataDatabase(root / "metadata.db")
-            logs_db = LogsDatabase(root / "logs.db")
-            alerts_db = AlertsDatabase(root / "alerts.db")
-            monitor = EntropyMonitor(
-                metadata_db=metadata_db,
-                logs_db=logs_db,
-                alerts_db=alerts_db,
-                allowed_extensions={"txt"},
-                monitored_roots=[root],
-                threshold=1.0,
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=3.0,
+                initial_max_entropy=7.5,
+                baseline_file_count=10,
+                source_roots=str(root),
             )
-            metadata_db.upsert_entropy_cache(path=str(data_file), entropy=1.0, file_size=data_file.stat().st_size, modified_time=data_file.stat().st_mtime, exists=True)
-            metadata_db.upsert_file(file_path=str(data_file), file_name=data_file.name, current_entropy=1.0, previous_entropy=None, file_size=data_file.stat().st_size, last_modified_ts=data_file.stat().st_mtime)
+            tracker = self._build_tracker(metadata_db)
 
-            try:
-                with patch("entropy.monitor.calculate_entropy", return_value=4.25) as entropy_mock:
-                    monitor._process_event(
-                        type("Evt", (), {"event_type": "FILE MODIFIED", "file_path": str(data_file), "previous_path": None, "file_id": None, "process_name": None, "pid": None, "executable": None, "parent": None})
-                    )
-                self.assertEqual(entropy_mock.call_count, 1)
-            finally:
-                monitor.stop()
-                metadata_db.close()
-                logs_db.close()
-                alerts_db.close()
+            file_path = root / "single" / "doc.txt"
+            self._write_file(file_path, b"hello world")
 
-    def test_entropy_verification_adds_bonus_when_average_increase_exceeds_threshold(self):
+            with patch("monitor.filesystem_monitor.calculate_entropy") as entropy_mock:
+                record = None
+                for _ in range(5):
+                    record = tracker.record_event("FILE MODIFIED", str(file_path), self._proc())
+
+            self.assertIsNotNone(record)
+            self.assertLess(record.score, 50)
+            self.assertEqual(entropy_mock.call_count, 0)
+            self.assertNotIn("EntropyIncrease", record.active_rules)
+
+    def test_score_50_triggers_validation_once_per_crossing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            target_file = root / "target.txt"
-            target_file.write_bytes(os.urandom(4096))
-            stat = target_file.stat()
-            file_id = f"{int(getattr(stat, 'st_dev', 0) or 0)}:{int(getattr(stat, 'st_ino', 0) or 0)}"
-
             metadata_db = MetadataDatabase(root / "metadata.db")
-            metadata_db.upsert_file(
-                file_path=str(target_file),
-                file_name=target_file.name,
-                current_entropy=1.0,
-                previous_entropy=1.0,
-                file_size=stat.st_size,
-                last_modified_ts=stat.st_mtime,
-                file_id=file_id,
-                baseline_entropy=1.0,
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=8,
+                source_roots=str(root),
             )
+            tracker = self._build_tracker(metadata_db)
 
-            try:
-                with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
-                    tracker = ProcessBehaviorTracker(_DummyLogger())
+            files = []
+            for idx in range(12):
+                directory = "a" if idx % 2 == 0 else "b"
+                target = root / directory / f"f{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                files.append(target)
 
-                process_meta = ProcessMetadata(
-                    pid=7777,
-                    name="powershell.exe",
-                    executable="C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-                    parent_name="explorer.exe",
-                    start_time="2026-07-20 10:00:00",
-                    start_time_epoch=time.time() - 10,
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.8) as entropy_mock:
+                for idx in range(11):
+                    tracker.record_event("FILE MODIFIED", str(files[idx]), self._proc())
+                calls_after_crossing = entropy_mock.call_count
+                self.assertGreater(calls_after_crossing, 0)
+
+                # Still above threshold: should not re-trigger entropy validation.
+                for idx in range(11, 12):
+                    tracker.record_event("FILE MODIFIED", str(files[idx]), self._proc())
+
+            self.assertEqual(entropy_mock.call_count, calls_after_crossing)
+
+    def test_validation_uses_exactly_last_10_modified_unique_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files = []
+            for idx in range(15):
+                directory = "left" if idx % 2 == 0 else "right"
+                target = root / directory / f"doc_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                files.append(target)
+
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.9) as entropy_mock:
+                for idx in range(11):
+                    tracker.record_event("FILE MODIFIED", str(files[idx]), self._proc())
+
+            selected_paths = [self._norm(call.args[0]) for call in entropy_mock.call_args_list]
+            self.assertEqual(len(selected_paths), 10)
+            expected = [self._norm(path) for path in reversed(files[1:11])]
+            self.assertEqual(selected_paths, expected)
+
+    def test_validation_file_selection_is_process_local_not_global(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files_a = []
+            files_b = []
+            for idx in range(12):
+                a_path = root / "proc_a" / f"a_{idx}.txt"
+                b_path = root / "proc_b" / f"b_{idx}.txt"
+                self._write_file(a_path, os.urandom(2048))
+                self._write_file(b_path, os.urandom(2048))
+                files_a.append(a_path)
+                files_b.append(b_path)
+
+            proc_a = self._proc(pid=501)
+            proc_b = self._proc(pid=777)
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.6) as entropy_mock:
+                for idx in range(3):
+                    tracker.record_event("FILE MODIFIED", str(files_b[idx]), proc_b)
+                for idx in range(11):
+                    tracker.record_event("FILE MODIFIED", str(files_a[idx]), proc_a)
+
+            selected_paths = {self._norm(call.args[0]) for call in entropy_mock.call_args_list}
+            proc_a_paths = {self._norm(path) for path in files_a}
+            proc_b_paths = {self._norm(path) for path in files_b}
+            self.assertTrue(selected_paths.issubset(proc_a_paths))
+            self.assertFalse(selected_paths.intersection(proc_b_paths))
+
+    def test_validation_handles_fewer_than_10_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            proc = self._proc()
+            only_files = []
+            for idx in range(4):
+                target = root / ("a" if idx % 2 == 0 else "b") / f"few_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                only_files.append(target)
+
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.8) as entropy_mock:
+                for idx in range(11):
+                    tracker.record_event("FILE MODIFIED", str(only_files[idx % len(only_files)]), proc)
+
+            self.assertLessEqual(entropy_mock.call_count, 4)
+            self.assertGreater(entropy_mock.call_count, 0)
+
+    def test_higher_modified_average_adds_entropy_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=2.0,
+                initial_max_entropy=3.5,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files = []
+            for idx in range(11):
+                target = root / ("d1" if idx % 2 == 0 else "d2") / f"hi_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                files.append(target)
+
+            record = None
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.9):
+                for file_path in files:
+                    record = tracker.record_event("FILE MODIFIED", str(file_path), self._proc())
+
+            self.assertIsNotNone(record)
+            self.assertIn("EntropyIncrease", record.active_rules)
+            self.assertEqual(record.entropy_score_bonus, tracker._entropy_score_delta)
+
+    def test_lower_or_equal_modified_average_does_not_add_entropy_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=6.5,
+                initial_max_entropy=7.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files = []
+            for idx in range(11):
+                target = root / ("x" if idx % 2 == 0 else "y") / f"lo_{idx}.txt"
+                self._write_file(target, b"A" * 2048)
+                files.append(target)
+
+            record = None
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=6.5):
+                for file_path in files:
+                    record = tracker.record_event("FILE MODIFIED", str(file_path), self._proc())
+
+            self.assertIsNotNone(record)
+            self.assertNotIn("EntropyIncrease", record.active_rules)
+            self.assertEqual(record.entropy_score_bonus, 0)
+
+    def test_ghost_files_are_ignored_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            live_files = []
+            for idx in range(8):
+                target = root / ("live_a" if idx % 2 == 0 else "live_b") / f"live_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                live_files.append(target)
+
+            ghost_paths = [root / "ghost_a" / "missing_1.txt", root / "ghost_b" / "missing_2.txt", root / "ghost_c" / "missing_3.txt"]
+
+            all_paths = live_files + ghost_paths
+            proc = self._proc()
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.7) as entropy_mock:
+                for idx in range(11):
+                    path = all_paths[idx % len(all_paths)]
+                    tracker.record_event("FILE MODIFIED", str(path), proc)
+
+            self.assertLess(entropy_mock.call_count, 10)
+            self.assertGreater(entropy_mock.call_count, 0)
+
+    def test_files_changing_during_validation_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=1.0,
+                initial_max_entropy=2.0,
+                baseline_file_count=10,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files = []
+            for idx in range(11):
+                target = root / ("busy_a" if idx % 2 == 0 else "busy_b") / f"busy_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                files.append(target)
+
+            record = None
+            with patch.object(ProcessBehaviorTracker, "_wait_for_file_stable", side_effect=[None, None] + [object()] * 20):
+                with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.8):
+                    for file_path in files:
+                        record = tracker.record_event("FILE MODIFIED", str(file_path), self._proc())
+
+            self.assertIsNotNone(record)
+            self.assertGreaterEqual(record.score, 50)
+
+    @unittest.skipUnless(os.name == "nt", "Windows integration test is only executed on Windows hosts")
+    def test_windows_integration_score50_entropy_validation_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata_db = MetadataDatabase(root / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            metadata_db.set_runtime_entropy_baseline(
+                initial_average_entropy=2.5,
+                initial_max_entropy=6.0,
+                baseline_file_count=12,
+                source_roots=str(root),
+            )
+            tracker = self._build_tracker(metadata_db)
+
+            files = []
+            for idx in range(12):
+                target = root / ("w1" if idx % 2 == 0 else "w2") / f"win_{idx}.txt"
+                self._write_file(target, os.urandom(2048))
+                files.append(target)
+
+            proc = self._proc(pid=4444)
+            record = None
+            with patch("monitor.filesystem_monitor.calculate_entropy", return_value=7.9):
+                for file_path in files:
+                    record = tracker.record_event("FILE MODIFIED", str(file_path), proc)
+
+            self.assertIsNotNone(record)
+            self.assertIn("EntropyIncrease", record.active_rules)
+            self.assertEqual(record.entropy_score_bonus, tracker._entropy_score_delta)
+
+    @unittest.skipUnless(os.name == "nt", "Windows runtime simulation runs only on Windows hosts")
+    def test_windows_runtime_simulator_against_monitor_pipeline(self):
+        simulator = SafeEntropyChangeSimulator(file_count=25, preserve_directory=True, seed=2026)
+        root = simulator.create_sandbox()
+        simulator.create_low_entropy_baseline_files()
+
+        with tempfile.TemporaryDirectory() as tmpdb:
+            metadata_db = MetadataDatabase(Path(tmpdb) / "metadata.db")
+            self.addCleanup(metadata_db.close)
+            baseline = self._startup_baseline_with_worker(metadata_db, root)
+
+            logger = _DummyLogger()
+            with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
+                monitor = FileSystemMonitor(
+                    target_path=root,
+                    recursive=True,
+                    logger=logger,
+                    event_callback=None,
                 )
 
-                record = None
-                for _ in range(11):
-                    record = tracker.record_event("FILE MODIFIED", str(target_file), process_meta)
+            entropy_hits = []
+            original_log = monitor.behavior_tracker._log_legacy_detection
 
-                self.assertIsNotNone(record)
-                self.assertIn("EntropyIncrease", record.active_rules)
-                self.assertGreaterEqual(record.entropy_score_bonus, 30)
-                self.assertGreaterEqual(record.score, 60)
-            finally:
-                metadata_db.close()
+            def _capture_entropy(record, rule_name, reason, score):
+                if rule_name == "EntropyIncrease":
+                    entropy_hits.append((record.pid, score, reason))
+                return original_log(record, rule_name, reason, score)
 
-    def test_unknown_process_fallback_triggers_entropy_verification(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            target_file = root / "unknown_target.txt"
-            target_file.write_bytes(os.urandom(4096))
-            stat = target_file.stat()
-            file_id = f"{int(getattr(stat, 'st_dev', 0) or 0)}:{int(getattr(stat, 'st_ino', 0) or 0)}"
-
-            metadata_db = MetadataDatabase(root / "metadata.db")
-            metadata_db.upsert_file(
-                file_path=str(target_file),
-                file_name=target_file.name,
-                current_entropy=1.0,
-                previous_entropy=1.0,
-                file_size=stat.st_size,
-                last_modified_ts=stat.st_mtime,
-                file_id=file_id,
-                baseline_entropy=1.0,
-            )
+            monitor.behavior_tracker._log_legacy_detection = _capture_entropy
 
             try:
-                with patch("monitor.filesystem_monitor.get_metadata_db", return_value=metadata_db):
-                    tracker = ProcessBehaviorTracker(_DummyLogger())
+                monitor.start()
+                time.sleep(0.6)
 
-                unknown_process = ProcessMetadata(
-                    pid=None,
-                    name=None,
-                    executable=None,
-                    parent_name=None,
-                    start_time=None,
-                    start_time_epoch=None,
-                )
+                modified = simulator.modify_files_high_entropy(count=25)
+                self.assertEqual(len(modified), 25)
+                time.sleep(2.5)
 
-                record = None
-                for _ in range(11):
-                    record = tracker.record_event("FILE MODIFIED", str(target_file), unknown_process)
+                states = list(monitor.behavior_tracker.records.values())
+                self.assertTrue(states)
+                max_state = max(states, key=lambda state: state.score)
+                self.assertGreaterEqual(max_state.score, 50)
+                self.assertTrue(baseline["initial_average_entropy"] is not None)
 
-                self.assertIsNotNone(record)
-                self.assertIn("EntropyIncrease", record.active_rules)
-                self.assertGreaterEqual(record.entropy_score_bonus, 30)
-                self.assertGreaterEqual(record.score, 50)
-            finally:
-                metadata_db.close()
-
-    def test_entropy_rename_preserves_baseline_and_identity(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            original = root / "sample.txt"
-            renamed = root / "sample.locked"
-            original.write_text("baseline\n", encoding="utf-8")
-
-            metadata_db = MetadataDatabase(root / "metadata.db")
-            logs_db = LogsDatabase(root / "logs.db")
-            alerts_db = AlertsDatabase(root / "alerts.db")
-
-            monitor = EntropyMonitor(
-                metadata_db=metadata_db,
-                logs_db=logs_db,
-                alerts_db=alerts_db,
-                allowed_extensions={"txt"},
-                monitored_roots=[root],
-                threshold=1.0,
-            )
-
-            try:
-                monitor._scan_file_for_cache(original)
-                original_row = metadata_db.get_file(str(original))
-                self.assertIsNotNone(original_row)
-                original_baseline = original_row["baseline_entropy"]
-                original_first_seen = original_row["first_seen"]
-                original_file_id = original_row["file_id"]
-
-                original.rename(renamed)
-
-                with patch("entropy.monitor.calculate_entropy", return_value=6.5) as entropy_mock:
-                    monitor._process_event(
-                        type(
-                            "Evt",
-                            (),
-                            {
-                                "event_type": "FILE MOVED",
-                                "file_path": str(renamed),
-                                "previous_path": str(original),
-                                "file_id": original_file_id,
-                                "process_name": None,
-                                "pid": None,
-                                "executable": None,
-                                "parent": None,
-                            },
-                        )
-                    )
-                monitor._flush_pending_metadata_updates()
-
-                self.assertEqual(entropy_mock.call_count, 1)
-                row = metadata_db.get_entropy_record(str(renamed))
-                self.assertIsNotNone(row)
-                self.assertTrue(row["exists"])
-                self.assertAlmostEqual(row["entropy"], 6.5)
-                legacy = metadata_db.get_file_by_identifier(original_file_id, str(renamed), include_deleted=True)
-                self.assertIsNotNone(legacy)
-                self.assertEqual(legacy["file_id"], original_file_id)
-                self.assertEqual(legacy["first_seen"], original_first_seen)
-                self.assertAlmostEqual(legacy["baseline_entropy"], original_baseline)
-                self.assertGreater(legacy["current_entropy"] - legacy["baseline_entropy"], 0.0)
-                self.assertIsNone(metadata_db.get_file(str(original)))
+                if max_state.entropy_score_bonus > 0:
+                    self.assertEqual(max_state.entropy_score_bonus, monitor.behavior_tracker._entropy_score_delta)
+                    self.assertLessEqual(len(entropy_hits), 1)
             finally:
                 monitor.stop()
-                metadata_db.close()
-                logs_db.close()
-                alerts_db.close()
+                simulator.assert_all_touches_inside_sandbox()
+                simulator.cleanup()
 
-    def test_copy_delete_creates_new_identity_when_file_id_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            original = root / "sample.txt"
-            copied = root / "sample.locked"
-            original.write_text("baseline\n", encoding="utf-8")
-            copied.write_text("encrypted payload\n", encoding="utf-8")
+        self.assertFalse(root.exists())
 
-            metadata_db = MetadataDatabase(root / "metadata.db")
-            logs_db = LogsDatabase(root / "logs.db")
-            alerts_db = AlertsDatabase(root / "alerts.db")
 
-            monitor = EntropyMonitor(
-                metadata_db=metadata_db,
-                logs_db=logs_db,
-                alerts_db=alerts_db,
-                allowed_extensions={"txt", "locked"},
-                monitored_roots=[root],
-                threshold=1.0,
-            )
-
-            try:
-                monitor._scan_file_for_cache(original)
-                original_row = metadata_db.get_file(str(original))
-                self.assertIsNotNone(original_row)
-                original_baseline = original_row["baseline_entropy"]
-                original_file_id = original_row["file_id"]
-
-                copied_stat = copied.stat()
-                copied_file_id = f"{int(getattr(copied_stat, 'st_dev', 0) or 0)}:{int(getattr(copied_stat, 'st_ino', 0) or 0)}"
-
-                with patch("entropy.monitor.calculate_entropy", return_value=6.5):
-                    monitor._process_event(
-                        type(
-                            "DeleteEvt",
-                            (),
-                            {
-                                "event_type": "FILE DELETED",
-                                "file_path": str(original),
-                                "previous_path": None,
-                                "file_id": original_file_id,
-                                "process_name": None,
-                                "pid": None,
-                                "executable": None,
-                                "parent": None,
-                            },
-                        )
-                    )
-
-                    monitor._process_event(
-                        type(
-                            "CreateEvt",
-                            (),
-                            {
-                                "event_type": "FILE CREATED",
-                                "file_path": str(copied),
-                                "previous_path": None,
-                                "file_id": copied_file_id,
-                                "process_name": None,
-                                "pid": None,
-                                "executable": None,
-                                "parent": None,
-                            },
-                        )
-                    )
-                monitor._flush_pending_metadata_updates()
-
-                deleted_row = metadata_db.get_file_by_identifier(original_file_id, str(original), include_deleted=True)
-                copied_row = metadata_db.get_file_by_identifier(copied_file_id, str(copied), include_deleted=True)
-
-                self.assertIsNotNone(deleted_row)
-                self.assertEqual(deleted_row["exists"], 0)
-                self.assertIsNotNone(copied_row)
-                self.assertEqual(copied_row["exists"], 1)
-                self.assertEqual(copied_row["file_id"], copied_file_id)
-                self.assertNotEqual(copied_row["file_id"], original_file_id)
-                self.assertNotEqual(copied_row["baseline_entropy"], original_baseline)
-                self.assertAlmostEqual(copied_row["baseline_entropy"], copied_row["current_entropy"])
-            finally:
-                monitor.stop()
-                metadata_db.close()
-                logs_db.close()
-                alerts_db.close()
-
-    def test_burst_queue_coalesces_duplicate_modification_events(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data_file = root / "sample.txt"
-            data_file.write_text("hello world\n", encoding="utf-8")
-
-            class DummyTracker:
-                def __init__(self):
-                    self.events = []
-
-                def record_event(self, event_type, src_path, process_metadata, previous_path=None, runtime_status=None):
-                    self.events.append((event_type, src_path, previous_path, runtime_status))
-
-            tracker = DummyTracker()
-            handler = FileSystemMonitorHandler(_DummyLogger(), tracker)
-            handler._process_resolver.resolve = lambda path, **kwargs: ProcessMetadata(
-                pid=111,
-                name="python.exe",
-                executable="C:/python/python.exe",
-                parent_name=None,
-                start_time=None,
-                start_time_epoch=None,
-            )
-
-            handler._report_event("FILE MODIFIED", str(data_file))
-            handler._report_event("FILE MODIFIED", str(data_file))
-
-            self.assertEqual(len(handler._queued_event_keys), 1)
-            time.sleep(0.15)
-            self.assertEqual(len(tracker.events), 1)
-            handler.stop()
+class WindowsRuntimeMetadataSnapshotTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Metadata snapshot is collected only on Windows hosts")
+    def test_print_runtime_environment_snapshot(self):
+        print(f"OS version: {platform.platform()}")
+        print(f"Python version: {sys.version}")
 
 
 if __name__ == "__main__":

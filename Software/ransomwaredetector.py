@@ -84,16 +84,9 @@ except ImportError:
     _DATABASE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# Entropy / database integration (gracefully optional so the GUI still starts
-# even if new packages are not yet installed)
+# Entropy scoring now runs inside ProcessBehaviorTracker as score-50 validation.
+# The GUI still surfaces entropy metadata but does not run a live entropy worker.
 # ---------------------------------------------------------------------------
-try:
-    from entropy import EntropyMonitor, EntropyIncreaseDetected
-    _ENTROPY_AVAILABLE = True
-except ImportError:
-    _ENTROPY_AVAILABLE = False
-    EntropyMonitor = None  # type: ignore[assignment,misc]
-
 logger = logging.getLogger(__name__)
 
 APP_VERSION = "v1.0.5"
@@ -770,8 +763,7 @@ class RdrsGui(QWidget):
         self.output_bridge.entropy_alert.connect(self._on_entropy_alert_signal)
         self.output_bridge.entropy_data_updated.connect(self._refresh_entropy_table)
 
-        # --- Entropy monitor (created lazily when monitor starts) ----------
-        self._entropy_monitor: Optional[object] = None  # EntropyMonitor | None
+        # Entropy validation is owned by ProcessBehaviorTracker.
         self._entropy_rebuild_dialog: Optional[QDialog] = None
         self._entropy_rebuild_thread: Optional[QThread] = None
         self._entropy_rebuild_worker: Optional[EntropyBuildWorker] = None
@@ -1277,11 +1269,9 @@ class RdrsGui(QWidget):
 
         # Status label for entropy module state
         self.entropy_status_label = QLabel(
-            "⚠ Entropy module not available — install the 'entropy' and 'database' packages."
-            if not _ENTROPY_AVAILABLE else
-            "Entropy module ready.  Start the monitor to begin tracking."
+            "Entropy validation mode: startup baseline + score-50 process validation."
         )
-        self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11pt;")
+        self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11pt;")
         self.entropy_status_label.setWordWrap(True)
         entropy_layout.addWidget(self.entropy_status_label)
 
@@ -2074,58 +2064,12 @@ class RdrsGui(QWidget):
         self.append_raw_line(f"Starting monitor for: {monitor_path}")
         if self._logs_db is not None:
             self._start_log_db_writer()
-        logger.info("[ENTROPY_TRACE][GUI] start_monitor path=%s entropy_available=%s", monitor_path, _ENTROPY_AVAILABLE)
-
-        # --- Start entropy monitor first (if available) -------------------
-        if _ENTROPY_AVAILABLE:
-            try:
-                cfg = get_config() if _CONFIG_AVAILABLE else None
-                ent_cfg = cfg.entropy if cfg else None
-                db_cfg  = cfg.database if cfg else None
-
-                meta_db   = get_metadata_db()
-                logs_db   = get_logs_db()
-                alerts_db = get_alerts_db()
-
-                allowed_ext = set(ent_cfg.file_extensions) if ent_cfg else set()
-                sample_size = ent_cfg.sample_size_bytes if ent_cfg else 5 * 1024 * 1024
-                threshold   = ent_cfg.threshold if ent_cfg else 1.4
-                retention   = db_cfg.metadata_retention_days if db_cfg else 30
-
-                entropy_enabled = bool(ent_cfg.enabled) if ent_cfg else True
-                if entropy_enabled:
-                    self._entropy_monitor = EntropyMonitor(
-                        metadata_db=meta_db,
-                        logs_db=logs_db,
-                        alerts_db=alerts_db,
-                        allowed_extensions=allowed_ext,
-                        monitored_roots=[entropy_root],
-                        sample_size_bytes=sample_size,
-                        threshold=threshold,
-                        on_entropy_alert=self._entropy_alert_callback,
-                        retention_days=retention,
-                        persist_events_to_logs=False,
-                    )
-                    self._entropy_monitor.start()
-                    logger.info(
-                        "[ENTROPY_TRACE][GUI] entropy_monitor_started threshold=%.3f sample_size=%s extensions=%s",
-                        threshold,
-                        sample_size,
-                        sorted(list(allowed_ext))[:20],
-                    )
-                    self.entropy_status_label.setText(
-                        f"Entropy module active  |  threshold: {threshold:.2f} bits  |  "
-                        f"watching {len(allowed_ext)} extension(s)"
-                    )
-                    self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
-                    self._entropy_refresh_timer.start()
-                else:
-                    self.entropy_status_label.setText("Entropy rule disabled from Active Rules. Module not started.")
-                    self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
-            except Exception as exc:
-                logger.exception("[ENTROPY_TRACE][GUI] entropy_monitor_start_failed: %s", exc)
-                self.entropy_status_label.setText(f"Entropy module failed to start: {exc}")
-                self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        logger.info("[ENTROPY_TRACE][GUI] start_monitor path=%s entropy_validation_mode=score50", monitor_path)
+        self.entropy_status_label.setText(
+            "Entropy validation active: startup baseline + score-50 process validation"
+        )
+        self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+        self._entropy_refresh_timer.start()
 
         self.monitor_session = MonitorSession(
             target_path=monitor_path,
@@ -2163,16 +2107,15 @@ class RdrsGui(QWidget):
 
         This callback runs on watchdog's observer thread. It must stay light:
         - persist event to logs.db (best effort)
-        - forward event to EntropyMonitor (if active)
+        - avoid entropy calculations (validation occurs in tracker at score 50)
         - enqueue a lightweight GUI event for batched rendering
         """
         logger.info(
-            "[ENTROPY_TRACE][GUI_CALLBACK] recv event=%s file=%s pid=%s proc=%s entropy_monitor=%s",
+            "[ENTROPY_TRACE][GUI_CALLBACK] recv event=%s file=%s pid=%s proc=%s",
             event_type,
             file_path,
             pid,
             process_name,
-            self._entropy_monitor is not None,
         )
 
         if self._logs_db is not None:
@@ -2197,37 +2140,11 @@ class RdrsGui(QWidget):
                     file_path,
                 )
 
-        forward_to_entropy = event_type in {"FILE CREATED", "FILE MODIFIED", "FILE MOVED", "FILE DELETED", "FILE RENAMED"}
-        if self._entropy_monitor is not None and forward_to_entropy:
-            try:
-                self._entropy_monitor.on_file_event(
-                    event_type,
-                    file_path,
-                    previous_path=previous_path,
-                    file_identifier=file_identifier,
-                    process_name=process_name,
-                    pid=pid,
-                    executable=executable,
-                    parent=parent,
-                )
-                logger.info(
-                    "[ENTROPY_TRACE][GUI_CALLBACK] forwarded_to_entropy event=%s file=%s",
-                    event_type,
-                    file_path,
-                )
-            except Exception:
-                logger.exception(
-                    "[ENTROPY_TRACE][GUI_CALLBACK] forward_error event=%s file=%s",
-                    event_type,
-                    file_path,
-                )
-        else:
-            logger.debug(
-                "[ENTROPY_TRACE][GUI_CALLBACK] entropy forwarding skipped event=%s file=%s monitor=%s",
-                event_type,
-                file_path,
-                self._entropy_monitor is not None,
-            )
+        logger.debug(
+            "[ENTROPY_TRACE][GUI_CALLBACK] no_entropy_forwarding event=%s file=%s",
+            event_type,
+            file_path,
+        )
 
         try:
             self._filesystem_event_gui_queue.put_nowait(
@@ -2327,7 +2244,6 @@ class RdrsGui(QWidget):
             self._entropy_rebuild_dialog = None
 
         entropy_root = Path(self.entropy_dir_input.text().strip() or Path.home()).expanduser()
-        self._restart_entropy_monitor_for_new_root(entropy_root)
         self.entropy_status_label.setText(
             f"Entropy database updated. Processed {processed} / {total} files from {entropy_root}."
         )
@@ -2350,55 +2266,6 @@ class RdrsGui(QWidget):
         self._entropy_rebuild_worker = None
         self._entropy_rebuild_thread = None
 
-    def _restart_entropy_monitor_for_new_root(self, entropy_root: Path) -> None:
-        """Switch entropy monitor root without blocking the GUI thread."""
-        if not _ENTROPY_AVAILABLE:
-            return
-        if not _DATABASE_AVAILABLE:
-            return
-
-        try:
-            cfg = get_config() if _CONFIG_AVAILABLE else None
-            ent_cfg = cfg.entropy if cfg else None
-            db_cfg = cfg.database if cfg else None
-
-            if ent_cfg is not None and not ent_cfg.enabled:
-                self.entropy_status_label.setText("Entropy rule disabled from Active Rules. Module not started.")
-                self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
-                return
-
-            meta_db = get_metadata_db()
-            logs_db = get_logs_db()
-            alerts_db = get_alerts_db()
-
-            allowed_ext = set(ent_cfg.file_extensions) if ent_cfg else set()
-            sample_size = ent_cfg.sample_size_bytes if ent_cfg else 5 * 1024 * 1024
-            threshold = ent_cfg.threshold if ent_cfg else 1.4
-            retention = db_cfg.metadata_retention_days if db_cfg else 30
-
-            old_monitor = self._entropy_monitor
-            self._entropy_monitor = EntropyMonitor(
-                metadata_db=meta_db,
-                logs_db=logs_db,
-                alerts_db=alerts_db,
-                allowed_extensions=allowed_ext,
-                monitored_roots=[entropy_root],
-                sample_size_bytes=sample_size,
-                threshold=threshold,
-                on_entropy_alert=self._entropy_alert_callback,
-                retention_days=retention,
-                persist_events_to_logs=False,
-            )
-            self._entropy_monitor.start()
-            self._entropy_refresh_timer.start()
-
-            # Stop old monitor in the background to keep UI responsive.
-            if old_monitor is not None:
-                threading.Thread(target=old_monitor.stop, daemon=True).start()
-        except Exception as exc:
-            logger.exception("Failed to restart entropy monitor for new root: %s", exc)
-            self.show_error(f"Failed to apply entropy root: {exc}")
-
     def stop_monitor(self):
         if self.monitor_session is None:
             return
@@ -2413,13 +2280,6 @@ class RdrsGui(QWidget):
             self.runtime_timer.stop()
         except Exception:
             pass
-        # Stop entropy monitor
-        if self._entropy_monitor is not None:
-            try:
-                self._entropy_monitor.stop()
-            except Exception:
-                pass
-            self._entropy_monitor = None
         self._entropy_refresh_timer.stop()
 
     def on_process_started(self):
@@ -2510,20 +2370,8 @@ class RdrsGui(QWidget):
             logger.exception("Failed to write batched log events to logs.db")
 
     def _on_high_score_rescan_requested(self, file_paths: List[str], context: Dict[str, object]) -> None:
-        """Queue highest-priority filesystem-truth entropy rescans from monitor workers."""
-        if self._entropy_monitor is None or not file_paths:
-            return
-        try:
-            paths = [Path(path) for path in file_paths]
-            self._entropy_monitor.queue_rescan_for_paths(paths)
-            logger.info(
-                "Queued high-score entropy rescan for %s files (pid=%s score=%s)",
-                len(paths),
-                context.get("pid"),
-                context.get("score"),
-            )
-        except Exception:
-            logger.exception("Failed to queue high-score entropy rescan.")
+        """Legacy hook retained for compatibility; score-50 validation is in tracker."""
+        return
 
     def handle_error(self, message: str) -> None:
         self.output_bridge.error_occurred.emit(message)
@@ -4135,87 +3983,8 @@ class RdrsGui(QWidget):
 
     def _refresh_entropy_table(self) -> None:
         """Populate the Entropy Monitor table with the latest metadata.db data."""
-        if not _ENTROPY_AVAILABLE:
-            return
-        if self._entropy_monitor is None:
-            self._refresh_entropy_table_from_db()
-            return
-
-        directory_filter = self.entropy_dir_input.text().strip()
-
-        try:
-            if directory_filter:
-                rows = self._entropy_monitor.get_files_in_directory(directory_filter)
-            else:
-                rows = self._entropy_monitor.get_monitored_files()
-        except Exception:
-            return
-
-        self.entropy_table.setSortingEnabled(False)
-        self.entropy_table.setRowCount(0)
-
-        for r in rows:
-            row_idx = self.entropy_table.rowCount()
-            self.entropy_table.insertRow(row_idx)
-
-            file_name    = r["file_name"] or ""
-            curr_ent     = r["current_entropy"]
-            baseline_ent = r["baseline_entropy"] if "baseline_entropy" in r.keys() else r["previous_entropy"]
-            file_size    = r["file_size"]
-            last_scan    = r["last_scan_ts"]
-            exists       = r["exists"]
-
-            # Δ entropy
-            if curr_ent is not None and baseline_ent is not None:
-                delta = curr_ent - baseline_ent
-                delta_str = f"{delta:+.4f}"
-            else:
-                delta = None
-                delta_str = "—"
-
-            curr_str    = f"{curr_ent:.4f}" if curr_ent is not None else "—"
-            prev_str    = f"{baseline_ent:.4f}" if baseline_ent is not None else "—"
-            size_str    = self._format_size(file_size) if file_size else "—"
-            scan_str    = (
-                datetime.fromtimestamp(last_scan).strftime("%Y-%m-%d %H:%M:%S")
-                if last_scan else "—"
-            )
-            status_str  = "Exists" if exists else "Deleted"
-
-            details_payload = {
-                "file_name": file_name or "—",
-                "current_entropy": curr_str,
-                "previous_entropy": prev_str,
-                "delta_entropy": delta_str,
-                "file_size": size_str,
-                "last_scan": scan_str,
-                "status": status_str,
-            }
-
-            values = [file_name, curr_str, delta_str, status_str]
-            for col, val in enumerate(values):
-                item = QTableWidgetItem(val)
-                if col == 0:
-                    item.setData(Qt.UserRole, details_payload)
-
-                # Colour delta column red if suspicious
-                if col == 2 and delta is not None:
-                    try:
-                        cfg = get_config() if _CONFIG_AVAILABLE else None
-                        threshold = cfg.entropy.threshold if cfg else 1.4
-                    except Exception:
-                        threshold = 1.4
-                    if delta >= threshold:
-                        item.setForeground(QBrush(QColor("#ff4444")))
-                        item.setFont(QFont("Arial", 10, QFont.Bold))
-                    elif delta > 0.5:
-                        item.setForeground(QBrush(QColor("#ff9800")))
-                if col == 3 and status_str == "Deleted":
-                    item.setForeground(QBrush(QColor("#808080")))
-                self.entropy_table.setItem(row_idx, col, item)
-
-        self.entropy_table.setSortingEnabled(True)
-        self._resize_entropy_columns()
+        self._refresh_entropy_table_from_db()
+        return
 
     def _refresh_entropy_table_from_db(self) -> None:
         """Fallback path that reads the metadata database directly."""

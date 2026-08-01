@@ -117,7 +117,6 @@ def build_entropy_cache(
     start = time.time()
     normalized_ext = {ext.lower().lstrip(".") for ext in allowed_extensions}
     all_current_files = [path for path in _iter_all_files(roots) if path.exists() and path.is_file()]
-    current_paths = {str(path.resolve()) for path in all_current_files}
 
     pre_reset_rows = []
     try:
@@ -125,15 +124,29 @@ def build_entropy_cache(
     except Exception:
         pre_reset_rows = []
 
+    entropy_cache_rows = []
+    try:
+        entropy_cache_rows = metadata_db.get_entropy_existing()
+    except Exception:
+        entropy_cache_rows = []
+
     existing_by_id = {}
+    existing_by_path = {}
     existing_paths = set()
     for row in pre_reset_rows:
         row_path = row["file_path"]
         row_id = row["file_id"] if "file_id" in row.keys() else None
         if row_path:
             existing_paths.add(row_path)
+            existing_by_path[row_path] = row
         if row_id:
             existing_by_id[row_id] = row
+
+    entropy_cache_by_path = {}
+    for row in entropy_cache_rows:
+        path_key = row["path"]
+        if path_key:
+            entropy_cache_by_path[path_key] = row
 
     candidates: list[Path] = []
     for path in all_current_files:
@@ -163,7 +176,12 @@ def build_entropy_cache(
         current_ext = path.suffix.lower().lstrip(".")
         file_id = _build_file_identity(path)
 
-        existing_row = metadata_db.get_file_by_identifier(file_id, resolved_path, include_deleted=True)
+        existing_row = None
+        if file_id and file_id in existing_by_id:
+            existing_row = existing_by_id[file_id]
+        elif resolved_path in existing_by_path:
+            existing_row = existing_by_path[resolved_path]
+
         baseline_entropy = None
         previous_entropy = None
         original_path = None
@@ -181,11 +199,22 @@ def build_entropy_cache(
             mtime = None
 
         entropy_value = None
+        reused_entropy = False
         if size is not None and mtime is not None:
-            try:
-                entropy_value = calculate_entropy(path, sample_size_bytes)
-            except Exception as exc:
-                logger.warning("[ENTROPY_SCAN][scan_failed] file=%s error=%s", resolved_path, exc)
+            cached = entropy_cache_by_path.get(resolved_path)
+            if (
+                cached is not None
+                and cached["entropy"] is not None
+                and int(cached["file_size"] or -1) == int(size)
+                and float(cached["modified_time"] or -1.0) == float(mtime)
+            ):
+                entropy_value = float(cached["entropy"])
+                reused_entropy = True
+            else:
+                try:
+                    entropy_value = calculate_entropy(path, sample_size_bytes)
+                except Exception as exc:
+                    logger.warning("[ENTROPY_SCAN][scan_failed] file=%s error=%s", resolved_path, exc)
 
         if entropy_value is None:
             logger.warning("[ENTROPY_SCAN][skip] file=%s could not be read", resolved_path)
@@ -240,6 +269,14 @@ def build_entropy_cache(
 
             if file_id:
                 metadata_db.upsert_entropy_identity(file_id, resolved_path, exists=True)
+
+            if reused_entropy:
+                logger.debug(
+                    "[ENTROPY_SCAN][cache_hit] file=%s size=%s mtime=%.6f",
+                    resolved_path,
+                    size,
+                    float(mtime),
+                )
 
 
         percent = int((idx / total) * 100) if total > 0 else 100

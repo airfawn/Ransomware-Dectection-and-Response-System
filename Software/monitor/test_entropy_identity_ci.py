@@ -30,7 +30,7 @@ class _DummyLogger:
 
 
 class _DummyTracker:
-    def record_event(self, event_type, src_path, process_metadata, previous_path=None):
+    def record_event(self, event_type, src_path, process_metadata, previous_path=None, runtime_status=None):
         class _State:
             score = 0
             pid = process_metadata.pid

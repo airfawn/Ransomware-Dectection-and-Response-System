@@ -7,7 +7,16 @@ from monitor.filesystem_monitor import ProcessBehaviorTracker, ProcessMetadata
 
 class FileSystemMonitorScoringTest(unittest.TestCase):
     def setUp(self):
-        logger = type("L", (), {"info": lambda *args, **kwargs: None, "error": lambda *args, **kwargs: None})()
+        logger = type(
+            "L",
+            (),
+            {
+                "info": lambda *args, **kwargs: None,
+                "error": lambda *args, **kwargs: None,
+                "debug": lambda *args, **kwargs: None,
+                "warning": lambda *args, **kwargs: None,
+            },
+        )()
         self.tracker = ProcessBehaviorTracker(logger=logger)
         self.meta = ProcessMetadata(
             pid=999,
