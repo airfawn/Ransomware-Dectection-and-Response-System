@@ -31,7 +31,7 @@ try:
 except ImportError:
     psutil = None
 
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer, QThread
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QColor, QFont, QBrush
 from PyQt5.QtWidgets import (
     QApplication,
@@ -62,8 +62,6 @@ from PyQt5.QtWidgets import (
 )
 
 from monitor.session import MonitorSession
-from entropy_loader import EntropyBuildWorker, EntropyRescanWorker
-from splash_screen import EntropyRebuildDialog
 from utils.paths import get_data_dir
 
 try:
@@ -71,14 +69,13 @@ try:
         get_config,
         save_rule_settings,
         save_entropy_rule_settings,
-        save_startup_directories,
     )
     _CONFIG_AVAILABLE = True
 except ImportError:
     _CONFIG_AVAILABLE = False
 
 try:
-    from database import get_logs_db, get_metadata_db, get_alerts_db
+    from database import get_logs_db, get_alerts_db
     _DATABASE_AVAILABLE = True
 except ImportError:
     _DATABASE_AVAILABLE = False
@@ -117,7 +114,7 @@ _RULE_DESCRIPTIONS: Dict[str, str] = {
     "Rule2_MultipleDirectories": "Triggers when a process touches more distinct directories than the configured threshold within 1 second.",
     "Rule3_YoungProcessBurst": "Triggers when a recently started process (below the age threshold) generates high file activity.",
     "Rule4_ExtensionChangeBurst": "Triggers on a burst of genuine file-extension changes (e.g. .docx \u2192 .locked) from one process within the configured window \u2014 a strong ransomware signature.",
-    "EntropyIncrease": "Triggers when a monitored file's Shannon entropy increases sharply between scans \u2014 a strong indicator that the file's contents were just encrypted.",
+    "EntropyIncrease": "Triggers only when score reaches 50+: scans up to 10 recent modified files, compares validation average entropy to startup baseline average, and adds score only if higher.",
 }
 
 # Special sentinel used for the Entropy row in the Active Rules table, since
@@ -763,13 +760,9 @@ class RdrsGui(QWidget):
         self.output_bridge.entropy_alert.connect(self._on_entropy_alert_signal)
         self.output_bridge.entropy_data_updated.connect(self._refresh_entropy_table)
 
-        # Entropy validation is owned by ProcessBehaviorTracker.
-        self._entropy_rebuild_dialog: Optional[QDialog] = None
-        self._entropy_rebuild_thread: Optional[QThread] = None
-        self._entropy_rebuild_worker: Optional[EntropyBuildWorker] = None
-        self._entropy_rescan_thread: Optional[QThread] = None
-        self._entropy_rescan_worker: Optional[EntropyRescanWorker] = None
-        self._last_applied_entropy_root: Optional[str] = None
+        # Aggregate entropy baseline snapshot from startup worker payload.
+        self._startup_baseline_average: Optional[float] = None
+        self._startup_baseline_file_count: int = 0
 
         self._log_db_event_queue: "queue.Queue[dict]" = queue.Queue(maxsize=5000)
         self._log_db_writer_running = False
@@ -807,12 +800,14 @@ class RdrsGui(QWidget):
             "QTableWidget::item { padding: 8px; }"
         )
         self.build_ui()
-        if hasattr(self, "entropy_dir_input"):
-            self._last_applied_entropy_root = str(
-                Path(self.entropy_dir_input.text().strip() or Path.home()).expanduser().resolve()
-            )
         self._load_persisted_logs(limit=300)
         self._load_persisted_response_actions(limit=200)
+
+    def set_entropy_baseline_snapshot(self, average_entropy: Optional[float], file_count: int) -> None:
+        """Inject startup baseline snapshot from initialization worker."""
+        self._startup_baseline_average = average_entropy
+        self._startup_baseline_file_count = max(0, int(file_count or 0))
+        self._refresh_entropy_table()
 
     def build_ui(self):
         main_layout = QHBoxLayout()
@@ -854,7 +849,7 @@ class RdrsGui(QWidget):
         self.processes_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.processes_button)
 
-        self.entropy_button = QPushButton("▶ Entropy Monitor")
+        self.entropy_button = QPushButton("▶ Detection & Entropy")
         self.entropy_button.clicked.connect(lambda: self.select_page(3))
         self.entropy_button.setStyleSheet("font-weight: bold; color: white; background: transparent;")
         sidebar_layout.addWidget(self.entropy_button)
@@ -1217,125 +1212,116 @@ class RdrsGui(QWidget):
         processes_layout.addWidget(processes_split_layout, 1)
         self.page_stack.addWidget(self.processes_page)
 
-        # ---- Entropy Monitor page ----------------------------------------
+        # ---- Detection & Entropy page ------------------------------------
         self.entropy_page = QWidget()
         entropy_layout = QVBoxLayout()
-        entropy_layout.setContentsMargins(20, 14, 20, 18)
-        entropy_layout.setSpacing(10)
+        entropy_layout.setContentsMargins(24, 24, 24, 24)
+        entropy_layout.setSpacing(14)
         self.entropy_page.setLayout(entropy_layout)
 
-        entropy_title = QLabel("Entropy Monitor")
-        entropy_title.setStyleSheet("font-size: 17pt; font-weight: bold; color: #ffffff;")
+        entropy_title = QLabel("RDRS")
+        entropy_title.setStyleSheet("font-size: 28pt; font-weight: 900; color: #ffffff;")
         entropy_layout.addWidget(entropy_title)
 
         entropy_desc = QLabel(
-            "Displays entropy values for monitored files. "
-            "High entropy increases may indicate encryption by ransomware."
+            "Ransomware Detection & Response System"
         )
         entropy_desc.setWordWrap(True)
-        entropy_desc.setStyleSheet("color: #d1d1d1; font-size: 11pt; margin-bottom: 2px;")
+        entropy_desc.setStyleSheet("color: #d1d1d1; font-size: 13pt;")
         entropy_layout.addWidget(entropy_desc)
 
-        # Toolbar row (directory selector + refresh button)
-        entropy_toolbar = QHBoxLayout()
-
-        entropy_dir_label = QLabel("Directory:")
-        entropy_dir_label.setStyleSheet("color: #d9d9d9;")
-        entropy_toolbar.addWidget(entropy_dir_label)
-
-        self.entropy_dir_input = QLineEdit(str(Path.home()))
-        self.entropy_dir_input.setStyleSheet(
-            "background: #222938; color: white; border: 1px solid #2f3a59; padding: 6px; border-radius: 4px;"
-        )
-        self.entropy_dir_input.setPlaceholderText("Entropy monitoring directory…")
-        self.entropy_dir_input.editingFinished.connect(self._on_set_entropy_directory_clicked)
-        entropy_toolbar.addWidget(self.entropy_dir_input, 1)
-
-        btn_refresh_entropy = QPushButton("↻ Refresh")
-        btn_refresh_entropy.clicked.connect(self._run_manual_entropy_refresh)
-        btn_refresh_entropy.setStyleSheet(
-            "background: #2f3a59; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;"
-        )
-        entropy_toolbar.addWidget(btn_refresh_entropy)
-
-        btn_apply_entropy_dir = QPushButton("Apply Entropy Directory")
-        btn_apply_entropy_dir.clicked.connect(self._on_set_entropy_directory_clicked)
-        btn_apply_entropy_dir.setStyleSheet(
-            "background: #345f2f; color: white; font-weight: bold; padding: 8px 16px; border-radius: 4px;"
-        )
-        entropy_toolbar.addWidget(btn_apply_entropy_dir)
-
-        entropy_layout.addLayout(entropy_toolbar)
-
-        # Status label for entropy module state
-        self.entropy_status_label = QLabel(
-            "Entropy validation mode: startup baseline + score-50 process validation."
-        )
-        self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11pt;")
+        self.entropy_status_label = QLabel("Status: PROTECTED\nMonitoring: INACTIVE")
+        self.entropy_status_label.setStyleSheet("color: #72d2a4; font-size: 12pt; font-weight: bold;")
         self.entropy_status_label.setWordWrap(True)
         entropy_layout.addWidget(self.entropy_status_label)
 
-        entropy_content_split = QSplitter(Qt.Horizontal)
-        entropy_content_split.setChildrenCollapsible(False)
-        entropy_content_split.setHandleWidth(8)
+        score_card = QFrame()
+        score_card.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 10px; }")
+        score_layout = QVBoxLayout()
+        score_layout.setContentsMargins(18, 18, 18, 18)
+        score_layout.setSpacing(6)
+        score_card.setLayout(score_layout)
+        score_layout.addWidget(QLabel("CURRENT SCORE"))
+        score_layout.itemAt(0).widget().setStyleSheet("color: #9fb3d1; font-size: 11pt; font-weight: bold;")
+        self.detection_score_label = QLabel("0 / 100")
+        self.detection_score_label.setStyleSheet("color: #ffffff; font-size: 34pt; font-weight: 900;")
+        score_layout.addWidget(self.detection_score_label)
+        self.detection_state_label = QLabel("NORMAL  (0-49)")
+        self.detection_state_label.setStyleSheet("color: #72d2a4; font-size: 12pt; font-weight: bold;")
+        score_layout.addWidget(self.detection_state_label)
+        score_layout.addWidget(QLabel("State Bands: 0-49 NORMAL, 50-64 SUSPICIOUS, 65+ ALERT"))
+        score_layout.itemAt(3).widget().setStyleSheet("color: #d1d1d1; font-size: 10pt;")
+        entropy_layout.addWidget(score_card)
 
-        # SOC-style condensed table: critical fields only
-        self.entropy_table = QTableWidget(0, 4)
-        self.entropy_table.setHorizontalHeaderLabels([
-            "File Name",
-            "Current Entropy",
-            "Δ Entropy",
-            "Status",
-        ])
-        self.entropy_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.entropy_table.horizontalHeader().setStretchLastSection(False)
-        self.entropy_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.entropy_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.entropy_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.entropy_table.setSortingEnabled(True)
-        self.entropy_table.setAlternatingRowColors(True)
-        self.entropy_table.itemSelectionChanged.connect(self._on_entropy_selection_changed)
-        entropy_content_split.addWidget(self.entropy_table)
+        entropy_split = QSplitter(Qt.Horizontal)
+        entropy_split.setChildrenCollapsible(False)
+        entropy_split.setHandleWidth(8)
 
-        self.entropy_details_panel = QFrame()
-        self.entropy_details_panel.setStyleSheet(
-            "QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 8px; }"
-        )
-        details_layout = QVBoxLayout()
-        details_layout.setContentsMargins(14, 14, 14, 14)
-        details_layout.setSpacing(10)
-        self.entropy_details_panel.setLayout(details_layout)
+        entropy_panel = QFrame()
+        entropy_panel.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 10px; }")
+        entropy_panel_layout = QVBoxLayout()
+        entropy_panel_layout.setContentsMargins(14, 14, 14, 14)
+        entropy_panel_layout.setSpacing(8)
+        entropy_panel.setLayout(entropy_panel_layout)
+        entropy_panel_layout.addWidget(QLabel("Entropy"))
+        entropy_panel_layout.itemAt(0).widget().setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        self.entropy_baseline_value = QLabel("Baseline Average Entropy: —")
+        self.entropy_validation_value = QLabel("Last Validation Average: Not triggered")
+        self.entropy_increase_value = QLabel("Entropy Increase: —")
+        self.entropy_trigger_value = QLabel("Entropy Trigger: +0")
+        for widget in (
+            self.entropy_baseline_value,
+            self.entropy_validation_value,
+            self.entropy_increase_value,
+            self.entropy_trigger_value,
+        ):
+            widget.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
+            entropy_panel_layout.addWidget(widget)
+        entropy_panel_layout.addStretch()
 
-        details_title = QLabel("Selected File Details")
-        details_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
-        details_layout.addWidget(details_title)
+        activity_panel = QFrame()
+        activity_panel.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 10px; }")
+        activity_layout = QVBoxLayout()
+        activity_layout.setContentsMargins(14, 14, 14, 14)
+        activity_layout.setSpacing(8)
+        activity_panel.setLayout(activity_layout)
+        activity_layout.addWidget(QLabel("Recent Activity"))
+        activity_layout.itemAt(0).widget().setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        self.entropy_activity_table = QTableWidget(0, 2)
+        self.entropy_activity_table.setHorizontalHeaderLabels(["Time", "Activity"])
+        self.entropy_activity_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.entropy_activity_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.entropy_activity_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.entropy_activity_table.setSelectionMode(QTableWidget.NoSelection)
+        self.entropy_activity_table.setAlternatingRowColors(True)
+        activity_layout.addWidget(self.entropy_activity_table)
 
-        self.entropy_details_hint = QLabel("Select a row to inspect baseline entropy, scan time, and file size.")
-        self.entropy_details_hint.setWordWrap(True)
-        self.entropy_details_hint.setStyleSheet("color: #d1d1d1; font-size: 11pt;")
-        details_layout.addWidget(self.entropy_details_hint)
+        entropy_split.addWidget(entropy_panel)
+        entropy_split.addWidget(activity_panel)
+        entropy_split.setSizes([380, 980])
+        entropy_layout.addWidget(entropy_split, 1)
 
-        self.entropy_detail_labels = {}
-        detail_fields = [
-            ("File Name", "file_name"),
-            ("Current Entropy", "current_entropy"),
-            ("Baseline Entropy", "previous_entropy"),
-            ("Delta Entropy", "delta_entropy"),
-            ("File Size", "file_size"),
-            ("Last Scan", "last_scan"),
-            ("Status", "status"),
-        ]
-        for title, key in detail_fields:
-            label = QLabel(f"{title}: —")
-            label.setWordWrap(True)
-            label.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
-            details_layout.addWidget(label)
-            self.entropy_detail_labels[key] = label
-        details_layout.addStretch()
-
-        entropy_content_split.addWidget(self.entropy_details_panel)
-        entropy_content_split.setSizes([1000, 360])
-        entropy_layout.addWidget(entropy_content_split, 1)
+        summary_panel = QFrame()
+        summary_panel.setStyleSheet("QFrame { background: #1f2430; border: 1px solid #2d3547; border-radius: 10px; }")
+        summary_layout = QVBoxLayout()
+        summary_layout.setContentsMargins(14, 14, 14, 14)
+        summary_layout.setSpacing(6)
+        summary_panel.setLayout(summary_layout)
+        summary_layout.addWidget(QLabel("Detection Summary"))
+        summary_layout.itemAt(0).widget().setStyleSheet("font-size: 16pt; font-weight: bold; color: #ffffff;")
+        self.summary_behavior_value = QLabel("Behavior Score: +0")
+        self.summary_extension_value = QLabel("Extension Score: +0")
+        self.summary_entropy_value = QLabel("Entropy Validation: +0")
+        self.summary_total_value = QLabel("Total Score: 0")
+        for widget in (
+            self.summary_behavior_value,
+            self.summary_extension_value,
+            self.summary_entropy_value,
+            self.summary_total_value,
+        ):
+            widget.setStyleSheet("color: #f0f0f0; font-size: 11pt;")
+            summary_layout.addWidget(widget)
+        entropy_layout.addWidget(summary_panel)
 
         self.page_stack.addWidget(self.entropy_page)
 
@@ -1679,7 +1665,7 @@ class RdrsGui(QWidget):
             self.log_table,
             self.active_process_table,
             self.inactive_process_table,
-            self.entropy_table,
+            self.entropy_activity_table,
             self.rules_table,
             self.incident_timeline_table,
             self.incident_files_table,
@@ -1764,14 +1750,10 @@ class RdrsGui(QWidget):
         self.incident_behavior_table.setColumnWidth(2, 450)
 
     def _resize_entropy_columns(self) -> None:
-        """Keep File Name at ~45% while sizing other columns to content."""
-        available = max(400, self.entropy_table.viewport().width())
-        file_name_width = int(available * 0.45)
-
-        self.entropy_table.setColumnWidth(1, max(180, self.entropy_table.sizeHintForColumn(1) + 20))
-        self.entropy_table.setColumnWidth(2, max(150, self.entropy_table.sizeHintForColumn(2) + 20))
-        self.entropy_table.setColumnWidth(3, max(120, self.entropy_table.sizeHintForColumn(3) + 20))
-        self.entropy_table.setColumnWidth(0, file_name_width)
+        """Maintain readable activity table column widths."""
+        if not hasattr(self, "entropy_activity_table"):
+            return
+        self.entropy_activity_table.setColumnWidth(0, 170)
 
     def _update_version_label_font(self) -> None:
         """Keep the footer version text small while allowing gentle resize scaling."""
@@ -1794,7 +1776,7 @@ class RdrsGui(QWidget):
     def resizeEvent(self, event) -> None:
         """Keep responsive table proportions as the window size changes."""
         super().resizeEvent(event)
-        if hasattr(self, "entropy_table"):
+        if hasattr(self, "entropy_activity_table"):
             self._resize_entropy_columns()
         self._update_version_label_font()
 
@@ -1821,7 +1803,7 @@ class RdrsGui(QWidget):
         self.incident_button.setText("▶ Incident Details")
         self.monitoring_button.setText("▶ File Monitoring")
         self.processes_button.setText("▶ Processes")
-        self.entropy_button.setText("▶ Entropy Monitor")
+        self.entropy_button.setText("▶ Detection & Entropy")
         self.rules_button.setText("▶ Active Rules")
 
         if index == 0:
@@ -1833,11 +1815,13 @@ class RdrsGui(QWidget):
         elif index == 1:
             self.monitoring_button.setText("▼ File Monitoring")
             self.monitoring_button.setStyleSheet(_active)
+            self._pending_log_refresh = True
+            self._pending_counter_refresh = True
         elif index == 2:
             self.processes_button.setText("▼ Processes")
             self.processes_button.setStyleSheet(_active)
         elif index == 3:
-            self.entropy_button.setText("▼ Entropy Monitor")
+            self.entropy_button.setText("▼ Detection & Entropy")
             self.entropy_button.setStyleSheet(_active)
             self._refresh_entropy_table()
         elif index == 4:
@@ -2053,21 +2037,12 @@ class RdrsGui(QWidget):
             self.handle_error(f"Monitor path does not exist: {monitor_path}")
             return
 
-        entropy_dir_text = self.entropy_dir_input.text().strip() if hasattr(self, "entropy_dir_input") else ""
-        entropy_root = Path(entropy_dir_text).expanduser() if entropy_dir_text else monitor_path
-        if not entropy_root.exists() or not entropy_root.is_dir():
-            entropy_root = monitor_path
-            if hasattr(self, "entropy_dir_input"):
-                self.entropy_dir_input.setText(str(entropy_root))
-
         self._pending_log_lines.clear()
         self.append_raw_line(f"Starting monitor for: {monitor_path}")
         if self._logs_db is not None:
             self._start_log_db_writer()
         logger.info("[ENTROPY_TRACE][GUI] start_monitor path=%s entropy_validation_mode=score50", monitor_path)
-        self.entropy_status_label.setText(
-            "Entropy validation active: startup baseline + score-50 process validation"
-        )
+        self.entropy_status_label.setText("Status: PROTECTED\nMonitoring: ACTIVE")
         self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
         self._entropy_refresh_timer.start()
 
@@ -2169,100 +2144,23 @@ class RdrsGui(QWidget):
             logger.warning("GUI event queue full; dropped event=%s file=%s", event_type, file_path)
 
     def _on_set_entropy_directory_clicked(self) -> None:
-        """Rebuild entropy database asynchronously when entropy root changes."""
-        if not _CONFIG_AVAILABLE:
-            self.show_error("Config module unavailable; cannot update entropy directory.")
-            return
-        if not _DATABASE_AVAILABLE:
-            self.show_error("Database module unavailable; cannot rebuild entropy database.")
-            return
-
-        entropy_dir_text = self.entropy_dir_input.text().strip()
-        if not entropy_dir_text:
-            self.show_error("Please enter an entropy monitoring directory.")
-            return
-
-        entropy_root = Path(entropy_dir_text).expanduser()
-        if not entropy_root.exists() or not entropy_root.is_dir():
-            self.show_error(f"Invalid entropy directory: {entropy_root}")
-            return
-
-        try:
-            normalized_entropy_root = str(entropy_root.resolve())
-        except Exception:
-            normalized_entropy_root = str(entropy_root)
-
-        # Ignore no-op apply events (e.g., editingFinished focus changes).
-        if self._last_applied_entropy_root == normalized_entropy_root:
-            return
-
-        if self._entropy_rebuild_thread is not None and self._entropy_rebuild_thread.isRunning():
-            logger.info("Entropy rebuild request ignored: rebuild already running.")
-            return
-
-        cfg = get_config()
-        monitor_root = self.path_input.text().strip() or cfg.monitoring.file_monitor_directory
-        saved = save_startup_directories(str(entropy_root), str(Path(monitor_root).expanduser()))
-        if not saved:
-            self.show_error("Failed to save startup directories to config.yaml.")
-            return
-
-        self._last_applied_entropy_root = normalized_entropy_root
-
-        self._entropy_rebuild_dialog = EntropyRebuildDialog(self)
-        self._entropy_rebuild_dialog.show()
-
-        metadata_db = get_metadata_db()
-        self._entropy_rebuild_thread = QThread(self)
-        self._entropy_rebuild_worker = EntropyBuildWorker(
-            metadata_db=metadata_db,
-            root=entropy_root,
-            allowed_extensions=set(cfg.entropy.file_extensions),
-            sample_size_bytes=cfg.entropy.sample_size_bytes,
-        )
-        self._entropy_rebuild_worker.moveToThread(self._entropy_rebuild_thread)
-
-        self._entropy_rebuild_thread.started.connect(self._entropy_rebuild_worker.run)
-        self._entropy_rebuild_worker.progress.connect(self._on_entropy_rebuild_progress)
-        self._entropy_rebuild_worker.completed.connect(self._on_entropy_rebuild_finished)
-        self._entropy_rebuild_worker.failed.connect(self._on_entropy_rebuild_failed)
-        self._entropy_rebuild_worker.completed.connect(self._entropy_rebuild_thread.quit)
-        self._entropy_rebuild_worker.failed.connect(self._entropy_rebuild_thread.quit)
-        self._entropy_rebuild_thread.finished.connect(self._cleanup_entropy_rebuild_worker)
-
-        self._entropy_rebuild_thread.start()
+        """Legacy compatibility stub; startup baseline scope is managed at initialization."""
+        return
 
     def _on_entropy_rebuild_progress(self, current: int, total: int, file_name: str, percent: int) -> None:
-        if self._entropy_rebuild_dialog is not None:
-            self._entropy_rebuild_dialog.on_progress(current, total, file_name, percent)
+        return
 
-    def _on_entropy_rebuild_finished(self, total: int, processed: int, added: int = 0, removed: int = 0, updated: int = 0) -> None:
-        if self._entropy_rebuild_dialog is not None:
-            self._entropy_rebuild_dialog.on_finished(total, processed)
-            self._entropy_rebuild_dialog.close()
-            self._entropy_rebuild_dialog.deleteLater()
-            self._entropy_rebuild_dialog = None
-
-        entropy_root = Path(self.entropy_dir_input.text().strip() or Path.home()).expanduser()
-        self.entropy_status_label.setText(
-            f"Entropy database updated. Processed {processed} / {total} files from {entropy_root}."
-        )
-        self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+    def _on_entropy_rebuild_finished(self, total: int, processed: int, average_entropy: float = 0.0) -> None:
+        self.entropy_status_label.setText("Status: PROTECTED\nMonitoring: ACTIVE")
         self._refresh_entropy_table()
 
     def _on_entropy_rebuild_failed(self, message: str) -> None:
         self._entropy_refresh_in_progress = False
-        if self._entropy_rebuild_dialog is not None:
-            self._entropy_rebuild_dialog.on_failed(message)
-        self.entropy_status_label.setText(f"Entropy refresh failed: {message}")
+        self.entropy_status_label.setText(f"Status: DEGRADED\nMonitoring: ACTIVE\nEntropy error: {message}")
         self.entropy_status_label.setStyleSheet("color: #ff5252; font-size: 11px;")
-        self.show_error(f"Entropy rebuild failed: {message}")
+        logger.error("Entropy operation failed: %s", message)
 
     def _cleanup_entropy_rebuild_worker(self) -> None:
-        if self._entropy_rebuild_worker is not None:
-            self._entropy_rebuild_worker.deleteLater()
-        if self._entropy_rebuild_thread is not None:
-            self._entropy_rebuild_thread.deleteLater()
         self._entropy_rebuild_worker = None
         self._entropy_rebuild_thread = None
 
@@ -2281,6 +2179,8 @@ class RdrsGui(QWidget):
         except Exception:
             pass
         self._entropy_refresh_timer.stop()
+        if hasattr(self, "entropy_status_label"):
+            self.entropy_status_label.setText("Status: PROTECTED\nMonitoring: INACTIVE")
 
     def on_process_started(self):
         self.start_button.setEnabled(False)
@@ -3178,6 +3078,20 @@ class RdrsGui(QWidget):
                     record["process_completed"] = value
                 elif current_key == "last_activity":
                     record["last_activity"] = value
+                elif current_key == "behavior_score_component":
+                    record["behavior_score_component"] = value
+                elif current_key == "extension_score_component":
+                    record["extension_score_component"] = value
+                elif current_key == "entropy_validation_trigger":
+                    record["entropy_validation_trigger"] = value
+                elif current_key == "entropy_baseline_average":
+                    record["entropy_baseline_average"] = value
+                elif current_key == "entropy_validation_average":
+                    record["entropy_validation_average"] = value
+                elif current_key == "entropy_validation_increase":
+                    record["entropy_validation_increase"] = value
+                elif current_key == "entropy_validation_passed":
+                    record["entropy_validation_passed"] = value
                 elif current_key == "process_start_time":
                     record["process_start_time"] = value
                 elif current_key == "first_activity":
@@ -3395,11 +3309,11 @@ class RdrsGui(QWidget):
             self._refresh_process_state_tables()
             self._pending_process_state_refresh = False
 
-        if self._pending_log_refresh:
+        if self._pending_log_refresh and self.page_stack.currentIndex() == 1:
             self._refresh_log_table_view()
             self._pending_log_refresh = False
 
-        if self._pending_counter_refresh:
+        if self._pending_counter_refresh and self.page_stack.currentIndex() == 1:
             self._refresh_file_event_counters()
             self._pending_counter_refresh = False
 
@@ -3982,109 +3896,158 @@ class RdrsGui(QWidget):
     # ------------------------------------------------------------------
 
     def _refresh_entropy_table(self) -> None:
-        """Populate the Entropy Monitor table with the latest metadata.db data."""
-        self._refresh_entropy_table_from_db()
-        return
+        """Refresh aggregate entropy and detection-score dashboard data."""
+        baseline_avg = self._startup_baseline_average
+        baseline_count = self._startup_baseline_file_count
+        validation_avg = None
+        validation_count = 0
+        validation_increase = None
+        validation_score_delta = 0
 
-    def _refresh_entropy_table_from_db(self) -> None:
-        """Fallback path that reads the metadata database directly."""
-        if not _DATABASE_AVAILABLE:
-            return
-        try:
-            metadata_db = get_metadata_db()
-            rows = metadata_db.get_all_existing()
-        except Exception:
-            return
+        top_process = self._get_response_target_process()
+        score_value = 0
+        behavior_score = 0
+        extension_score = 0
+        entropy_score = validation_score_delta
+        if top_process is not None:
+            try:
+                score_value = int(str(top_process.get("score") or "0"))
+            except Exception:
+                score_value = 0
+            try:
+                behavior_score = int(str(top_process.get("behavior_score_component") or "0"))
+            except Exception:
+                behavior_score = 0
+            try:
+                extension_score = int(str(top_process.get("extension_score_component") or "0"))
+            except Exception:
+                extension_score = 0
+            try:
+                entropy_score = int(str(top_process.get("entropy_validation_trigger") or entropy_score or 0))
+            except Exception:
+                pass
+            try:
+                if baseline_avg is None:
+                    baseline_avg = float(str(top_process.get("entropy_baseline_average") or ""))
+            except Exception:
+                pass
+            try:
+                if baseline_count <= 0:
+                    baseline_count = int(str(top_process.get("entropy_baseline_file_count") or "0"))
+            except Exception:
+                pass
+            try:
+                validation_avg = float(str(top_process.get("entropy_validation_average") or ""))
+            except Exception:
+                validation_avg = validation_avg
+            try:
+                validation_count = int(str(top_process.get("entropy_validation_file_count") or "0"))
+            except Exception:
+                validation_count = validation_count
+            try:
+                validation_increase = float(str(top_process.get("entropy_validation_increase") or ""))
+            except Exception:
+                validation_increase = validation_increase
+            try:
+                validation_score_delta = int(str(top_process.get("entropy_validation_trigger") or "0"))
+            except Exception:
+                validation_score_delta = validation_score_delta
 
-        self.entropy_table.setSortingEnabled(False)
-        self.entropy_table.setRowCount(0)
-        for row in rows:
-            row_idx = self.entropy_table.rowCount()
-            self.entropy_table.insertRow(row_idx)
-            values = [
-                row["file_name"] or Path(row["file_path"]).name,
-                f"{row['current_entropy']:.4f}" if row["current_entropy"] is not None else "—",
-                f"{(row['current_entropy'] - (row['baseline_entropy'] if 'baseline_entropy' in row.keys() else row['previous_entropy'])):+.4f}"
-                if row["current_entropy"] is not None
-                and ((row["baseline_entropy"] if "baseline_entropy" in row.keys() else row["previous_entropy"]) is not None)
-                else "—",
-                "Exists" if row["exists"] else "Deleted",
-            ]
-            for col_index, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                self.entropy_table.setItem(row_idx, col_index, item)
-        self.entropy_table.setSortingEnabled(True)
+        if score_value >= 65:
+            state_text = "ALERT  (65+)"
+            state_color = "#ff6b6b"
+        elif score_value >= 50:
+            state_text = "SUSPICIOUS  (50-64)"
+            state_color = "#ffb347"
+        else:
+            state_text = "NORMAL  (0-49)"
+            state_color = "#72d2a4"
+
+        self.detection_score_label.setText(f"{score_value} / 100")
+        self.detection_state_label.setText(state_text)
+        self.detection_state_label.setStyleSheet(f"color: {state_color}; font-size: 12pt; font-weight: bold;")
+
+        if baseline_avg is None:
+            self.entropy_baseline_value.setText("Baseline Average Entropy: Not available")
+        else:
+            self.entropy_baseline_value.setText(
+                f"Baseline Average Entropy: {float(baseline_avg):.2f}  ({baseline_count} files)"
+            )
+
+        if validation_avg is None:
+            self.entropy_validation_value.setText("Last Validation Average: Not triggered")
+            self.entropy_increase_value.setText("Entropy Increase: —")
+            self.entropy_trigger_value.setText("Entropy Trigger: +0")
+        else:
+            self.entropy_validation_value.setText(
+                f"Last Validation Average: {float(validation_avg):.2f}  ({validation_count} files)"
+            )
+            if validation_increase is None and baseline_avg is not None:
+                validation_increase = float(validation_avg) - float(baseline_avg)
+            self.entropy_increase_value.setText(
+                f"Entropy Increase: {float(validation_increase or 0.0):+0.2f}"
+            )
+            self.entropy_trigger_value.setText(f"Entropy Trigger: +{int(validation_score_delta)}")
+
+        self.summary_behavior_value.setText(f"Behavior Score: +{behavior_score}")
+        self.summary_extension_value.setText(f"Extension Score: +{extension_score}")
+        self.summary_entropy_value.setText(f"Entropy Validation: +{entropy_score}")
+        self.summary_total_value.setText(f"Total Score: {score_value}")
+
+        self._refresh_entropy_activity_table()
         self._resize_entropy_columns()
 
+    def _refresh_entropy_table_from_db(self) -> None:
+        """Compatibility wrapper retained for older call sites."""
+        self._refresh_entropy_table()
+
     def _run_manual_entropy_refresh(self) -> None:
-        """Run a full filesystem-based entropy rebuild asynchronously."""
-        if self._entropy_refresh_in_progress:
-            return
-        if not _DATABASE_AVAILABLE:
-            self.show_error("Database module unavailable; cannot refresh entropy data.")
-            return
-        entropy_dir_text = self.entropy_dir_input.text().strip()
-        if not entropy_dir_text:
-            self.show_error("Please enter an entropy monitoring directory.")
-            return
-        entropy_root = Path(entropy_dir_text).expanduser()
-        if not entropy_root.exists() or not entropy_root.is_dir():
-            self.show_error(f"Invalid entropy directory: {entropy_root}")
-            return
+        """Manual entropy refresh is intentionally disabled in validation-only mode."""
+        self.entropy_status_label.setText("Status: PROTECTED\nMonitoring: ACTIVE\nEntropy runs only at startup and score trigger.")
+        self.entropy_status_label.setStyleSheet("color: #72d2a4; font-size: 11px;")
+        self._refresh_entropy_table()
 
-        self._entropy_refresh_in_progress = True
-        self.entropy_status_label.setText("Scanning filesystem for entropy refresh…")
-        self.entropy_status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
-
-        metadata_db = get_metadata_db()
-        self._entropy_rebuild_thread = QThread(self)
-        self._entropy_rebuild_worker = EntropyBuildWorker(
-            metadata_db=metadata_db,
-            root=entropy_root,
-            allowed_extensions=set(get_config().entropy.file_extensions) if _CONFIG_AVAILABLE else set(),
-            sample_size_bytes=get_config().entropy.sample_size_bytes if _CONFIG_AVAILABLE else 5 * 1024 * 1024,
-        )
-        self._entropy_rebuild_worker.moveToThread(self._entropy_rebuild_thread)
-        self._entropy_rebuild_thread.started.connect(self._entropy_rebuild_worker.run)
-        self._entropy_rebuild_worker.progress.connect(self._on_entropy_rebuild_progress)
-        self._entropy_rebuild_worker.completed.connect(self._on_manual_entropy_refresh_finished)
-        self._entropy_rebuild_worker.failed.connect(self._on_entropy_rebuild_failed)
-        self._entropy_rebuild_worker.completed.connect(self._entropy_rebuild_thread.quit)
-        self._entropy_rebuild_worker.failed.connect(self._entropy_rebuild_thread.quit)
-        self._entropy_rebuild_thread.finished.connect(self._cleanup_entropy_rebuild_worker)
-        self._entropy_rebuild_thread.start()
-
-    def _on_manual_entropy_refresh_finished(self, total: int, processed: int, added: int, removed: int, updated: int) -> None:
+    def _on_manual_entropy_refresh_finished(self, total: int, processed: int, average_entropy: float) -> None:
         self._entropy_refresh_in_progress = False
-        self.entropy_status_label.setText(
-            f"Refresh complete — scanned {processed}/{total} files, added {added}, removed {removed}, updated {updated}."
-        )
+        self.entropy_status_label.setText("Status: PROTECTED\nMonitoring: ACTIVE")
         self.entropy_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
         self._refresh_entropy_table()
 
     def _on_entropy_selection_changed(self) -> None:
-        """Update the details panel with data from the selected entropy row."""
-        selected = self.entropy_table.selectedItems()
-        if not selected:
-            return
+        return
 
-        row = selected[0].row()
-        anchor_item = self.entropy_table.item(row, 0)
-        if anchor_item is None:
-            return
+    def _refresh_entropy_activity_table(self) -> None:
+        """Render recent, detection-relevant activity for the dashboard page."""
+        activities = []
+        for row in reversed(self.event_rows[-600:]):
+            timestamp = str(row.get("timestamp") or "")
+            event_type = str(row.get("event_type") or "")
+            message = str(row.get("message") or "")
+            process = str(row.get("process") or "")
 
-        payload = anchor_item.data(Qt.UserRole)
-        if not isinstance(payload, dict):
-            return
+            if event_type in {"FILE MODIFIED", "FILE CREATED", "FILE DELETED", "FILE MOVED"}:
+                continue
 
-        self.entropy_details_hint.setVisible(False)
-        self.entropy_detail_labels["file_name"].setText(f"File Name: {payload.get('file_name', '—')}")
-        self.entropy_detail_labels["current_entropy"].setText(f"Current Entropy: {payload.get('current_entropy', '—')}")
-        self.entropy_detail_labels["previous_entropy"].setText(f"Baseline Entropy: {payload.get('previous_entropy', '—')}")
-        self.entropy_detail_labels["delta_entropy"].setText(f"Delta Entropy: {payload.get('delta_entropy', '—')}")
-        self.entropy_detail_labels["file_size"].setText(f"File Size: {payload.get('file_size', '—')}")
-        self.entropy_detail_labels["last_scan"].setText(f"Last Scan: {payload.get('last_scan', '—')}")
-        self.entropy_detail_labels["status"].setText(f"Status: {payload.get('status', '—')}")
+            if event_type == "PROCESS_STATE":
+                score_text = str(row.get("score") or "0")
+                activities.append((timestamp, f"Score updated: {score_text}"))
+            elif event_type == "DETECTION":
+                reason = str(row.get("reason") or message or "Detection triggered")
+                activities.append((timestamp, reason))
+            elif "Entropy validation" in message or "[EntropyValidation]" in message:
+                activities.append((timestamp, message))
+            elif event_type == "EXTENSION_CHANGE":
+                activities.append((timestamp, f"Extension changes detected ({process or 'unknown process'})"))
+
+            if len(activities) >= 12:
+                break
+
+        self.entropy_activity_table.setRowCount(0)
+        for timestamp, text in reversed(activities):
+            row_index = self.entropy_activity_table.rowCount()
+            self.entropy_activity_table.insertRow(row_index)
+            self.entropy_activity_table.setItem(row_index, 0, QTableWidgetItem(timestamp or "—"))
+            self.entropy_activity_table.setItem(row_index, 1, QTableWidgetItem(text))
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:

@@ -40,7 +40,7 @@ class StartupWorker(QObject):
             self._run_step(2, "Initializing Settings", "Applying runtime settings", self._step_init_settings, ctx)
             self._run_step(3, "Connecting Database", "Opening SQLite databases", self._step_connect_db, ctx)
             self._run_step(4, "Loading Previous Logs", "Reading persisted monitoring history", self._step_load_logs, ctx)
-            self._run_step(5, "Building Entropy Database", "Scanning files for entropy cache", self._step_build_entropy, ctx)
+            self._run_step(5, "Building Entropy Baseline", "Scanning files for startup entropy average", self._step_build_entropy, ctx)
             self._run_step(6, "Initializing Monitoring Modules", "Preparing monitor modules", self._step_init_modules, ctx)
             self._run_step(7, "Verifying Modules", "Verifying module readiness", self._step_verify_modules, ctx)
             self._run_step(8, "Launching Dashboard", "Finalizing startup", self._step_launch_dashboard, ctx)
@@ -52,6 +52,8 @@ class StartupWorker(QObject):
                     "logs_loaded": ctx.get("logs_loaded", 0),
                     "entropy_total": ctx.get("entropy_total", 0),
                     "entropy_processed": ctx.get("entropy_processed", 0),
+                    "initial_average_entropy": ctx.get("initial_average_entropy"),
+                    "baseline_file_count": ctx.get("baseline_file_count", 0),
                 }
             )
         except Exception as exc:
@@ -107,42 +109,9 @@ class StartupWorker(QObject):
         )
         ctx["entropy_total"] = summary.total_files
         ctx["entropy_processed"] = summary.processed_files
-        self._persist_initial_entropy_baseline(metadata_db, ctx)
+        ctx["initial_average_entropy"] = summary.average_entropy
+        ctx["baseline_file_count"] = summary.processed_files
         return f"Scanned {summary.processed_files} / {summary.total_files} files"
-
-    def _persist_initial_entropy_baseline(self, metadata_db, ctx: Dict[str, Any]) -> None:
-        """Compute and persist startup baseline values for score-50 validation."""
-        rows = metadata_db.get_entropy_existing()
-        entropy_values = [
-            float(row["entropy"])
-            for row in rows
-            if row["entropy"] is not None
-        ]
-        if entropy_values:
-            initial_average_entropy = sum(entropy_values) / len(entropy_values)
-            initial_max_entropy = max(entropy_values)
-        else:
-            initial_average_entropy = None
-            initial_max_entropy = None
-
-        metadata_db.set_runtime_entropy_baseline(
-            initial_average_entropy=initial_average_entropy,
-            initial_max_entropy=initial_max_entropy,
-            baseline_file_count=len(entropy_values),
-            source_roots=str(self._entropy_dir),
-        )
-
-        ctx["initial_average_entropy"] = initial_average_entropy
-        ctx["initial_max_entropy"] = initial_max_entropy
-        ctx["baseline_file_count"] = len(entropy_values)
-
-        logger.debug(
-            "Entropy baseline initialized (avg=%s, max=%s, files=%s, root=%s)",
-            f"{initial_average_entropy:.6f}" if initial_average_entropy is not None else "None",
-            f"{initial_max_entropy:.6f}" if initial_max_entropy is not None else "None",
-            len(entropy_values),
-            self._entropy_dir,
-        )
 
     def _step_init_modules(self, ctx: Dict[str, Any]) -> str:
         # Importing validates that monitor modules are available.

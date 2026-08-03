@@ -806,7 +806,6 @@ class ProcessBehaviorTracker:
         self._entropy_validation_armed: Dict[ProcessIdentity, bool] = {}
         self._entropy_baseline_missing_logged = False
         self._entropy_initial_average: Optional[float] = None
-        self._entropy_initial_max: Optional[float] = None
         self._entropy_initial_file_count: int = 0
         self._load_startup_entropy_baseline()
         
@@ -819,20 +818,12 @@ class ProcessBehaviorTracker:
         row = self._metadata_db.get_runtime_entropy_baseline()
         if row is None:
             self._entropy_initial_average = None
-            self._entropy_initial_max = None
             self._entropy_initial_file_count = 0
             return
-        self._entropy_initial_average = (
-            float(row["initial_average_entropy"])
-            if row["initial_average_entropy"] is not None
-            else None
-        )
-        self._entropy_initial_max = (
-            float(row["initial_max_entropy"])
-            if row["initial_max_entropy"] is not None
-            else None
-        )
-        self._entropy_initial_file_count = int(row["baseline_file_count"] or 0)
+        average_value = row["average_entropy"] if "average_entropy" in row.keys() else row["initial_average_entropy"]
+        self._entropy_initial_average = float(average_value) if average_value is not None else None
+        file_count_value = row["file_count"] if "file_count" in row.keys() else row["baseline_file_count"]
+        self._entropy_initial_file_count = int(file_count_value or 0)
 
     def get_process_state(self, process_metadata: ProcessMetadata) -> Optional[ProcessState]:
         """Return the current ProcessState for a process identity if it exists."""
@@ -1097,6 +1088,19 @@ class ProcessBehaviorTracker:
         
         # Update active rules
         record.active_rules = active_rules
+
+        # Persist score components so the GUI can show a deterministic
+        # behavior/extension/entropy breakdown without recalculating rule logic.
+        behavior_component = 0
+        extension_component = 0
+        for rule_name in active_rules:
+            weight = int(weights.get(rule_name, 0))
+            if rule_name == "Rule4_ExtensionChangeBurst":
+                extension_component += weight
+            else:
+                behavior_component += weight
+        record.encryption_indicators["behavior_score_component"] = behavior_component
+        record.encryption_indicators["extension_score_component"] = extension_component
         
         # Log new detections
         if new_activations:
@@ -1142,6 +1146,13 @@ class ProcessBehaviorTracker:
             return
 
         self._entropy_validation_armed[identity] = True
+        self.logger.info(
+            "[EntropyValidation] Triggered pid=%s process=%s score=%s baseline_avg=%.6f",
+            record.pid,
+            record.process_name or "unknown",
+            behavioral_score,
+            self._entropy_initial_average,
+        )
         candidate_paths = self._select_recent_modified_paths(record, limit=10)
 
         if not candidate_paths:
@@ -1172,6 +1183,13 @@ class ProcessBehaviorTracker:
             selected_valid_paths.append(str(path))
             entropy_values.append(float(current_entropy))
 
+        self.logger.info(
+            "[EntropyValidation] Files selected=%s readable=%s pid=%s",
+            len(candidate_paths),
+            len(selected_valid_paths),
+            record.pid,
+        )
+
         if not entropy_values:
             self.logger.debug(
                 "Entropy validation triggered but no readable stable files remained "
@@ -1186,16 +1204,38 @@ class ProcessBehaviorTracker:
         modified_average_entropy = sum(entropy_values) / len(entropy_values)
         entropy_passed = modified_average_entropy > self._entropy_initial_average
 
+        entropy_increase = modified_average_entropy - self._entropy_initial_average
+        record.encryption_indicators["entropy_baseline_average"] = self._entropy_initial_average
+        record.encryption_indicators["entropy_baseline_file_count"] = self._entropy_initial_file_count
+        record.encryption_indicators["entropy_last_validation_average"] = modified_average_entropy
+        record.encryption_indicators["entropy_last_validation_file_count"] = len(entropy_values)
+        record.encryption_indicators["entropy_last_validation_increase"] = entropy_increase
+        record.encryption_indicators["entropy_last_validation_passed"] = entropy_passed
+        record.encryption_indicators["entropy_last_validation_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            self._metadata_db.set_last_entropy_validation(
+                validation_average_entropy=modified_average_entropy,
+                validation_file_count=len(entropy_values),
+                triggered_process_pid=record.pid,
+                triggered_process_name=record.process_name,
+                triggered_process_executable=record.executable,
+                baseline_average_entropy=self._entropy_initial_average,
+                entropy_increase=entropy_increase,
+                score_delta=(self._entropy_score_delta if entropy_passed else 0),
+            )
+        except Exception as exc:
+            self.logger.debug("Failed to persist entropy validation snapshot: %s", exc)
+
         self.logger.debug(
             "Entropy validation triggered: pid=%s score=%s selected=%s valid=%s "
-            "modified_avg=%.6f initial_avg=%.6f initial_max=%s pass=%s",
+            "modified_avg=%.6f initial_avg=%.6f pass=%s",
             record.pid,
             behavioral_score,
             len(candidate_paths),
             len(selected_valid_paths),
             modified_average_entropy,
             self._entropy_initial_average,
-            f"{self._entropy_initial_max:.6f}" if self._entropy_initial_max is not None else "None",
             "yes" if entropy_passed else "no",
         )
 
@@ -1203,6 +1243,13 @@ class ProcessBehaviorTracker:
         if entropy_passed:
             record.entropy_score_bonus = self._entropy_score_delta
             record.active_rules.add(self._entropy_rule_name)
+            self.logger.info(
+                "[EntropyValidation] Average entropy %.6f is above baseline %.6f (increase=%+.6f) -> +%s",
+                modified_average_entropy,
+                self._entropy_initial_average,
+                entropy_increase,
+                self._entropy_score_delta,
+            )
             if not previously_active:
                 reason = (
                     "Entropy validation passed: modified average entropy "
@@ -1218,6 +1265,12 @@ class ProcessBehaviorTracker:
         else:
             record.entropy_score_bonus = 0
             record.active_rules.discard(self._entropy_rule_name)
+            self.logger.info(
+                "[EntropyValidation] Average entropy %.6f is not above baseline %.6f (increase=%+.6f) -> +0",
+                modified_average_entropy,
+                self._entropy_initial_average,
+                entropy_increase,
+            )
 
     @staticmethod
     def _select_recent_modified_paths(record: ProcessState, *, limit: int) -> List[str]:
@@ -1372,6 +1425,7 @@ class ProcessBehaviorTracker:
         # Remove stale processes
         for identity in stale_identities:
             del self.records[identity]
+            self._entropy_validation_armed.pop(identity, None)
             self.logger.debug(f"Removed stale process: {identity}")
         
         if stale_identities:
@@ -1471,6 +1525,32 @@ class ProcessBehaviorTracker:
         Args:
             record: ProcessState to log.
         """
+        now = time.time()
+        previous_log_ts = float(record.encryption_indicators.get("_last_state_log_ts", 0.0) or 0.0)
+        previous_score = int(record.encryption_indicators.get("_last_state_log_score", -1) or -1)
+        previous_classification = str(record.encryption_indicators.get("_last_state_log_classification", ""))
+        previous_total_events = int(record.encryption_indicators.get("_last_state_log_events", -1) or -1)
+
+        current_score = int(record.score)
+        current_classification = str(record.classification)
+        current_total_events = int(record.total_events)
+
+        # Throttle very noisy PROCESS_STATE logs. Always log immediately when
+        # score/classification changes; otherwise emit at most every 350 ms or
+        # every 25 events so UI and log pipelines stay responsive under bursts.
+        if (
+            current_score == previous_score
+            and current_classification == previous_classification
+            and (now - previous_log_ts) < 0.35
+            and (current_total_events - previous_total_events) < 25
+        ):
+            return
+
+        record.encryption_indicators["_last_state_log_ts"] = now
+        record.encryption_indicators["_last_state_log_score"] = current_score
+        record.encryption_indicators["_last_state_log_classification"] = current_classification
+        record.encryption_indicators["_last_state_log_events"] = current_total_events
+
         lines = ["[ProcessState]", ""]
         lines.extend([
             "Process Name:", record.process_name or "unknown",
@@ -1499,6 +1579,15 @@ class ProcessBehaviorTracker:
             "Queue Pending:", str(record.encryption_indicators.get("queue_pending", 0)),
             "Queue Processed:", str(record.encryption_indicators.get("queue_processed", 0)),
             "Process Completed:", str(record.encryption_indicators.get("process_completed", False)),
+            "Behavior Score Component:", str(record.encryption_indicators.get("behavior_score_component", 0)),
+            "Extension Score Component:", str(record.encryption_indicators.get("extension_score_component", 0)),
+            "Entropy Baseline Average:", str(record.encryption_indicators.get("entropy_baseline_average", "unknown")),
+            "Entropy Baseline File Count:", str(record.encryption_indicators.get("entropy_baseline_file_count", "unknown")),
+            "Entropy Validation Average:", str(record.encryption_indicators.get("entropy_last_validation_average", "not triggered")),
+            "Entropy Validation File Count:", str(record.encryption_indicators.get("entropy_last_validation_file_count", 0)),
+            "Entropy Validation Increase:", str(record.encryption_indicators.get("entropy_last_validation_increase", 0)),
+            "Entropy Validation Passed:", str(record.encryption_indicators.get("entropy_last_validation_passed", False)),
+            "Entropy Validation Trigger:", str(record.entropy_score_bonus),
         ])
         lines.append("")
         lines.append("----------------------------")

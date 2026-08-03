@@ -1,7 +1,7 @@
 """RDRS database access layer package.
 
 Three databases are maintained:
-  metadata_db  — one row per monitored file (entropy, hash, timestamps, …)
+    metadata_db  — aggregate entropy baseline/validation snapshots
   logs_db      — file-system events (created / modified / deleted / renamed)
   alerts_db    — triggered alerts and suspicious-process records
 
@@ -14,7 +14,7 @@ Usage example::
     from database import get_metadata_db, get_logs_db, get_alerts_db
 
     metadata_db = get_metadata_db()
-    metadata_db.upsert_file(path=..., current_entropy=7.9, ...)
+    metadata_db.set_runtime_entropy_baseline(average_entropy=3.8, file_count=500)
 
 """
 

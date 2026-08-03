@@ -73,6 +73,12 @@ class InitializationManager(QObject):
                 f"Ready. Startup loaded {logs_loaded} log entries."
             )
 
+        if hasattr(self._main_window, "set_entropy_baseline_snapshot"):
+            self._main_window.set_entropy_baseline_snapshot(
+                payload.get("initial_average_entropy"),
+                int(payload.get("baseline_file_count", 0) or 0),
+            )
+
         self._main_window.show()
         if hasattr(self._main_window, "raise_"):
             self._main_window.raise_()
