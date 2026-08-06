@@ -479,6 +479,7 @@ class ProcessState:
     max_event_history: int = 1000
     event_window_seconds: float = 60.0
     recent_events: Deque[Tuple[float, str, str, str]] = field(default_factory=deque)
+    last_event_timestamp: Optional[float] = None
     extension_change_timestamps: Deque[float] = field(default_factory=lambda: deque(maxlen=500))
     """Bounded history of genuine extension-change event timestamps, used by
     ExtensionChangeEngine to detect mass-rename bursts (see
@@ -494,6 +495,8 @@ class ProcessState:
         """
         file_path = self._normalize_file_path(src_path)
         directory = self._extract_directory(src_path)
+
+        self.last_event_timestamp = timestamp
 
         if self.first_activity is None:
             self.first_activity = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
@@ -529,6 +532,8 @@ class ProcessState:
         """
         self.extension_change_count += 1
         self.extension_change_timestamps.append(timestamp)
+        if self.last_event_timestamp is None or timestamp > self.last_event_timestamp:
+            self.last_event_timestamp = timestamp
 
     def count_extension_changes(self, window_seconds: float) -> int:
         """Return the number of extension changes within a trailing time window.
@@ -542,7 +547,8 @@ class ProcessState:
         Returns:
             Count of extension-change events within the window.
         """
-        cutoff = datetime.now().timestamp() - window_seconds
+        reference = self.last_event_timestamp if self.last_event_timestamp is not None else datetime.now().timestamp()
+        cutoff = reference - window_seconds
         return sum(1 for ts in self.extension_change_timestamps if ts >= cutoff)
 
     def _normalize_file_path(self, src_path: str) -> str:
@@ -600,8 +606,8 @@ class ProcessState:
         Returns:
             Number of events within the last 1 second.
         """
-        now = datetime.now().timestamp()
-        return sum(1 for timestamp, *_ in self.recent_events if timestamp >= now - 1.0)
+        reference = self.last_event_timestamp if self.last_event_timestamp is not None else datetime.now().timestamp()
+        return sum(1 for timestamp, *_ in self.recent_events if timestamp >= reference - 1.0)
 
     @property
     def events_last_minute(self) -> int:
@@ -619,11 +625,11 @@ class ProcessState:
         Returns:
             Set of directory paths with recent activity.
         """
-        now = datetime.now().timestamp()
+        reference = self.last_event_timestamp if self.last_event_timestamp is not None else datetime.now().timestamp()
         return {
             directory
             for timestamp, _, directory, _ in self.recent_events
-            if timestamp >= now - 1.0
+            if timestamp >= reference - 1.0
         }
 
     @property
@@ -841,6 +847,7 @@ class ProcessBehaviorTracker:
         process_metadata: ProcessMetadata,
         previous_path: Optional[str] = None,
         runtime_status: Optional[Dict[str, Any]] = None,
+        event_timestamp: Optional[float] = None,
     ) -> ProcessState:
         """Record a filesystem event and update process behavior state.
         
@@ -859,7 +866,7 @@ class ProcessBehaviorTracker:
             Updated ProcessState for the process.
         """
         with self._lock:
-            now = datetime.now().timestamp()
+            now = float(event_timestamp) if event_timestamp is not None else datetime.now().timestamp()
             
             # Get or create process state
             identity = ProcessIdentity(
@@ -2064,6 +2071,7 @@ class FileSystemMonitorHandler(FileSystemEventHandler):
                 queued_event.process_metadata,
                 previous_path=queued_event.previous_path,
                 runtime_status=runtime_status,
+                event_timestamp=queued_event.timestamp,
             )
             file_identifier = self._compute_file_identifier(path, queued_event.previous_path)
 

@@ -2467,8 +2467,10 @@ class RdrsGui(QWidget):
         if not detection_entry and not process_state:
             return None
 
-        combined = process_state.copy()
-        combined.update({k: v for k, v in detection_entry.items() if v not in (None, "")})
+        # Prefer live process-state fields (score/components/classification)
+        # while still preserving detection-specific context such as reason/timestamp.
+        combined = detection_entry.copy()
+        combined.update({k: v for k, v in process_state.items() if v not in (None, "")})
 
         score_text = str(combined.get("score") or "0")
         try:
@@ -2573,8 +2575,8 @@ class RdrsGui(QWidget):
         if not process_entry and not detection_entry:
             return
 
-        combined = process_entry.copy()
-        combined.update({k: v for k, v in detection_entry.items() if v not in (None, "")})
+        combined = detection_entry.copy()
+        combined.update({k: v for k, v in process_entry.items() if v not in (None, "")})
 
         try:
             score_value = int(str(combined.get("score") or "0"))
@@ -3255,28 +3257,35 @@ class RdrsGui(QWidget):
         self.suspicious_process_rows.clear()
 
         def _score_for_sort(item: tuple) -> int:
-            entry = item[1]
+            key, entry = item
+            live_entry = self.process_state_cache.get(key, {})
+            effective_entry = entry.copy()
+            effective_entry.update({k: v for k, v in live_entry.items() if v not in (None, "")})
             try:
-                return int(entry.get("score", "0") or 0)
+                return int(effective_entry.get("score", "0") or 0)
             except Exception:
                 return 0
 
         for row_index, (key, entry) in enumerate(
             sorted(self.suspicious_process_entries.items(), key=_score_for_sort, reverse=True)
         ):
+            live_entry = self.process_state_cache.get(key, {})
+            effective_entry = entry.copy()
+            effective_entry.update({k: v for k, v in live_entry.items() if v not in (None, "")})
+
             self.home_table.insertRow(row_index)
             self.suspicious_process_rows[key] = row_index
-            score = entry.get("score", "0")
+            score = effective_entry.get("score", "0")
             try:
                 score_int = int(score)
             except Exception:
                 score_int = 0
             severity = self._severity_for_score(score_int)
-            status = self._incident_status_for(entry, self._response_actions_for_process(key))
-            detection_time = entry.get("timestamp") or entry.get("last_activity") or ""
+            status = self._incident_status_for(effective_entry, self._response_actions_for_process(key))
+            detection_time = effective_entry.get("timestamp") or effective_entry.get("last_activity") or ""
             values = [
-                entry.get("process", ""),
-                entry.get("pid", ""),
+                effective_entry.get("process", ""),
+                effective_entry.get("pid", ""),
                 str(score),
                 severity,
                 detection_time,
