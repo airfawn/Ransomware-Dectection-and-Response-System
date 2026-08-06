@@ -70,6 +70,14 @@ class MetadataDatabase(BaseDatabase):
 
         self._ensure_column(baseline_table, "source_roots", "TEXT")
         self._ensure_column(baseline_table, "created_at", "REAL")
+        if "computed_at" in baseline_columns:
+            self.execute(
+                """
+                UPDATE entropy_runtime_baseline
+                SET created_at = computed_at
+                WHERE created_at IS NULL
+                """
+            )
         self.execute(
             """
             UPDATE entropy_runtime_baseline
@@ -140,28 +148,59 @@ class MetadataDatabase(BaseDatabase):
     ) -> None:
         """Persist startup entropy baseline aggregate values."""
         self.execute("DELETE FROM entropy_last_validation")
+        baseline_columns = self._table_columns("entropy_runtime_baseline")
+        timestamp = time.time()
+        normalized_file_count = max(0, int(file_count))
+
+        columns = [
+            "id",
+            "average_entropy",
+            "file_count",
+            "source_roots",
+            "created_at",
+        ]
+        values = [
+            average_entropy,
+            normalized_file_count,
+            source_roots,
+            timestamp,
+        ]
+        updates = [
+            "average_entropy = excluded.average_entropy",
+            "file_count = excluded.file_count",
+            "source_roots = excluded.source_roots",
+            "created_at = excluded.created_at",
+        ]
+
+        # Legacy metadata DBs still enforce NOT NULL on computed_at and may
+        # keep alias columns. Populate both shapes in one UPSERT.
+        if "initial_average_entropy" in baseline_columns:
+            columns.append("initial_average_entropy")
+            values.append(average_entropy)
+            updates.append("initial_average_entropy = excluded.initial_average_entropy")
+        if "baseline_file_count" in baseline_columns:
+            columns.append("baseline_file_count")
+            values.append(normalized_file_count)
+            updates.append("baseline_file_count = excluded.baseline_file_count")
+        if "computed_at" in baseline_columns:
+            columns.append("computed_at")
+            values.append(timestamp)
+            updates.append("computed_at = excluded.computed_at")
+
+        placeholders = ", ".join(["?"] * len(values))
+        insert_columns_sql = ",\n                ".join(columns)
+        updates_sql = ",\n                ".join(updates)
+
         self.execute(
-            """
+            f"""
             INSERT INTO entropy_runtime_baseline (
-                id,
-                average_entropy,
-                file_count,
-                source_roots,
-                created_at
+                {insert_columns_sql}
             )
-            VALUES (1, ?, ?, ?, ?)
+            VALUES (1, {placeholders})
             ON CONFLICT(id) DO UPDATE SET
-                average_entropy = excluded.average_entropy,
-                file_count = excluded.file_count,
-                source_roots = excluded.source_roots,
-                created_at = excluded.created_at
+                {updates_sql}
             """,
-            (
-                average_entropy,
-                max(0, int(file_count)),
-                source_roots,
-                time.time(),
-            ),
+            tuple(values),
         )
 
     def get_runtime_entropy_baseline(self):

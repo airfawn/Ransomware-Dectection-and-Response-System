@@ -92,13 +92,28 @@ class LogsDatabase(BaseDatabase):
             timestamp:  Event epoch time (defaults to now).
         """
         ts = timestamp or time.time()
+        normalized_event_type = str(event_type or "").strip() or "UNKNOWN"
+        normalized_file_path = str(file_path or "")
+        normalized_file_name = str(file_name or "").strip()
+        if not normalized_file_name:
+            normalized_file_name = Path(normalized_file_path).name or "(unknown)"
+
         self.execute(
             """
             INSERT INTO file_events
                 (timestamp, event_type, file_path, file_name, process, pid, executable, parent)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (ts, event_type, file_path, file_name, process, pid, executable, parent),
+            (
+                ts,
+                normalized_event_type,
+                normalized_file_path,
+                normalized_file_name,
+                process,
+                pid,
+                executable,
+                parent,
+            ),
         )
         # Throttled retention enforcement — count query is cheap when indexed.
         self._maybe_trim()
@@ -115,12 +130,15 @@ class LogsDatabase(BaseDatabase):
 
         params = []
         for item in events:
+            file_path = str(item.get("file_path") or "")
+            file_name = str(item.get("file_name") or "").strip() or Path(file_path).name or "(unknown)"
+            event_type = str(item.get("event_type") or "").strip() or "UNKNOWN"
             params.append(
                 (
                     item.get("timestamp") or time.time(),
-                    item.get("event_type", ""),
-                    item.get("file_path", ""),
-                    item.get("file_name", ""),
+                    event_type,
+                    file_path,
+                    file_name,
                     item.get("process"),
                     item.get("pid"),
                     item.get("executable"),
