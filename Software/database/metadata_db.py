@@ -21,6 +21,83 @@ class MetadataDatabase(BaseDatabase):
 
     def __init__(self, db_path: Path) -> None:
         super().__init__(db_path)
+        self._migrate_legacy_schema()
+
+    def _table_columns(self, table_name: str) -> set:
+        """Return a set of column names for a table."""
+        rows = self.fetchall(f"PRAGMA table_info({table_name})")
+        return {row["name"] for row in rows}
+
+    def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
+        """Add a column if it is missing."""
+        columns = self._table_columns(table_name)
+        if column_name in columns:
+            return
+        self.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+    def _migrate_legacy_schema(self) -> None:
+        """Backfill schema changes for legacy metadata DB files.
+
+        Older builds used column names like ``initial_average_entropy`` and
+        ``baseline_file_count``. Ensure current columns exist and copy values
+        forward so startup can read/write without manual DB resets.
+        """
+        # runtime baseline table
+        baseline_table = "entropy_runtime_baseline"
+        baseline_columns = self._table_columns(baseline_table)
+
+        if "average_entropy" not in baseline_columns:
+            self._ensure_column(baseline_table, "average_entropy", "REAL")
+            if "initial_average_entropy" in baseline_columns:
+                self.execute(
+                    """
+                    UPDATE entropy_runtime_baseline
+                    SET average_entropy = initial_average_entropy
+                    WHERE average_entropy IS NULL
+                    """
+                )
+
+        if "file_count" not in baseline_columns:
+            self._ensure_column(baseline_table, "file_count", "INTEGER NOT NULL DEFAULT 0")
+            if "baseline_file_count" in baseline_columns:
+                self.execute(
+                    """
+                    UPDATE entropy_runtime_baseline
+                    SET file_count = COALESCE(baseline_file_count, 0)
+                    WHERE file_count IS NULL OR file_count = 0
+                    """
+                )
+
+        self._ensure_column(baseline_table, "source_roots", "TEXT")
+        self._ensure_column(baseline_table, "created_at", "REAL")
+        self.execute(
+            """
+            UPDATE entropy_runtime_baseline
+            SET created_at = ?
+            WHERE created_at IS NULL
+            """,
+            (time.time(),),
+        )
+
+        # last validation table
+        validation_table = "entropy_last_validation"
+        self._ensure_column(validation_table, "validation_average_entropy", "REAL")
+        self._ensure_column(validation_table, "validation_file_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(validation_table, "triggered_process_pid", "INTEGER")
+        self._ensure_column(validation_table, "triggered_process_name", "TEXT")
+        self._ensure_column(validation_table, "triggered_process_executable", "TEXT")
+        self._ensure_column(validation_table, "baseline_average_entropy", "REAL")
+        self._ensure_column(validation_table, "entropy_increase", "REAL")
+        self._ensure_column(validation_table, "score_delta", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(validation_table, "validated_at", "REAL")
+        self.execute(
+            """
+            UPDATE entropy_last_validation
+            SET validated_at = ?
+            WHERE validated_at IS NULL
+            """,
+            (time.time(),),
+        )
 
     def _get_schema_sql(self) -> List[str]:
         return [
