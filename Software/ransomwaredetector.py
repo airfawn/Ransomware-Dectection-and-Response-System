@@ -86,7 +86,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
-APP_VERSION = "v1.0.5"
+APP_VERSION = "1.5"
 
 
 def _safe_export_name(value: str, fallback: str = "event") -> str:
