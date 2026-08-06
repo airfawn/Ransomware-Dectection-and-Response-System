@@ -86,7 +86,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
-APP_VERSION = "1.5"
+APP_VERSION = "2"
 
 
 def _safe_export_name(value: str, fallback: str = "event") -> str:
@@ -2093,11 +2093,13 @@ class RdrsGui(QWidget):
             process_name,
         )
 
+        normalized_event_type = self._normalize_event_type(event_type)
+
         if self._logs_db is not None:
             try:
                 self._log_db_event_queue.put_nowait(
                     {
-                        "event_type": event_type,
+                        "event_type": normalized_event_type,
                         "file_path": file_path,
                         "file_name": Path(file_path).name,
                         "process": process_name,
@@ -2126,7 +2128,7 @@ class RdrsGui(QWidget):
                 {
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "level": "INFO",
-                    "event_type": event_type,
+                    "event_type": normalized_event_type,
                     "file": file_path,
                     "file_name": Path(file_path).name,
                     "process": process_name or "",
@@ -2287,7 +2289,18 @@ class RdrsGui(QWidget):
         if self.raw_output_window:
             self.raw_output_window.append_line(line)
 
+    @staticmethod
+    def _normalize_event_type(event_type: str) -> str:
+        """Normalize event type aliases used across callbacks and logs."""
+        normalized = str(event_type or "").strip().upper()
+        if normalized == "FILE EXTENSION CHANGED":
+            return "EXTENSION_CHANGE"
+        return normalized
+
     def add_log_row(self, entry: dict) -> None:
+        entry = dict(entry)
+        entry["event_type"] = self._normalize_event_type(entry.get("event_type", ""))
+
         if entry.get("event_type") == "PROCESS_STATE":
             self._update_process_state_table(entry)
             return
@@ -2327,7 +2340,7 @@ class RdrsGui(QWidget):
         pid = int(pid_value) if str(pid_value or "").isdigit() else None
         try:
             self._logs_db.log_event(
-                event_type="FILE EXTENSION CHANGED",
+                event_type="EXTENSION_CHANGE",
                 file_path=file_path,
                 file_name=f"{base_name} (.{original_ext} -> .{new_ext})",
                 process=entry.get("process") or None,

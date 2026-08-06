@@ -201,5 +201,45 @@ class GuiEntropyDbPollingRegressionTests(unittest.TestCase):
         self.assertIn("Last Validation Average", gui.entropy_validation_value.text)
 
 
+class GuiExtensionChangeNormalizationTests(unittest.TestCase):
+    def _make_gui_shell(self):
+        gui = rd.RdrsGui.__new__(rd.RdrsGui)
+        gui.event_rows = []
+        gui.event_count = 0
+        gui._pending_total_events_refresh = False
+        gui._pending_log_refresh = False
+        gui._pending_counter_refresh = False
+        gui._pending_metrics_refresh = False
+
+        gui._trim_gui_event_cache = lambda: None
+        gui._update_process_state_table = lambda *_args, **_kwargs: None
+        gui._update_suspicious_process_table = lambda *_args, **_kwargs: None
+
+        persisted = {"count": 0}
+        gui._persist_extension_change = lambda _entry: persisted.__setitem__("count", persisted["count"] + 1)
+        return gui, persisted
+
+    def test_normalize_event_type_maps_extension_alias(self):
+        self.assertEqual(rd.RdrsGui._normalize_event_type("FILE EXTENSION CHANGED"), "EXTENSION_CHANGE")
+
+    def test_add_log_row_keeps_extension_change_events(self):
+        gui, persisted = self._make_gui_shell()
+
+        rd.RdrsGui.add_log_row(
+            gui,
+            {
+                "event_type": "FILE EXTENSION CHANGED",
+                "file": "/tmp/report.locked",
+                "file_name": "report.locked",
+                "process": "proc",
+            },
+        )
+
+        self.assertEqual(len(gui.event_rows), 1)
+        self.assertEqual(gui.event_rows[0]["event_type"], "EXTENSION_CHANGE")
+        self.assertEqual(persisted["count"], 1)
+        self.assertEqual(gui.event_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
